@@ -104,16 +104,24 @@ impl Doc {
     /// `cx`,`cy` 는 화면 **가운데**에 올 도면 좌표, `scale` 은 도면 단위당 픽셀.
     #[allow(clippy::too_many_arguments)]
     fn raster(
-        &self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+        &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
     ) -> Option<Raster> {
-        let space = if layout.is_empty() {
-            Space::Model
-        } else {
-            Space::Paper(layout.to_string())
-        };
         // 곡선을 선분으로 쪼갤 오차는 "화면 반 픽셀". 줌이 바뀌면 같이 바뀐다.
-        let opts = Options { tolerance: 0.5 / scale.max(1e-12), ..Options::default() };
-        let dl = cadcraft_render::build(&self.drawing, &space, &opts);
+        let tol = 0.5 / scale.max(1e-12);
+        let reusable = self.cache.as_ref().is_some_and(|(l, t, _)| {
+            l == layout && *t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK
+        });
+        if !reusable {
+            let space = if layout.is_empty() {
+                Space::Model
+            } else {
+                Space::Paper(layout.to_string())
+            };
+            let opts = Options { tolerance: tol, ..Options::default() };
+            let dl = cadcraft_render::build(&self.drawing, &space, &opts);
+            self.cache = Some((layout.to_string(), tol, dl));
+        }
+        let dl = &self.cache.as_ref()?.2;
         let view = cadcraft_render::raster::View {
             center: cadcraft_geom::Vec2 { x: cx, y: cy },
             scale,
@@ -124,7 +132,7 @@ impl Doc {
             background: cadcraft_color::Rgb((bg >> 16) as u8, (bg >> 8) as u8, bg as u8),
             ..Default::default()
         };
-        let pm = cadcraft_render::raster::render(&dl, &view, &ro)?;
+        let pm = cadcraft_render::raster::render(dl, &view, &ro)?;
 
         // tiny-skia 는 **알파 곱해진(premultiplied)** 픽셀을 준다. 캔버스
         // ImageData 는 곱하지 않은 값을 원한다 — 그냥 넘기면 반투명한 것이
@@ -163,12 +171,25 @@ fn set_fallbacks(list: &str) {
 /// 열어둔 도면 하나.
 pub struct Doc {
     drawing: Drawing,
+    /// 마지막으로 만든 DisplayList 와 그때의 (공간, tolerance).
+    ///
+    /// **이게 성능의 전부다.** 매 프레임 build 하면 45MB 도면에서 한 장이
+    /// 240ms 인데, 그중 래스터는 15ms 뿐이고 나머지가 build 다. 팬은 카메라만
+    /// 움직이므로 같은 목록을 다시 쓰면 된다.
+    cache: Option<(String, f64, DisplayList)>,
 }
+
+/// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
+///
+/// tolerance 는 "화면 반 픽셀"이라 줌에 반비례한다. 조금만 달라도 다시 만들면
+/// 휠을 굴릴 때마다 build 가 돌아 끊긴다. 2배까지는 곡선이 눈에 띄게 거칠어지지
+/// 않으므로 그 안에서는 쓰던 걸 쓴다.
+const TOL_SLACK: f64 = 2.0;
 
 impl Doc {
     fn open(bytes: &[u8]) -> Result<Doc, String> {
         let drawing = cadcraft_io::read_dxf(bytes).map_err(|e| e.to_string())?;
-        Ok(Doc { drawing })
+        Ok(Doc { drawing, cache: None })
     }
 
     /// 배치(종이공간) 탭 이름들. 모형 탭은 여기 없다 — `Space::Model` 로 따로 연다.
@@ -245,7 +266,7 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = renderPixels)]
     #[allow(clippy::too_many_arguments)]
     pub fn render_pixels(
-        &self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+        &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
     ) -> Option<BimoveRaster> {
         self.0.raster(layout, cx, cy, scale, w, h, bg).map(BimoveRaster)
     }
@@ -361,7 +382,7 @@ mod tests {
     fn 픽셀로_그리면_선이_실제로_찍힌다() {
         // 크기만 맞고 전부 배경색이면 "그려진 척" 이다. 배경이 아닌 픽셀이
         // 있어야 진짜 그린 것이다.
-        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
         let (w, h) = (200, 100);
         // (0,0)~(100,50) 선을 가운데(50,25)에 두고 1.5px/단위로
         let r = doc.raster("", 50.0, 25.0, 1.5, w, h, 0xFFFFFF).expect("래스터 실패");
@@ -379,14 +400,51 @@ mod tests {
     fn 알파는_곱해지지_않은_채로_나온다() {
         // tiny-skia 는 알파가 곱해진 픽셀을 준다. 그대로 넘기면 캔버스에서
         // 색이 어두워진다. 불투명 배경이니 알파가 전부 255 여야 한다.
-        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
         let r = doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
         assert!(r.rgba.chunks_exact(4).all(|p| p[3] == 255), "알파가 255 가 아닌 픽셀이 있다");
     }
 
     #[test]
+    fn 팬은_목록을_다시_만들지_않는다() {
+        // 카메라만 움직이면 같은 DisplayList 를 쓴다. 이게 깨지면 45MB 도면에서
+        // 한 프레임이 15ms 에서 240ms 로 돌아간다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        let built = doc.cache.as_ref().map(|(_, t, dl)| (*t, dl.prims.len())).unwrap();
+        doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        let after = doc.cache.as_ref().map(|(_, t, dl)| (*t, dl.prims.len())).unwrap();
+        assert_eq!(built, after, "팬만 했는데 목록이 다시 만들어졌다");
+    }
+
+    #[test]
+    fn 줌이_크게_바뀌면_다시_만든다() {
+        // tolerance 는 줌에 반비례한다. 2배 안쪽은 그대로 쓰고, 넘으면 다시
+        // 만들어야 곡선이 거칠어지지 않는다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF).unwrap();
+        let t0 = doc.cache.as_ref().unwrap().1;
+
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        assert_eq!(doc.cache.as_ref().unwrap().1, t0, "1.5배 줌은 다시 만들 일이 아니다");
+
+        doc.raster("", 50.0, 25.0, 10.0, 64, 64, 0xFFFFFF).unwrap();
+        assert_ne!(doc.cache.as_ref().unwrap().1, t0, "10배 줌인데 그대로 썼다");
+    }
+
+    #[test]
+    fn 공간이_바뀌면_다시_만든다() {
+        // 모형 ↔ 배치는 아예 다른 내용이다. 캐시를 그대로 쓰면 엉뚱한 걸 그린다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        assert_eq!(doc.cache.as_ref().unwrap().0, "");
+        doc.raster("배치1", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        assert_eq!(doc.cache.as_ref().unwrap().0, "배치1", "공간이 바뀌었는데 캐시가 그대로다");
+    }
+
+    #[test]
     fn 크기가_0_이면_실패를_돌려준다() {
-        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
         assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF).is_none());
     }
 
