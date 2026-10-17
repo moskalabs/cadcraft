@@ -146,6 +146,78 @@ impl Doc {
     }
 }
 
+/// 커서가 붙을 점 하나.
+pub struct Snap {
+    x: f64,
+    y: f64,
+    /// 어떤 스냅인지 — "Endpoint", "Midpoint", "Perpendicular" …
+    name: &'static str,
+    mode: u32,
+}
+
+impl Doc {
+    fn space_of(layout: &str) -> Space {
+        if layout.is_empty() {
+            Space::Model
+        } else {
+            Space::Paper(layout.to_string())
+        }
+    }
+
+    /// 한 점을 찍어 엔티티를 고른다. 없으면 None.
+    ///
+    /// `aperture` 는 **도면 단위**다 — 화면 픽셀이 아니라. 줌이 바뀌면 같은
+    /// 화면 거리라도 도면 거리가 달라지므로, 부르는 쪽이 `픽셀 / scale` 로
+    /// 바꿔 넘겨야 한다. 안 그러면 줌인했을 때 클릭이 안 먹는다.
+    fn pick(&self, layout: &str, x: f64, y: f64, aperture: f64) -> Option<String> {
+        let h = cadcraft_engine::select::pick(
+            &self.drawing,
+            &Self::space_of(layout),
+            cadcraft_geom::Vec2 { x, y },
+            aperture,
+        )?;
+        Some(format!("{h:?}"))
+    }
+
+    /// 사각형으로 고른다. `crossing` 이면 걸치기만 해도, 아니면 완전히 들어와야.
+    ///
+    /// 오토캐드에서 왼→오 드래그가 "포함", 오→왼이 "걸침"이다. 그 구분을
+    /// 부르는 쪽이 정해 넘긴다.
+    fn pick_window(
+        &self, layout: &str, x0: f64, y0: f64, x1: f64, y1: f64, crossing: bool,
+    ) -> usize {
+        let bx = cadcraft_geom::Bounds2 {
+            min: cadcraft_geom::Vec2 { x: x0.min(x1), y: y0.min(y1) },
+            max: cadcraft_geom::Vec2 { x: x0.max(x1), y: y0.max(y1) },
+        };
+        cadcraft_engine::select::select_window(&self.drawing, &Self::space_of(layout), bx, crossing)
+            .len()
+    }
+
+    /// 커서 근처에서 스냅 점을 찾는다.
+    ///
+    /// `osmode` 는 오토캐드 OSMODE 비트마스크다 — 1 끝점, 2 중간점, 4 중심,
+    /// 32 교차점, 128 수직, 512 근처점, 4096 연장… Bimove 의 스냅 패널 토글이
+    /// 그대로 비트 하나씩에 대응한다. 손으로 구현한 snap.ts 를 이걸로 대체한다.
+    ///
+    /// `base` 는 지금 그리는 선의 시작점 (수직·연장이 그걸 필요로 한다).
+    fn snap(
+        &self, layout: &str, x: f64, y: f64, aperture: f64, osmode: u32,
+        base: Option<(f64, f64)>,
+    ) -> Option<Snap> {
+        let hit = cadcraft_engine::snap::osnap(
+            &self.drawing,
+            &Self::space_of(layout),
+            cadcraft_geom::Vec2 { x, y },
+            aperture,
+            osmode,
+            base.map(|(bx, by)| cadcraft_geom::Vec2 { x: bx, y: by }),
+            false,
+        )?;
+        Some(Snap { x: hit.point.x, y: hit.point.y, name: hit.name, mode: hit.mode })
+    }
+}
+
 /// 폰트를 이름으로 등록한다.
 ///
 /// **브라우저에서는 이게 유일한 길이다.** CADCraft 는 빌드할 때 `CRAFT_FONTS_DIR`
@@ -261,6 +333,29 @@ impl BimoveDoc {
         BimoveFrame(self.0.build(layout, tolerance))
     }
 
+    /// 한 점을 찍어 엔티티를 고른다. `aperture` 는 **도면 단위** (픽셀 ÷ 줌).
+    pub fn pick(&self, layout: &str, x: f64, y: f64, aperture: f64) -> Option<String> {
+        self.0.pick(layout, x, y, aperture)
+    }
+
+    /// 사각형 선택. `crossing` = 걸치기만 해도 잡기 (오→왼 드래그).
+    #[wasm_bindgen(js_name = pickWindow)]
+    pub fn pick_window(
+        &self, layout: &str, x0: f64, y0: f64, x1: f64, y1: f64, crossing: bool,
+    ) -> usize {
+        self.0.pick_window(layout, x0, y0, x1, y1, crossing)
+    }
+
+    /// 커서가 붙을 점. `osmode` 는 오토캐드 OSMODE 비트마스크.
+    /// `baseX`/`baseY` 가 NaN 이면 시작점 없음으로 본다 (수직·연장이 그걸 본다).
+    pub fn snap(
+        &self, layout: &str, x: f64, y: f64, aperture: f64, osmode: u32,
+        base_x: f64, base_y: f64,
+    ) -> Option<BimoveSnap> {
+        let base = if base_x.is_nan() || base_y.is_nan() { None } else { Some((base_x, base_y)) };
+        self.0.snap(layout, x, y, aperture, osmode, base).map(BimoveSnap)
+    }
+
     /// 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
     /// `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
     #[wasm_bindgen(js_name = renderPixels)]
@@ -269,6 +364,29 @@ impl BimoveDoc {
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
     ) -> Option<BimoveRaster> {
         self.0.raster(layout, cx, cy, scale, w, h, bg).map(BimoveRaster)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct BimoveSnap(Snap);
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl BimoveSnap {
+    pub fn x(&self) -> f64 {
+        self.0.x
+    }
+    pub fn y(&self) -> f64 {
+        self.0.y
+    }
+    /// "Endpoint" / "Midpoint" / "Perpendicular" … 마커 옆에 그대로 띄우면 된다.
+    pub fn name(&self) -> String {
+        self.0.name.to_string()
+    }
+    /// 걸린 OSMODE 비트 하나.
+    pub fn mode(&self) -> u32 {
+        self.0.mode
     }
 }
 
@@ -446,6 +564,77 @@ mod tests {
     fn 크기가_0_이면_실패를_돌려준다() {
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
         assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF).is_none());
+    }
+
+    // ── 선택 · 스냅 ──
+    //
+    // Bimove 의 snap.ts(끝점·중간점·교차점·수직·연장·직교)를 이걸로 대체한다.
+    // 비트 하나씩이 패널 토글 하나에 대응하므로, 비트를 잘못 넘기면 조용히
+    // 엉뚱한 데 붙는다. 여기서 비트별로 확인한다.
+
+    /// (0,0)-(100,50) 선 하나. 중간점은 (50,25).
+    const END: u32 = 1;
+    const MID: u32 = 2;
+
+    #[test]
+    fn 선_위를_찍으면_골라진다() {
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        // 선 위 한 점 (중간 근처)
+        assert!(doc.pick("", 50.0, 25.0, 1.0).is_some(), "선 위인데 안 골라졌다");
+        // 한참 떨어진 곳
+        assert!(doc.pick("", 50.0, 500.0, 1.0).is_none(), "멀리 찍었는데 골라졌다");
+    }
+
+    #[test]
+    fn aperture_가_도면_단위라서_줌에_따라_달라진다() {
+        // 화면 픽셀을 그대로 넘기면 줌인했을 때 클릭이 안 먹는다. 부르는 쪽이
+        // 픽셀÷줌 으로 바꿔 넘겨야 한다는 계약을 여기서 못 박는다.
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let off = (50.0, 30.0);  // 선에서 살짝 떨어진 점
+        assert!(doc.pick("", off.0, off.1, 0.1).is_none(), "aperture 가 작은데 잡혔다");
+        assert!(doc.pick("", off.0, off.1, 20.0).is_some(), "aperture 가 큰데 안 잡혔다");
+    }
+
+    #[test]
+    fn 끝점_스냅이_선의_끝에_붙는다() {
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let s = doc.snap("", 98.0, 48.0, 10.0, END, None).expect("끝점을 못 찾았다");
+        assert!((s.x - 100.0).abs() < 1e-6 && (s.y - 50.0).abs() < 1e-6, "({},{})", s.x, s.y);
+        assert_eq!(s.name, "Endpoint");
+        assert_eq!(s.mode, END);
+    }
+
+    #[test]
+    fn 중간점_스냅이_가운데에_붙는다() {
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let s = doc.snap("", 52.0, 27.0, 10.0, MID, None).expect("중간점을 못 찾았다");
+        assert!((s.x - 50.0).abs() < 1e-6 && (s.y - 25.0).abs() < 1e-6, "({},{})", s.x, s.y);
+        assert_eq!(s.name, "Midpoint");
+    }
+
+    #[test]
+    fn 끈_모드는_안_걸린다() {
+        // 패널에서 끝점만 켜 뒀는데 중간점에 붙으면 사용자는 영문을 모른다.
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let s = doc.snap("", 52.0, 27.0, 10.0, END, None);
+        assert!(s.is_none_or(|h| h.mode == END), "끝점만 켰는데 다른 게 걸렸다");
+    }
+
+    #[test]
+    fn 멀면_스냅이_없다() {
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        assert!(doc.snap("", 50.0, 900.0, 10.0, END | MID, None).is_none());
+    }
+
+    #[test]
+    fn 사각형_선택_포함과_걸침이_다르다() {
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        // 선을 통째로 감싸는 상자 — 둘 다 잡아야 한다
+        assert_eq!(doc.pick_window("", -10.0, -10.0, 110.0, 60.0, false), 1);
+        assert_eq!(doc.pick_window("", -10.0, -10.0, 110.0, 60.0, true), 1);
+        // 선을 가로지르기만 하는 작은 상자 — 걸침만 잡는다
+        assert_eq!(doc.pick_window("", 40.0, 15.0, 60.0, 35.0, false), 0, "포함인데 잡혔다");
+        assert_eq!(doc.pick_window("", 40.0, 15.0, 60.0, 35.0, true), 1, "걸침인데 안 잡혔다");
     }
 
     #[test]
