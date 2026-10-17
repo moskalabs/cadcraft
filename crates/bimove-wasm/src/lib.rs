@@ -87,6 +87,57 @@ impl Frame {
     }
 }
 
+/// WASM 안에서 래스터라이즈한 한 장. `rgba` 는 캔버스 `ImageData` 에 바로 넣는다.
+pub struct Raster {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+impl Doc {
+    /// 도면을 **픽셀로** 그려서 돌려준다.
+    ///
+    /// DisplayList 를 JS 로 넘겨 Canvas2D 로 그리는 길도 있지만, 큰 도면에서는
+    /// 그쪽이 막힌다 — 프리미티브가 10만 개면 Path2D 를 아무리 묶어도 한 프레임이
+    /// 수 초다. 여기서는 CADCraft 자신이 쓰는 CPU 래스터라이저(tiny-skia)로 그린다.
+    ///
+    /// `cx`,`cy` 는 화면 **가운데**에 올 도면 좌표, `scale` 은 도면 단위당 픽셀.
+    #[allow(clippy::too_many_arguments)]
+    fn raster(
+        &self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+    ) -> Option<Raster> {
+        let space = if layout.is_empty() {
+            Space::Model
+        } else {
+            Space::Paper(layout.to_string())
+        };
+        // 곡선을 선분으로 쪼갤 오차는 "화면 반 픽셀". 줌이 바뀌면 같이 바뀐다.
+        let opts = Options { tolerance: 0.5 / scale.max(1e-12), ..Options::default() };
+        let dl = cadcraft_render::build(&self.drawing, &space, &opts);
+        let view = cadcraft_render::raster::View {
+            center: cadcraft_geom::Vec2 { x: cx, y: cy },
+            scale,
+            width: w,
+            height: h,
+        };
+        let ro = cadcraft_render::raster::RasterOptions {
+            background: cadcraft_color::Rgb((bg >> 16) as u8, (bg >> 8) as u8, bg as u8),
+            ..Default::default()
+        };
+        let pm = cadcraft_render::raster::render(&dl, &view, &ro)?;
+
+        // tiny-skia 는 **알파 곱해진(premultiplied)** 픽셀을 준다. 캔버스
+        // ImageData 는 곱하지 않은 값을 원한다 — 그냥 넘기면 반투명한 것이
+        // 어둡게 나온다. 여기서 되돌린다.
+        let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for p in pm.pixels() {
+            let c = p.demultiply();
+            rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+        Some(Raster { rgba, w, h })
+    }
+}
+
 /// 폰트를 이름으로 등록한다.
 ///
 /// **브라우저에서는 이게 유일한 길이다.** CADCraft 는 빌드할 때 `CRAFT_FONTS_DIR`
@@ -188,6 +239,35 @@ impl BimoveDoc {
     pub fn build_frame(&self, layout: &str, tolerance: f64) -> BimoveFrame {
         BimoveFrame(self.0.build(layout, tolerance))
     }
+
+    /// 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
+    /// `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
+    #[wasm_bindgen(js_name = renderPixels)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_pixels(
+        &self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+    ) -> Option<BimoveRaster> {
+        self.0.raster(layout, cx, cy, scale, w, h, bg).map(BimoveRaster)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct BimoveRaster(Raster);
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl BimoveRaster {
+    /// `ImageData` 에 그대로 넣을 RGBA 바이트 (곱하지 않은 알파).
+    pub fn rgba(&self) -> Vec<u8> {
+        self.0.rgba.clone()
+    }
+    pub fn width(&self) -> u32 {
+        self.0.w
+    }
+    pub fn height(&self) -> u32 {
+        self.0.h
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -275,6 +355,39 @@ mod tests {
         assert!((f.bounds[1] - 0.0).abs() < 1e-6, "minY {}", f.bounds[1]);
         assert!((f.bounds[2] - 100.0).abs() < 1e-6, "maxX {}", f.bounds[2]);
         assert!((f.bounds[3] - 50.0).abs() < 1e-6, "maxY {}", f.bounds[3]);
+    }
+
+    #[test]
+    fn 픽셀로_그리면_선이_실제로_찍힌다() {
+        // 크기만 맞고 전부 배경색이면 "그려진 척" 이다. 배경이 아닌 픽셀이
+        // 있어야 진짜 그린 것이다.
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let (w, h) = (200, 100);
+        // (0,0)~(100,50) 선을 가운데(50,25)에 두고 1.5px/단위로
+        let r = doc.raster("", 50.0, 25.0, 1.5, w, h, 0xFFFFFF).expect("래스터 실패");
+        assert_eq!(r.w, w);
+        assert_eq!(r.h, h);
+        assert_eq!(r.rgba.len(), (w as usize) * (h as usize) * 4, "RGBA 길이가 안 맞는다");
+
+        let bg = r.rgba.chunks_exact(4).filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255).count();
+        let ink = (w as usize) * (h as usize) - bg;
+        assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 선이 안 찍혔다");
+        assert!(bg > 0, "전부 잉크다 — 배경색이 안 먹었다");
+    }
+
+    #[test]
+    fn 알파는_곱해지지_않은_채로_나온다() {
+        // tiny-skia 는 알파가 곱해진 픽셀을 준다. 그대로 넘기면 캔버스에서
+        // 색이 어두워진다. 불투명 배경이니 알파가 전부 255 여야 한다.
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        let r = doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        assert!(r.rgba.chunks_exact(4).all(|p| p[3] == 255), "알파가 255 가 아닌 픽셀이 있다");
+    }
+
+    #[test]
+    fn 크기가_0_이면_실패를_돌려준다() {
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF).is_none());
     }
 
     #[test]
