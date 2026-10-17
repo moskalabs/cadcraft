@@ -1,0 +1,23 @@
+[package]
+name = "bimove-wasm"
+description = "Bimove 의 WASM 바인딩. CADCraft 의 doc/io/render/engine 을 브라우저에서 쓴다."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cadcraft-doc = { workspace = true }
+cadcraft-io = { workspace = true }
+cadcraft-render = { workspace = true }
+cadcraft-geom = { workspace = true }
+cadcraft-fonts = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"

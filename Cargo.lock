@@ -441,6 +441,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a45f9771ced8a774de5e5ebffbe520f52e3943bf5a9a6baa3a5d14a5de1afe6"
 
 [[package]]
+name = "bimove-wasm"
+version = "0.7.0"
+dependencies = [
+ "cadcraft-doc",
+ "cadcraft-fonts",
+ "cadcraft-geom",
+ "cadcraft-io",
+ "cadcraft-render",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
