@@ -451,6 +451,7 @@ dependencies = [
  "cadcraft-geom",
  "cadcraft-io",
  "cadcraft-render",
+ "serde_json",
  "wasm-bindgen",
 ]
 

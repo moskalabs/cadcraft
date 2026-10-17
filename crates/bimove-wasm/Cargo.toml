@@ -20,6 +20,7 @@ cadcraft-geom = { workspace = true }
 cadcraft-fonts = { workspace = true }
 cadcraft-color = { workspace = true }
 cadcraft-engine = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

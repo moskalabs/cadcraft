@@ -9,7 +9,8 @@
 //! 으로 하나씩 넘기면 경계를 넘는 비용이 그리는 비용보다 커진다. 도면 하나가
 //! 수만 개 선분이라 이게 전부다.
 
-use cadcraft_doc::{Drawing, Space};
+use cadcraft_doc::Space;
+use cadcraft_engine::Session;
 use cadcraft_render::{DisplayList, Kind, Options};
 
 #[cfg(target_arch = "wasm32")]
@@ -111,17 +112,18 @@ impl Doc {
         let tol = 0.5 / scale.max(1e-12);
         // 배경색도 키다 — 색 보정이 배경에 달려 있어서, 배경이 바뀌면 같은
         // 목록을 쓰면 안 된다.
-        let reusable = self.cache.as_ref().is_some_and(|(l, t, b, _)| {
-            l == layout && *b == bg && *t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK
+        let rev = self.revision();
+        let reusable = self.cache.as_ref().is_some_and(|(l, t, b, r, _)| {
+            l == layout && *b == bg && *r == rev && *t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK
         });
         if !reusable {
             let space = Self::space_of(layout);
             let opts = Options { tolerance: tol, ..Options::default() };
-            let mut dl = cadcraft_render::build(&self.drawing, &space, &opts);
+            let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
             make_readable(&mut dl, bg_rgb);
-            self.cache = Some((layout.to_string(), tol, bg, dl));
+            self.cache = Some((layout.to_string(), tol, bg, rev, dl));
         }
-        let dl = &self.cache.as_ref()?.3;
+        let dl = &self.cache.as_ref()?.4;
         let view = cadcraft_render::raster::View {
             center: cadcraft_geom::Vec2 { x: cx, y: cy },
             scale,
@@ -235,7 +237,7 @@ impl Doc {
     /// 바꿔 넘겨야 한다. 안 그러면 줌인했을 때 클릭이 안 먹는다.
     fn pick(&self, layout: &str, x: f64, y: f64, aperture: f64) -> Option<String> {
         let h = cadcraft_engine::select::pick(
-            &self.drawing,
+            self.drawing(),
             &Self::space_of(layout),
             cadcraft_geom::Vec2 { x, y },
             aperture,
@@ -254,7 +256,7 @@ impl Doc {
             min: cadcraft_geom::Vec2 { x: x0.min(x1), y: y0.min(y1) },
             max: cadcraft_geom::Vec2 { x: x0.max(x1), y: y0.max(y1) },
         };
-        cadcraft_engine::select::select_window(&self.drawing, &Self::space_of(layout), bx, crossing)
+        cadcraft_engine::select::select_window(self.drawing(), &Self::space_of(layout), bx, crossing)
             .len()
     }
 
@@ -270,7 +272,7 @@ impl Doc {
         base: Option<(f64, f64)>,
     ) -> Option<Snap> {
         let hit = cadcraft_engine::snap::osnap(
-            &self.drawing,
+            self.drawing(),
             &Self::space_of(layout),
             cadcraft_geom::Vec2 { x, y },
             aperture,
@@ -305,14 +307,22 @@ fn set_fallbacks(list: &str) {
 }
 
 /// 열어둔 도면 하나.
+///
+/// 엔진의 `Session` 을 들고 있다. 그냥 `Drawing` 만 들면 읽기는 되지만 편집이
+/// 안 된다 — 명령·되돌리기·선택이 전부 Session 에 매달려 있다.
 pub struct Doc {
-    drawing: Drawing,
+    session: Session,
     /// 마지막으로 만든 DisplayList 와 그때의 (공간, tolerance).
     ///
     /// **이게 성능의 전부다.** 매 프레임 build 하면 45MB 도면에서 한 장이
     /// 240ms 인데, 그중 래스터는 15ms 뿐이고 나머지가 build 다. 팬은 카메라만
     /// 움직이므로 같은 목록을 다시 쓰면 된다.
-    cache: Option<(String, f64, u32, DisplayList)>,
+    /// (공간, tolerance, 배경, **도면 판번호**) → 그릴 거리.
+    ///
+    /// revision 을 키에 넣는 게 편집과 캐시를 잇는 전부다. 엔진이 도면을 고칠
+    /// 때마다 올려주므로, 선 하나만 그어도 다음 렌더에서 자동으로 다시 만든다.
+    /// 이걸 빼면 그린 게 화면에 안 나타난다.
+    cache: Option<(String, f64, u32, u64, DisplayList)>,
 }
 
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
@@ -325,12 +335,40 @@ const TOL_SLACK: f64 = 2.0;
 impl Doc {
     fn open(bytes: &[u8]) -> Result<Doc, String> {
         let drawing = cadcraft_io::read_dxf(bytes).map_err(|e| e.to_string())?;
-        Ok(Doc { drawing, cache: None })
+        let mut session = Session::empty();
+        session.open_drawing(drawing, "bimove", None);
+        Ok(Doc { session, cache: None })
+    }
+
+    fn drawing(&self) -> &cadcraft_doc::Drawing {
+        // open() 이 반드시 하나를 열어두므로 비어 있을 수 없다.
+        self.session.doc().expect("도면이 열려 있지 않다")
+    }
+
+    /// 지금 도면의 판번호. 편집할 때마다 올라간다.
+    fn revision(&self) -> u64 {
+        self.session.state().map(|s| s.revision).unwrap_or(0)
+    }
+
+    /// 명령을 실행한다 — `id` 는 엔진 명령 이름("line", "erase", "u", "redo"…),
+    /// `params` 는 그 명령이 받는 JSON.
+    ///
+    /// 되돌리기 스냅샷은 엔진이 알아서 쌓는다 (`execute` 안에서 push_undo).
+    /// 그래서 우리가 실행취소를 따로 만들 필요가 없다 — `u` / `redo` 명령이
+    /// 같은 길로 들어온다.
+    fn exec(&mut self, id: &str, params_json: &str) -> Result<String, String> {
+        let params: serde_json::Value = if params_json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(params_json).map_err(|e| format!("params 가 JSON 이 아니다: {e}"))?
+        };
+        let v = self.session.execute(id, &params).map_err(|e| e.to_string())?;
+        Ok(v.to_string())
     }
 
     /// 배치(종이공간) 탭 이름들. 모형 탭은 여기 없다 — `Space::Model` 로 따로 연다.
     fn layout_names(&self) -> Vec<String> {
-        self.drawing.layouts.iter().map(|l| l.name.clone()).collect()
+        self.drawing().layouts.iter().map(|l| l.name.clone()).collect()
     }
 
     /// `layout` 이 비어 있으면 모형공간, 아니면 그 이름의 배치.
@@ -345,7 +383,7 @@ impl Doc {
             Space::Paper(layout.to_string())
         };
         let opts = Options { tolerance, ..Options::default() };
-        Frame::from_list(&cadcraft_render::build(&self.drawing, &space, &opts))
+        Frame::from_list(&cadcraft_render::build(self.drawing(), &space, &opts))
     }
 }
 
@@ -395,6 +433,31 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = buildFrame)]
     pub fn build_frame(&self, layout: &str, tolerance: f64) -> BimoveFrame {
         BimoveFrame(self.0.build(layout, tolerance))
+    }
+
+    /// 엔진 명령을 실행한다. 결과 JSON 을 돌려주고, 실패하면 throw 한다.
+    ///
+    /// 명령을 하나씩 바인딩하지 않고 **문 하나**로 연다 — 엔진에 명령이 수백 개라
+    /// 하나씩 감싸면 끝이 없고, 늘 때마다 바인딩을 또 고쳐야 한다.
+    ///
+    /// ```js
+    /// doc.exec('line',  JSON.stringify({ points: [[0,0],[100,50]] }))
+    /// doc.exec('pline', JSON.stringify({ vertices: [[0,0],[10,0],[10,10]], closed: true }))
+    /// doc.exec('move',  JSON.stringify({ handles: [h], delta: [100, 0] }))
+    /// doc.exec('erase', JSON.stringify({ handles: [h] }))
+    /// doc.exec('u',     '{}')            // 되돌리기
+    /// doc.exec('redo',  '{}')            // 다시 실행
+    /// ```
+    ///
+    /// 되돌리기 스냅샷은 엔진이 알아서 쌓는다. 우리가 실행취소를 따로 만들
+    /// 필요가 없다 — `u` / `redo` 도 그냥 명령이다.
+    pub fn exec(&mut self, id: &str, params_json: &str) -> Result<String, JsError> {
+        self.0.exec(id, params_json).map_err(|e| JsError::new(&e))
+    }
+
+    /// 도면 판번호. 편집할 때마다 올라간다 — UI 가 "다시 그려야 하나" 를 이걸로 안다.
+    pub fn revision(&self) -> f64 {
+        self.0.revision() as f64
     }
 
     /// 한 점을 찍어 엔티티를 고른다. `aperture` 는 **도면 단위** (픽셀 ÷ 줌).
@@ -593,9 +656,9 @@ mod tests {
         // 한 프레임이 15ms 에서 240ms 로 돌아간다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
         doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
-        let built = doc.cache.as_ref().map(|(_, t, _, dl)| (*t, dl.prims.len())).unwrap();
+        let built = doc.cache.as_ref().map(|(_, t, _, _, dl)| (*t, dl.prims.len())).unwrap();
         doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
-        let after = doc.cache.as_ref().map(|(_, t, _, dl)| (*t, dl.prims.len())).unwrap();
+        let after = doc.cache.as_ref().map(|(_, t, _, _, dl)| (*t, dl.prims.len())).unwrap();
         assert_eq!(built, after, "팬만 했는데 목록이 다시 만들어졌다");
     }
 
@@ -769,6 +832,73 @@ mod tests {
         // 선을 가로지르기만 하는 작은 상자 — 걸침만 잡는다
         assert_eq!(doc.pick_window("", 40.0, 15.0, 60.0, 35.0, false), 0, "포함인데 잡혔다");
         assert_eq!(doc.pick_window("", 40.0, 15.0, 60.0, 35.0, true), 1, "걸침인데 안 잡혔다");
+    }
+
+    // ── 편집 ──
+    //
+    // 여기서 보는 건 "명령이 돌았나" 가 아니라 **그린 게 화면에 나오나** 다.
+    // 도면이 바뀌어도 캐시가 그대로면 사용자는 아무 일도 안 일어난 걸로 본다.
+
+    /// 지금 모형공간을 그리면 프리미티브가 몇 개인가.
+    fn prim_count(doc: &mut Doc) -> usize {
+        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF).unwrap();
+        doc.cache.as_ref().unwrap().4.prims.len()
+    }
+
+    #[test]
+    fn 선을_그으면_도면에_늘어난다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let before = prim_count(&mut doc);
+        doc.exec("line", r#"{"points": [[0,0],[0,200]]}"#).expect("line 실패");
+        assert!(prim_count(&mut doc) > before, "선을 그었는데 안 늘었다");
+    }
+
+    #[test]
+    fn 되돌리면_없어지고_다시하면_돌아온다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let base = prim_count(&mut doc);
+        doc.exec("line", r#"{"points": [[0,0],[0,200]]}"#).unwrap();
+        let drawn = prim_count(&mut doc);
+        assert!(drawn > base);
+
+        doc.exec("u", "{}").expect("되돌리기 실패");
+        assert_eq!(prim_count(&mut doc), base, "되돌렸는데 그대로다");
+
+        doc.exec("redo", "{}").expect("다시 실행 실패");
+        assert_eq!(prim_count(&mut doc), drawn, "다시 했는데 안 돌아왔다");
+    }
+
+    #[test]
+    fn 편집하면_캐시가_저절로_무효화된다() {
+        // revision 을 캐시 키에 넣은 이유. 이게 깨지면 그린 게 화면에 안 나타난다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        prim_count(&mut doc);
+        let r0 = doc.revision();
+        doc.exec("line", r#"{"points": [[0,0],[0,200]]}"#).unwrap();
+        assert!(doc.revision() > r0, "편집했는데 판번호가 그대로다");
+        // 캐시에 남은 판번호가 옛것이라 다음 렌더가 다시 만든다
+        assert_ne!(doc.cache.as_ref().unwrap().3, doc.revision());
+    }
+
+    #[test]
+    fn 없는_명령은_에러다() {
+        // 조용히 넘기면 "왜 아무 일도 안 일어나지" 가 된다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        assert!(doc.exec("이런명령없음", "{}").is_err());
+    }
+
+    #[test]
+    fn 깨진_params_는_에러다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let e = doc.exec("line", "{이건 JSON 이 아니다}").unwrap_err();
+        assert!(e.contains("JSON"), "에러에 이유가 없다: {e}");
+    }
+
+    #[test]
+    fn 빈_params_는_빈_객체로_본다() {
+        // JS 에서 '' 를 넘기는 실수가 흔하다. 거기서 터지면 원인을 못 찾는다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        assert!(doc.exec("u", "").is_ok());
     }
 
     #[test]
