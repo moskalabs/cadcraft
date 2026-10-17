@@ -106,32 +106,29 @@ impl Doc {
     fn raster(
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
     ) -> Option<Raster> {
+        let bg_rgb = cadcraft_color::Rgb((bg >> 16) as u8, (bg >> 8) as u8, bg as u8);
         // 곡선을 선분으로 쪼갤 오차는 "화면 반 픽셀". 줌이 바뀌면 같이 바뀐다.
         let tol = 0.5 / scale.max(1e-12);
-        let reusable = self.cache.as_ref().is_some_and(|(l, t, _)| {
-            l == layout && *t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK
+        // 배경색도 키다 — 색 보정이 배경에 달려 있어서, 배경이 바뀌면 같은
+        // 목록을 쓰면 안 된다.
+        let reusable = self.cache.as_ref().is_some_and(|(l, t, b, _)| {
+            l == layout && *b == bg && *t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK
         });
         if !reusable {
-            let space = if layout.is_empty() {
-                Space::Model
-            } else {
-                Space::Paper(layout.to_string())
-            };
+            let space = Self::space_of(layout);
             let opts = Options { tolerance: tol, ..Options::default() };
-            let dl = cadcraft_render::build(&self.drawing, &space, &opts);
-            self.cache = Some((layout.to_string(), tol, dl));
+            let mut dl = cadcraft_render::build(&self.drawing, &space, &opts);
+            make_readable(&mut dl, bg_rgb);
+            self.cache = Some((layout.to_string(), tol, bg, dl));
         }
-        let dl = &self.cache.as_ref()?.2;
+        let dl = &self.cache.as_ref()?.3;
         let view = cadcraft_render::raster::View {
             center: cadcraft_geom::Vec2 { x: cx, y: cy },
             scale,
             width: w,
             height: h,
         };
-        let ro = cadcraft_render::raster::RasterOptions {
-            background: cadcraft_color::Rgb((bg >> 16) as u8, (bg >> 8) as u8, bg as u8),
-            ..Default::default()
-        };
+        let ro = cadcraft_render::raster::RasterOptions { background: bg_rgb, ..Default::default() };
         let pm = cadcraft_render::raster::render(dl, &view, &ro)?;
 
         // tiny-skia 는 **알파 곱해진(premultiplied)** 픽셀을 준다. 캔버스
@@ -143,6 +140,73 @@ impl Doc {
             rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
         }
         Some(Raster { rgba, w, h })
+    }
+}
+
+// ── 흰 배경에서 안 보이는 색 ──
+//
+// CAD 색(ACI)은 오토캐드의 **검은 모형공간**을 전제로 고른 것이다. 노랑(2)과
+// 하늘(4)이 대표적인데, 흰 배경에 그대로 올리면 글자가 거의 안 보인다.
+// CADCraft 는 색 7번만 배경에 따라 흑백을 뒤집고(display_rgb) 나머지는 그대로
+// 둔다 — 종이에 출력할 땐 플롯 스타일이 그 일을 하기 때문이다.
+//
+// Bimove 는 뷰어이지 플로터가 아니다. 흰 캔버스에서 도면을 **읽는** 게 목적이라
+// 묻히는 색만 끌어내린다. **밝은 배경에서는 색상이 보존된다** — 전 성분을 같은
+// 비율로 줄이므로 "노란 글씨" 는 어두운 겨자색, 하늘색은 청록으로 남는다.
+// 레이어를 색으로 구분하던 사람이 길을 잃지 않는다.
+//
+// 어두운 배경에서는 채도가 빠진다. 진한 파랑은 성분을 키워도 밝아지지 않아서
+// (루마에서 파랑의 몫이 0.07 뿐이다) 흰색을 섞는 수밖에 없다. 받아들인다 —
+// Bimove 의 캔버스는 흰색이다.
+
+/// 배경과 이만큼은 밝기 차가 나야 읽힌다 (luma 0~1).
+///
+/// 0.4 는 노랑·하늘이 여전히 연해서 치수가 잘 안 읽혔다. 0.55 면 흰 배경에서
+/// 글씨가 또렷하면서도 색은 남는다 — 하늘(0,255,255)이 (0,164,164) 이 되고
+/// 파랑(0,0,255)은 이미 충분히 어두워 손대지 않으므로 둘은 그대로 구분된다.
+/// 더 올리면 색이 전부 검정 쪽으로 몰려 레이어 구분이 흐려진다.
+const MIN_INK_CONTRAST: f64 = 0.55;
+
+fn scale_rgb(c: cadcraft_color::Rgb, f: f64) -> cadcraft_color::Rgb {
+    let q = |v: u8| (f64::from(v) * f).round().clamp(0.0, 255.0) as u8;
+    cadcraft_color::Rgb(q(c.0), q(c.1), q(c.2))
+}
+
+/// `bg` 위에서 읽히도록 밝기만 옮긴 색.
+fn readable_on(c: cadcraft_color::Rgb, bg: cadcraft_color::Rgb) -> cadcraft_color::Rgb {
+    let (lb, lc) = (bg.luma(), c.luma());
+    if lb >= 0.5 {
+        // 밝은 배경 — 잉크를 어둡게. luma 가 성분의 선형 가중합이라 전부 같은
+        // 비율로 줄이면 목표 밝기에 정확히 떨어지고 색상은 보존된다.
+        let target = lb - MIN_INK_CONTRAST;
+        if lc <= target {
+            return c;
+        }
+        scale_rgb(c, (target / lc.max(1e-9)).clamp(0.0, 1.0))
+    } else {
+        // 어두운 배경 — 흰색 쪽으로 섞어 밝힌다 (줄이는 걸론 밝아지지 않는다).
+        let target = lb + MIN_INK_CONTRAST;
+        if lc >= target {
+            return c;
+        }
+        let t = ((target - lc) / (1.0 - lc).max(1e-9)).clamp(0.0, 1.0);
+        let up = |v: u8| (f64::from(v) + (255.0 - f64::from(v)) * t).round() as u8;
+        cadcraft_color::Rgb(up(c.0), up(c.1), up(c.2))
+    }
+}
+
+/// 배경에 묻히는 색을 끌어낸다. **DisplayList 를 제자리에서 고친다.**
+fn make_readable(dl: &mut DisplayList, bg: cadcraft_color::Rgb) {
+    for p in &mut dl.prims {
+        // 색 7번은 display_rgb 가 이미 배경에 맞춰 흑백으로 뒤집는다. 그 결과를
+        // 가지고 판단해야 "이미 검은 글씨" 를 또 손대지 않는다.
+        let shown = cadcraft_color::display_rgb(p.color, p.aci7, bg);
+        let fixed = readable_on(shown, bg);
+        if fixed != shown {
+            p.color = fixed;
+            // 우리가 정한 색을 그대로 쓰게 한다 (다시 흑백으로 뒤집히지 않도록)
+            p.aci7 = false;
+        }
     }
 }
 
@@ -248,7 +312,7 @@ pub struct Doc {
     /// **이게 성능의 전부다.** 매 프레임 build 하면 45MB 도면에서 한 장이
     /// 240ms 인데, 그중 래스터는 15ms 뿐이고 나머지가 build 다. 팬은 카메라만
     /// 움직이므로 같은 목록을 다시 쓰면 된다.
-    cache: Option<(String, f64, DisplayList)>,
+    cache: Option<(String, f64, u32, DisplayList)>,
 }
 
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
@@ -529,9 +593,9 @@ mod tests {
         // 한 프레임이 15ms 에서 240ms 로 돌아간다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
         doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
-        let built = doc.cache.as_ref().map(|(_, t, dl)| (*t, dl.prims.len())).unwrap();
+        let built = doc.cache.as_ref().map(|(_, t, _, dl)| (*t, dl.prims.len())).unwrap();
         doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
-        let after = doc.cache.as_ref().map(|(_, t, dl)| (*t, dl.prims.len())).unwrap();
+        let after = doc.cache.as_ref().map(|(_, t, _, dl)| (*t, dl.prims.len())).unwrap();
         assert_eq!(built, after, "팬만 했는데 목록이 다시 만들어졌다");
     }
 
@@ -558,6 +622,76 @@ mod tests {
         assert_eq!(doc.cache.as_ref().unwrap().0, "");
         doc.raster("배치1", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().0, "배치1", "공간이 바뀌었는데 캐시가 그대로다");
+    }
+
+    // ── 흰 배경에서 읽히는 색 ──
+
+    use cadcraft_color::Rgb;
+    const WHITE: Rgb = Rgb(255, 255, 255);
+    const DARK: Rgb = Rgb(33, 40, 48);   // CADCraft 기본 배경
+
+    #[test]
+    fn 흰_배경에서_노랑과_하늘이_읽히게_어두워진다() {
+        // 한이 보낸 화면에서 안 보이던 바로 그 두 색이다.
+        for c in [Rgb(255, 255, 0), Rgb(0, 255, 255)] {
+            let f = readable_on(c, WHITE);
+            // u8 로 반올림하면서 목표에서 한 칸(≈1/255) 모자랄 수 있다.
+            assert!(
+                WHITE.luma() - f.luma() >= MIN_INK_CONTRAST - 1.0 / 255.0,
+                "{c:?} → {f:?} 인데 밝기 차가 {:.3} 뿐이다", WHITE.luma() - f.luma()
+            );
+        }
+    }
+
+    #[test]
+    fn 색상은_보존된다() {
+        // 노랑이 회색이 되면 레이어를 색으로 구분하던 사람이 길을 잃는다.
+        let f = readable_on(Rgb(255, 255, 0), WHITE);
+        assert_eq!(f.0, f.1, "R 과 G 가 같아야 노랑이다: {f:?}");
+        assert_eq!(f.2, 0, "파랑이 섞였다: {f:?}");
+        assert!(f.0 > 0, "까맣게 죽었다: {f:?}");
+
+        let g = readable_on(Rgb(0, 255, 255), WHITE);
+        assert_eq!(g.0, 0, "빨강이 섞였다: {g:?}");
+        assert_eq!(g.1, g.2, "G 와 B 가 같아야 하늘이다: {g:?}");
+    }
+
+    #[test]
+    fn 이미_어두운_색은_건드리지_않는다() {
+        // 검정·남색은 흰 배경에서 이미 잘 보인다. 손대면 서로 구분이 사라진다.
+        for c in [Rgb(0, 0, 0), Rgb(0, 0, 255), Rgb(165, 0, 0)] {
+            assert_eq!(readable_on(c, WHITE), c, "{c:?} 를 건드렸다");
+        }
+    }
+
+    #[test]
+    fn 어두운_배경에서는_반대로_밝아진다() {
+        // 같은 규칙이 검은 배경에도 서야 배경색을 바꿀 수 있다.
+        let f = readable_on(Rgb(0, 0, 90), DARK);
+        assert!(f.luma() - DARK.luma() >= MIN_INK_CONTRAST - 1.0 / 255.0, "{f:?}");
+        assert!(f.2 >= 90, "밝히랬더니 어두워졌다: {f:?}");
+        // 어두운 배경 쪽은 채도가 빠진다. 진한 파랑은 아무리 키워도 밝아지지
+        // 않으므로(루마에서 파랑이 0.07 밖에 안 된다) 흰색을 섞는 수밖에 없다.
+        // 흰 배경 — 한이 쓰는 쪽 — 은 색상이 보존된다. 위 테스트 참고.
+    }
+
+    #[test]
+    fn 색_7번은_이미_뒤집힌_뒤에_판단한다() {
+        // aci7 은 흰 배경에서 검정이 된다. 그걸 모르고 원본 흰색을 보면
+        // "안 보인다" 고 판단해 멀쩡한 글씨를 회색으로 만든다.
+        let mut dl = DisplayList::default();
+        dl.prims.push(cadcraft_render::DPrim {
+            handle: Default::default(),
+            color: Rgb(255, 255, 255),
+            aci7: true,
+            lw: 0.0,
+            transparency: 0,
+            kind: Kind::Polyline,
+            start: 0,
+            len: 0,
+        });
+        make_readable(&mut dl, WHITE);
+        assert!(dl.prims[0].aci7, "aci7 을 꺼버렸다 — 배경을 바꾸면 안 뒤집힌다");
     }
 
     #[test]
