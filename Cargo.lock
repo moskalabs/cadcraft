@@ -444,6 +444,7 @@ checksum = "5a45f9771ced8a774de5e5ebffbe520f52e3943bf5a9a6baa3a5d14a5de1afe6"
 name = "bimove-wasm"
 version = "0.7.0"
 dependencies = [
+ "cadcraft-color",
  "cadcraft-doc",
  "cadcraft-fonts",
  "cadcraft-geom",
