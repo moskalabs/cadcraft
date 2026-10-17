@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>Bimove × CADCraft — 래스터 경로</title>
+<style>
+  body { margin: 0; font: 13px/1.5 system-ui, sans-serif; background: #f8f8f8; }
+  #bar { padding: 8px 12px; background: #fff; border-bottom: 1px solid #ddd;
+         display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: #333; }
+  canvas { display: block; background: #fff; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  .err { color: #c00; font-weight: 700; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <strong>래스터 경로</strong>
+  <label>공간 <select id="space"></select></label>
+  <button id="fit">화면 맞춤</button>
+  <span id="log">불러오는 중…</span>
+</div>
+<canvas id="cv"></canvas>
+
+<script type="module">
+import init, { BimoveDoc, registerFont, setFallbackFonts } from './pkg/bimove_wasm.js'
+
+const log = (m, c) => { const e = document.getElementById('log'); e.textContent = m; e.className = c || ''; console.log('[raster]', m) }
+const cv = document.getElementById('cv')
+const ctx = cv.getContext('2d')
+let doc = null, layout = ''
+
+// 카메라: 화면 가운데에 올 도면 좌표 + 단위당 픽셀
+const cam = { cx: 0, cy: 0, scale: 1 }
+let W = 0, H = 0, dpr = 1
+
+function resize() {
+  dpr = window.devicePixelRatio || 1
+  const w = window.innerWidth, h = window.innerHeight - document.getElementById('bar').offsetHeight
+  W = Math.round(w * dpr); H = Math.round(h * dpr)
+  cv.width = W; cv.height = H
+  cv.style.width = w + 'px'; cv.style.height = h + 'px'
+}
+
+/**
+ * 한 장 그린다.
+ *
+ * Canvas2D 로 프리미티브를 하나씩 그리는 대신, WASM 안에서 tiny-skia 로
+ * 래스터라이즈한 픽셀을 그대로 붙인다. 프리미티브 10만 개짜리 도면에서
+ * 전자는 한 프레임 20초였다.
+ */
+function render() {
+  if (!doc) return
+  const t0 = performance.now()
+  // scale 은 **도면 단위당 CSS 픽셀**이고, 래스터는 실제 픽셀로 그려야
+  // 고해상도 화면에서 흐려지지 않는다. 그래서 dpr 을 곱해 넘긴다.
+  const r = doc.renderPixels(layout, cam.cx, cam.cy, cam.scale * dpr, W, H, 0xFFFFFF)
+  const tRaster = performance.now() - t0
+  if (!r) { log('래스터 실패 (크기 0?)', 'err'); return }
+
+  const t1 = performance.now()
+  const bytes = r.rgba()
+  const img = new ImageData(new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.length), r.width(), r.height())
+  ctx.putImageData(img, 0, 0)
+  const tBlit = performance.now() - t1
+  r.free()
+
+  log(`래스터 ${tRaster.toFixed(0)}ms · 붙이기 ${tBlit.toFixed(0)}ms · ` +
+      `합 ${(tRaster + tBlit).toFixed(0)}ms · ${W}×${H} · 줌 ${cam.scale.toExponential(2)}`)
+}
+
+function fit() {
+  resize()
+  // 전체 범위는 DisplayList 에서 얻는다 (한 번만).
+  const f = doc.buildFrame(layout, 1)
+  const [minX, minY, maxX, maxY] = f.bounds()
+  f.free()
+  const bw = Math.max(maxX - minX, 1e-9), bh = Math.max(maxY - minY, 1e-9)
+  cam.scale = Math.min((W / dpr - 40) / bw, (H / dpr - 40) / bh)
+  cam.cx = (minX + maxX) / 2
+  cam.cy = (minY + maxY) / 2
+  render()
+}
+
+cv.addEventListener('wheel', (e) => {
+  e.preventDefault()
+  const r = cv.getBoundingClientRect()
+  // 커서 밑 도면 좌표가 제자리에 있어야 "그 점으로 들어간다" 는 느낌이 난다.
+  //
+  // 중심은 **렌더가 쓰는 중심**(장치 픽셀 W,H 의 한가운데)으로 잡는다.
+  // dpr 이 1 이 아니면 W = round(w × dpr) 이라 CSS 의 rect.width/2 와 최대
+  // 0.5/dpr 픽셀 어긋나는데, 줌마다 그걸 다시 기준 삼으면 쌓인다.
+  const cxPx = W / (2 * dpr), cyPx = H / (2 * dpr)
+  const dx = (e.clientX - r.left) - cxPx
+  const dy = (e.clientY - r.top) - cyPx
+  const wx = cam.cx + dx / cam.scale, wy = cam.cy - dy / cam.scale
+  cam.scale *= Math.exp(-e.deltaY * 0.0015)
+  cam.cx = wx - dx / cam.scale
+  cam.cy = wy + dy / cam.scale
+  render()
+}, { passive: false })
+
+let drag = null
+cv.addEventListener('pointerdown', (e) => {
+  drag = { x: e.clientX, y: e.clientY, cx: cam.cx, cy: cam.cy }
+  cv.setPointerCapture(e.pointerId)
+})
+cv.addEventListener('pointermove', (e) => {
+  if (!drag) return
+  cam.cx = drag.cx - (e.clientX - drag.x) / cam.scale
+  cam.cy = drag.cy + (e.clientY - drag.y) / cam.scale
+  render()
+})
+cv.addEventListener('pointerup', (e) => { drag = null; cv.releasePointerCapture(e.pointerId) })
+window.onresize = () => { resize(); render() }
+
+async function main() {
+  try {
+    await init({ module_or_path: './pkg/bimove_wasm_bg.wasm' })
+    const params = new URLSearchParams(location.search)
+    if (params.get('nofont') !== '1') {
+      log('한글 폰트 받는 중…')
+      const fb = new Uint8Array(await (await fetch('NotoSansKR.ttf')).arrayBuffer())
+      registerFont('Noto Sans KR', fb)
+      setFallbackFonts('Noto Sans KR')
+    }
+    const file = params.get('f') || 'apartment.dxf'
+    log(`${file} 읽는 중…`)
+    const bytes = new Uint8Array(await (await fetch(file)).arrayBuffer())
+    const t0 = performance.now()
+    doc = BimoveDoc.openDxf(bytes)
+    console.log(`[raster] openDxf ${(performance.now() - t0).toFixed(0)}ms`)
+
+    const sel = document.getElementById('space')
+    sel.innerHTML = '<option value="">모형공간</option>' +
+      doc.layoutNames().map(n => `<option value="${n}">${n}</option>`).join('')
+    sel.onchange = () => { layout = sel.value; fit() }
+    document.getElementById('fit').onclick = fit
+
+    fit()
+    // 줌 단계별 시간을 재둔다 (브라우저가 바빠도 나중에 읽을 수 있게)
+    window.__bench = () => {
+      const out = []
+      const base = cam.scale
+      for (const k of [1, 4, 16, 64]) {
+        cam.scale = base * k
+        const t = performance.now()
+        const r = doc.renderPixels(layout, cam.cx, cam.cy, cam.scale * dpr, W, H, 0xFFFFFF)
+        const ms = performance.now() - t
+        if (r) r.free()
+        out.push(`${k}배 ${ms.toFixed(0)}ms`)
+      }
+      cam.scale = base
+      render()
+      return out.join(' · ')
+    }
+    // 팬 = 줌 그대로, 카메라만 이동. 캐시가 들으면 build 가 안 돌아야 한다.
+    window.__panBench = (n = 6) => {
+      const out = []
+      const c0 = cam.cx
+      for (let i = 0; i < n; i++) {
+        cam.cx = c0 + i * (50 / cam.scale)   // 화면 50px 씩 이동
+        const t = performance.now()
+        const r = doc.renderPixels(layout, cam.cx, cam.cy, cam.scale * dpr, W, H, 0xFFFFFF)
+        out.push((performance.now() - t).toFixed(0))
+        if (r) r.free()
+      }
+      cam.cx = c0
+      render()
+      return out.join('ms · ') + 'ms'
+    }
+    window.__zoomTo = (k) => { cam.scale *= k; render(); return cam.scale }
+    // 화면 좌표 밑의 도면 좌표. 커서 기준 줌이 맞는지 보는 데 쓴다.
+    window.__worldAt = (sx, sy) => {
+      const dx = sx - W / (2 * dpr), dy = sy - H / (2 * dpr)
+      return { x: cam.cx + dx / cam.scale, y: cam.cy - dy / cam.scale }
+    }
+    window.__cam = () => ({ cx: cam.cx, cy: cam.cy, scale: cam.scale })
+    window.__dims = () => ({ W, H, dpr, liveDpr: window.devicePixelRatio, innerW: window.innerWidth, innerH: window.innerHeight, barH: document.getElementById("bar").offsetHeight })
+    window.__ready = true
+  } catch (e) {
+    log('실패: ' + (e?.message || e), 'err'); console.error(e); window.__ready = 'error'
+  }
+}
+main()
+</script>
+</body>
+</html>
