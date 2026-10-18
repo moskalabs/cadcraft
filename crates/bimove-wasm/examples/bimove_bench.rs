@@ -37,11 +37,19 @@ fn make_doc(groups: usize, polys: usize, pts: usize) -> String {
         let mut path = String::new();
         for _ in 0..polys {
             let (mut x, mut y) = (r.next() * 200.0, r.next() * 200.0);
-            for _ in 0..pts - 1 {
+            // 진짜 도면은 **곧은 구간이 길다** (벽·치수선·해치 경계). 방향을
+            // 가끔만 꺾어야 Douglas–Peucker 가 할 일이 실제와 같아진다.
+            let (mut dx, mut dy) = (1.0_f64, 0.0_f64);
+            for i in 0..pts - 1 {
+                if i % 6 == 0 {
+                    let a = r.next() * std::f64::consts::TAU;
+                    dx = a.cos();
+                    dy = a.sin();
+                }
                 // 들여올 때처럼 소수 첫째 자리로 반올림한다 — 그래야 이어
                 // 붙이기가 실제와 같은 조건에서 돈다.
-                let nx = (x + (r.next() - 0.5) * 80.0).round() / 10.0;
-                let ny = (y + (r.next() - 0.5) * 80.0).round() / 10.0;
+                let nx = ((x + dx * 4.0) * 10.0).round() / 10.0;
+                let ny = ((y + dy * 4.0) * 10.0).round() / 10.0;
                 path.push_str(&format!("M{x:.1},{y:.1}L{nx:.1},{ny:.1}"));
                 x = nx;
                 y = ny;
@@ -96,7 +104,11 @@ fn main() {
         let t = Instant::now();
         doc.raster_for_bench("", cx, cy, sc, w, h, 0xFFFFFF, false);
         let draw = t.elapsed().as_secs_f64() * 1000.0;
-        println!("  scale {sc:>7.2} · 만들기 {build:>7.1}ms (prim {prims}) · 찍기 {draw:>7.1}ms");
+        let (v0, v1) = doc.decimate_report("", 0.5 / sc);
+        println!(
+            "  scale {sc:>7.2} · 만들기 {build:>7.1}ms (prim {prims}) · 찍기 {draw:>7.1}ms · 점 {v0}→{v1} ({:.0}%)",
+            v1 as f64 / v0.max(1) as f64 * 100.0
+        );
     }
 
     // 조작 중에 해상도를 반으로 떨어뜨리면 픽셀이 1/4 이 된다 — 흔한 수다.

@@ -13,6 +13,7 @@ pub mod bimove;
 
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
+use cadcraft_geom::Vec2;
 use cadcraft_render::{DisplayList, Kind, Options};
 
 #[cfg(target_arch = "wasm32")]
@@ -106,6 +107,15 @@ impl Doc {
     ///
     /// `cx`,`cy` 는 화면 **가운데**에 올 도면 좌표, `scale` 은 도면 단위당 픽셀.
     #[allow(clippy::too_many_arguments)]
+    /// 계측용 — 덜어내기가 점을 얼마나 줄였나. `(전, 후)`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn decimate_report(&self, layout: &str, tol: f64) -> (usize, usize) {
+        let space = Self::space_of(layout);
+        let opts = Options { tolerance: tol, ..Options::default() };
+        let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
+        decimate(&mut dl, tol)
+    }
+
     /// 계측용 — 그릴 거리를 만드는 비용만 잰다.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn build_for_bench(&self, layout: &str, tolerance: f64) -> Frame {
@@ -157,6 +167,9 @@ impl Doc {
             let opts = Options { tolerance: tol, ..Options::default() };
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
             make_readable(&mut dl, bg_rgb);
+            // 그릴 때 쓰는 tolerance 와 **같은 값**으로 덜어낸다. 그래야
+            // 보이는 차이가 없다는 보장이 선다 (decimate 주석 참고).
+            decimate(&mut dl, tol);
             self.cache = Some((layout.to_string(), tol, bg, rev, dl));
         }
         let dl = &self.cache.as_ref()?.4;
@@ -179,6 +192,108 @@ impl Doc {
         demultiply_in_place(pm.data_mut());
         Some(Raster { rgba: pm.take(), w, h })
     }
+}
+
+// ── 화면에서 구분되지 않는 점 덜어내기 ──
+//
+// 전체 보기에서는 폴리라인 대부분이 1픽셀도 안 되는 디테일이다. 그걸 다 그리는
+// 게 프레임 시간의 거의 전부다 — 래스터라이저는 선분마다 화면 좌표로 옮기고
+// stroke 하므로 **비용이 선분 개수에 붙는다.** (해상도를 반으로 낮춰도 242→
+// 186ms 밖에 안 줄었다. 픽셀은 1/4 인데. 그래서 덜 그리는 것 말고 길이 없다.)
+//
+// 엔진의 `tolerance` 는 **곡선을 선분으로 쪼갤 때**만 쓰인다. 이미 선분인
+// 폴리라인은 줌을 아무리 빼도 점 수가 그대로다. 우리 도면은 들여올 때 전부
+// 선분으로 평평해져서 정확히 그 경우에 걸린다.
+//
+// 그래서 만들어진 그릴 거리에서 **화면 반 픽셀 안쪽인 점을 덜어낸다.**
+// Douglas–Peucker 는 "간략화한 선이 원래 선에서 ε 안에 있다" 를 보장하므로,
+// ε 를 그릴 때 쓰는 tolerance 와 같게 두면 **눈에 보이는 차이가 없다.**
+// 줌을 당기면 tolerance 가 작아지고 다시 만들면서 디테일이 돌아온다.
+//
+// 도면 자체(Drawing)는 손대지 않는다. 고르기·스냅·편집은 전부 엔티티를 보므로
+// 정확도가 그대로다 — 싸지는 건 픽셀뿐이다.
+
+/// 점에서 선분 `a`–`b` 까지의 거리. `a == b` 면 점까지의 거리.
+fn perp_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f64::MIN_POSITIVE {
+        return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    let (qx, qy) = (a.x + t * dx, a.y + t * dy);
+    ((p.x - qx).powi(2) + (p.y - qy).powi(2)).sqrt()
+}
+
+/// Douglas–Peucker. `keep[i]` 가 남길 점.
+///
+/// 재귀가 아니라 **제 스택**으로 돈다 — 한 폴리라인이 수천 점일 수 있어서,
+/// 최악의 경우(계단 모양) 재귀 깊이가 그만큼 간다.
+fn douglas_peucker(pts: &[Vec2], eps: f64, keep: &mut Vec<bool>) {
+    keep.clear();
+    keep.resize(pts.len(), false);
+    if pts.len() < 2 {
+        keep.iter_mut().for_each(|k| *k = true);
+        return;
+    }
+    let last = pts.len() - 1;
+    keep[0] = true;
+    keep[last] = true;
+    let mut stack = vec![(0usize, last)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        let (pa, pb) = (pts[a], pts[b]);
+        let mut best = 0.0;
+        let mut bi = a;
+        for (i, p) in pts.iter().enumerate().take(b).skip(a + 1) {
+            let d = perp_dist(*p, pa, pb);
+            if d > best {
+                best = d;
+                bi = i;
+            }
+        }
+        if best > eps && bi > a {
+            keep[bi] = true;
+            stack.push((a, bi));
+            stack.push((bi, b));
+        }
+    }
+}
+
+/// 그릴 거리의 폴리라인에서 ε 안쪽 점을 덜어낸다. `(전, 후)` 점 수.
+///
+/// **프리미티브를 지우지는 않는다** — 점만 줄인다. 글자(`texts[].prim`)와
+/// 레이어(`prim_layers`)가 프리미티브 번호로 서로를 가리키고 있어서, 하나라도
+/// 빼면 그 참조가 전부 어긋난다.
+fn decimate(dl: &mut DisplayList, eps: f64) -> (usize, usize) {
+    let before = dl.verts.len();
+    if !(eps.is_finite() && eps > 0.0) || dl.verts.is_empty() {
+        return (before, before);
+    }
+    let mut out: Vec<cadcraft_geom::Vec2> = Vec::with_capacity(dl.verts.len());
+    let mut keep: Vec<bool> = Vec::new();
+    for p in &mut dl.prims {
+        // Tris/Mask 는 `tris` 를 가리킨다 — 여기서 건드릴 것이 아니다.
+        if matches!(p.kind, Kind::Tris | Kind::Mask) {
+            continue;
+        }
+        let (s, l) = (p.start as usize, p.len as usize);
+        let Some(pts) = dl.verts.get(s..s + l) else { continue };
+        let start = out.len() as u32;
+        if l <= 2 {
+            out.extend_from_slice(pts);
+        } else {
+            douglas_peucker(pts, eps, &mut keep);
+            out.extend(pts.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p));
+        }
+        p.start = start;
+        p.len = out.len() as u32 - start;
+    }
+    let after = out.len();
+    dl.verts = out;
+    (before, after)
 }
 
 /// 알파 곱해진 RGBA 바이트를 **제자리에서** 곱하지 않은 값으로 되돌린다.
@@ -774,6 +889,115 @@ mod tests {
         let ink = (w as usize) * (h as usize) - bg;
         assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 선이 안 찍혔다");
         assert!(bg > 0, "전부 잉크다 — 배경색이 안 먹었다");
+    }
+
+    // ── 화면에서 구분되지 않는 점 덜어내기 ──
+    //
+    // 이건 **그려지는 픽셀을 바꾸는** 변경이라, "빨라졌다" 만으로는 부족하다.
+    // Douglas–Peucker 의 보장(간략화한 선이 원래 선에서 ε 안)이 실제로 서는지,
+    // 그리고 그릴 거리의 짜임(프리미티브 번호로 서로를 가리키는 구조)이
+    // 안 깨지는지를 본다.
+
+    fn v(x: f64, y: f64) -> Vec2 {
+        Vec2 { x, y }
+    }
+
+    /// 원래 점들이 간략화한 선에서 얼마나 멀어졌나 (최대).
+    fn max_deviation(orig: &[Vec2], keep: &[bool]) -> f64 {
+        let kept: Vec<Vec2> =
+            orig.iter().zip(keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
+        orig.iter()
+            .map(|p| {
+                kept.windows(2)
+                    .map(|w| perp_dist(*p, w[0], w[1]))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn 직선_위의_중간점은_사라진다() {
+        let pts = [v(0.0, 0.0), v(1.0, 0.0), v(2.0, 0.0), v(3.0, 0.0), v(4.0, 0.0)];
+        let mut keep = Vec::new();
+        douglas_peucker(&pts, 0.5, &mut keep);
+        assert_eq!(keep, vec![true, false, false, false, true]);
+    }
+
+    #[test]
+    fn 튀는_점은_남는다() {
+        // ε 보다 멀리 벗어난 점을 지우면 **선 모양이 달라진다.**
+        let pts = [v(0.0, 0.0), v(2.0, 5.0), v(4.0, 0.0)];
+        let mut keep = Vec::new();
+        douglas_peucker(&pts, 0.5, &mut keep);
+        assert_eq!(keep, vec![true, true, true]);
+    }
+
+    #[test]
+    fn 양_끝은_언제나_남는다() {
+        // 끝점을 잃으면 선이 짧아진다 — 도면에서는 벽이 안 닿는 걸로 보인다.
+        let pts = [v(0.0, 0.0), v(1.0, 0.0), v(2.0, 0.0)];
+        let mut keep = Vec::new();
+        douglas_peucker(&pts, 100.0, &mut keep);
+        assert!(keep[0] && keep[2]);
+    }
+
+    #[test]
+    fn 어긋남이_ε_를_넘지_않는다() {
+        // 이게 이 변경의 **보장 그 자체**다. 깨지면 도면이 눈에 띄게 달라진다.
+        let mut r = 12_345_u64;
+        let mut next = || {
+            r = r.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((r >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        for eps in [0.1, 0.5, 2.0, 10.0] {
+            let pts: Vec<Vec2> =
+                (0..400).map(|i| v(f64::from(i) * 0.7, (next() - 0.5) * 20.0)).collect();
+            let mut keep = Vec::new();
+            douglas_peucker(&pts, eps, &mut keep);
+            let dev = max_deviation(&pts, &keep);
+            assert!(dev <= eps + 1e-9, "ε {eps} 인데 {dev} 만큼 어긋났다");
+        }
+    }
+
+    #[test]
+    fn 닫힌_선도_다룬다() {
+        // 첫 점과 끝 점이 같으면 기준선이 길이 0 이다. 거기서 0 으로 나누면
+        // NaN 이 번져서 도면이 통째로 사라진다.
+        let pts = [v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0), v(0.0, 0.0)];
+        let mut keep = Vec::new();
+        douglas_peucker(&pts, 0.5, &mut keep);
+        assert_eq!(keep.iter().filter(|k| **k).count(), 5, "사각형 꼭짓점이 사라졌다");
+    }
+
+    #[test]
+    fn 덜어내도_프리미티브_수는_그대로다() {
+        // 글자(texts[].prim)와 레이어(prim_layers)가 프리미티브 **번호**로
+        // 서로를 가리킨다. 하나라도 빼면 그 참조가 전부 어긋난다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let before = doc.build("", 0.001).prims.len();
+        // 거칠게 그려도(=많이 덜어내도) 개수는 안 변해야 한다
+        doc.raster("", 0.0, 0.0, 0.001, 64, 64, 0xFFFFFF, false);
+        let after = doc.build("", 0.001).prims.len();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn ε_가_말이_안_되면_아무것도_안_한다() {
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let (a, b) = doc.decimate_report("", bad);
+            assert_eq!(a, b, "ε {bad} 인데 점을 건드렸다");
+        }
+    }
+
+    #[test]
+    fn 덜어내도_그려지는_건_그대로다() {
+        // 숫자만 줄고 화면이 비면 아무 소용이 없다. 잉크 픽셀이 남아 있는지
+        // 본다 (덜어내기는 반 픽셀 안쪽만 건드리므로 크게 달라질 수 없다).
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let r = doc.raster("", 50.0, -25.0, 1.5, 200, 100, 0xFFFFFF, false).unwrap();
+        let ink = r.rgba.chunks_exact(4).filter(|p| !(p[0] == 255 && p[1] == 255 && p[2] == 255)).count();
+        assert!(ink > 20, "덜어내고 나니 {ink} 픽셀뿐 — 도면이 사라졌다");
     }
 
     // ── Bimove 문서로 여는 길 ──
