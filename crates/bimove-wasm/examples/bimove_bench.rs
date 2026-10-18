@@ -99,6 +99,28 @@ fn main() {
         println!("  scale {sc:>7.2} · 만들기 {build:>7.1}ms (prim {prims}) · 찍기 {draw:>7.1}ms");
     }
 
+    // 조작 중에 해상도를 반으로 떨어뜨리면 픽셀이 1/4 이 된다 — 흔한 수다.
+    //
+    // **여기선 별로 안 벌린다.** 재보니 242→186ms, 54→33ms 다. 비용이 픽셀이
+    // 아니라 **선분 개수**에 붙어 있기 때문이다 (59만 선분을 해상도와 무관하게
+    // 매번 화면 좌표로 옮기고 stroke 한다). 그래서 안 넣었다 — 이 줄은 그
+    // 측정을 남겨두려고 있다. 같은 이유로 "path 를 묶어서 한 번에 stroke" 도
+    // 기대만큼 안 벌 것이다.
+    //
+    // 진짜 레버는 **선분을 덜 그리는 것** 하나다 (전체 보기에서 1픽셀도 안 되는
+    // 디테일을 간략화한 사본을 따로 들고 갈아끼우기).
+    for (lbl, dw, dh, mul) in [("전체해상도", w, h, 1.0_f64), ("절반해상도", w / 2, h / 2, 0.5)] {
+        for sc in [0.2_f64, 2.0] {
+            doc.raster_for_bench("", cx, cy, sc * mul, dw, dh, 0xFFFFFF, true);
+            let t = Instant::now();
+            doc.raster_for_bench("", cx, cy, sc * mul, dw, dh, 0xFFFFFF, true);
+            println!(
+                "  {lbl} scale {sc:>5.2} → {:>6.1}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
     for draft in [false, true] {
         sweep(&mut doc, w, h, cx, cy, draft);
     }
