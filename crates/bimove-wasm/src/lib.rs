@@ -9,7 +9,7 @@
 //! 으로 하나씩 넘기면 경계를 넘는 비용이 그리는 비용보다 커진다. 도면 하나가
 //! 수만 개 선분이라 이게 전부다.
 
-mod bimove;
+pub mod bimove;
 
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
@@ -52,7 +52,7 @@ fn kind_code(k: Kind) -> i32 {
 pub struct Frame {
     verts: Vec<f64>,
     tris: Vec<f64>,
-    prims: Vec<i32>,
+    pub prims: Vec<i32>,
     bounds: [f64; 4],
     expanded: usize,
 }
@@ -106,8 +106,25 @@ impl Doc {
     ///
     /// `cx`,`cy` 는 화면 **가운데**에 올 도면 좌표, `scale` 은 도면 단위당 픽셀.
     #[allow(clippy::too_many_arguments)]
+    /// 계측용 — 그릴 거리를 만드는 비용만 잰다.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn build_for_bench(&self, layout: &str, tolerance: f64) -> Frame {
+        self.build(layout, tolerance)
+    }
+
+    /// 계측용 창구. 네이티브 예제(`examples/bimove_bench.rs`)가 쓴다 —
+    /// wasm 바깥에서 재야 브라우저를 띄우지 않고 프레임 시간을 볼 수 있다.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn raster_for_bench(
+        &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+        draft: bool,
+    ) -> Option<Raster> {
+        self.raster(layout, cx, cy, scale, w, h, bg, draft)
+    }
+
     fn raster(
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+        draft: bool,
     ) -> Option<Raster> {
         let bg_rgb = cadcraft_color::Rgb((bg >> 16) as u8, (bg >> 8) as u8, bg as u8);
         // 곡선을 선분으로 쪼갤 오차는 "화면 반 픽셀". 줌이 바뀌면 같이 바뀐다.
@@ -116,9 +133,26 @@ impl Doc {
         // 목록을 쓰면 안 된다.
         let rev = self.revision();
         let reusable = self.cache.as_ref().is_some_and(|(l, t, b, r, _)| {
-            l == layout && *b == bg && *r == rev && *t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK
+            l == layout
+                && *b == bg
+                && *r == rev
+                // `draft` 면 tolerance 가 얼마나 어긋나든 쓰던 걸 쓴다.
+                //
+                // 휠을 굴리는 동안은 한 옥타브마다 목록을 새로 만든다. 60만
+                // 선분짜리에서 그게 **프레임당 150ms** 다 (실측). 그동안 JS 가
+                // 막혀 있어서 브라우저는 직전 그림을 계속 보여준다 — 한이 본
+                // "줌할 때 텍스트 잔상" 이 그거다.
+                //
+                // 거친 목록으로 한 프레임 그리는 건 손해가 거의 없다. 우리
+                // 도면은 들여올 때 이미 선분으로 평평해져서 tolerance 가
+                // 바꾸는 건 글자 외곽선뿐이다. 손을 떼면 호출부가 draft 를
+                // 끄고 한 번 더 그려서 제대로 맞춘다.
+                && (draft || (*t / TOL_SLACK <= tol && tol <= *t * TOL_SLACK))
         });
         if !reusable {
+            // **만들기 전에 옛것을 놓는다.** 그냥 덮어쓰면 두 목록이 잠깐
+            // 동시에 산다 — 60만 선분이면 그만큼이 한 번 더 필요하다.
+            self.cache = None;
             let space = Self::space_of(layout);
             let opts = Options { tolerance: tol, ..Options::default() };
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
@@ -133,17 +167,40 @@ impl Doc {
             height: h,
         };
         let ro = cadcraft_render::raster::RasterOptions { background: bg_rgb, ..Default::default() };
-        let pm = cadcraft_render::raster::render(dl, &view, &ro)?;
+        let mut pm = cadcraft_render::raster::render(dl, &view, &ro)?;
 
         // tiny-skia 는 **알파 곱해진(premultiplied)** 픽셀을 준다. 캔버스
         // ImageData 는 곱하지 않은 값을 원한다 — 그냥 넘기면 반투명한 것이
         // 어둡게 나온다. 여기서 되돌린다.
-        let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for p in pm.pixels() {
-            let c = p.demultiply();
-            rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        //
+        // **제자리에서** 되돌린다. 새 Vec 에 담으면 1874×1000 한 장에 7.5MB 를
+        // 프레임마다 더 잡는다 — 그리는 비용에 비하면 작지만, 줌에서 목록을
+        // 다시 만드는 순간과 겹치면 가장 아쉬운 자리다.
+        demultiply_in_place(pm.data_mut());
+        Some(Raster { rgba: pm.take(), w, h })
+    }
+}
+
+/// 알파 곱해진 RGBA 바이트를 **제자리에서** 곱하지 않은 값으로 되돌린다.
+///
+/// tiny-skia 의 `PremultipliedColorU8::demultiply()` 와 같은 값을 내야 한다 —
+/// 반올림이 1 이라도 어긋나면 반투명한 해치가 미묘하게 다른 색이 된다.
+/// 그래서 그 함수를 그대로 부른다.
+fn demultiply_in_place(data: &mut [u8]) {
+    use tiny_skia::PremultipliedColorU8;
+    for px in data.chunks_exact_mut(4) {
+        // 불투명(가장 흔한 경우)은 되돌릴 게 없다.
+        if px[3] == 255 {
+            continue;
         }
-        Some(Raster { rgba, w, h })
+        let Some(p) = PremultipliedColorU8::from_rgba(px[0], px[1], px[2], px[3]) else {
+            continue;
+        };
+        let c = p.demultiply();
+        px[0] = c.red();
+        px[1] = c.green();
+        px[2] = c.blue();
+        px[3] = c.alpha();
     }
 }
 
@@ -353,7 +410,7 @@ impl Doc {
     /// DXF 를 거치지 않는다. 저장된 도면을 DXF 로 다시 써서 읽히는 길도 있지만,
     /// 그 왕복에서 색·레이어·글자 맞춤이 한 번 더 뭉개진다 — 그리고 애초에
     /// 지금 저장된 건 DXF 가 아니라 평평해진 선분이라 되돌릴 원본이 없다.
-    fn from_bimove(json: &str, page_id: &str) -> Result<Doc, String> {
+    pub fn from_bimove(json: &str, page_id: &str) -> Result<Doc, String> {
         let load = bimove::drawing_from_bimove(json, page_id)?;
         let counts = (load.line_count, load.text_count);
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
@@ -558,12 +615,17 @@ impl BimoveDoc {
 
     /// 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
     /// `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
+    /// `draft` 면 **그릴 거리를 다시 만들지 않는다** — 쓰던 걸 그대로 쓴다.
+    /// 휠·드래그 중에 켜라. 60만 선분짜리에서 목록 다시 만들기가 프레임당
+    /// 150ms 라, 그 프레임이 통째로 밀리면서 직전 그림이 남아 보인다.
+    /// 손을 떼면 draft 를 끄고 한 번 더 그려서 제대로 맞춘다.
     #[wasm_bindgen(js_name = renderPixels)]
     #[allow(clippy::too_many_arguments)]
     pub fn render_pixels(
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
+        draft: bool,
     ) -> Option<BimoveRaster> {
-        self.0.raster(layout, cx, cy, scale, w, h, bg).map(BimoveRaster)
+        self.0.raster(layout, cx, cy, scale, w, h, bg, draft).map(BimoveRaster)
     }
 }
 
@@ -703,7 +765,7 @@ mod tests {
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
         let (w, h) = (200, 100);
         // (0,0)~(100,50) 선을 가운데(50,25)에 두고 1.5px/단위로
-        let r = doc.raster("", 50.0, 25.0, 1.5, w, h, 0xFFFFFF).expect("래스터 실패");
+        let r = doc.raster("", 50.0, 25.0, 1.5, w, h, 0xFFFFFF, false).expect("래스터 실패");
         assert_eq!(r.w, w);
         assert_eq!(r.h, h);
         assert_eq!(r.rgba.len(), (w as usize) * (h as usize) * 4, "RGBA 길이가 안 맞는다");
@@ -740,7 +802,7 @@ mod tests {
         let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
         let (w, h) = (200, 100);
         // 캔버스 y 가 뒤집히므로 도면은 y = -50..0 에 있다
-        let r = doc.raster("", 50.0, -25.0, 1.5, w, h, 0xFFFFFF).expect("래스터 실패");
+        let r = doc.raster("", 50.0, -25.0, 1.5, w, h, 0xFFFFFF, false).expect("래스터 실패");
         let bg = r.rgba.chunks_exact(4).filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255).count();
         let ink = (w as usize) * (h as usize) - bg;
         assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 아무것도 안 찍혔다");
@@ -786,7 +848,7 @@ mod tests {
         // tiny-skia 는 알파가 곱해진 픽셀을 준다. 그대로 넘기면 캔버스에서
         // 색이 어두워진다. 불투명 배경이니 알파가 전부 255 여야 한다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        let r = doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        let r = doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false).unwrap();
         assert!(r.rgba.chunks_exact(4).all(|p| p[3] == 255), "알파가 255 가 아닌 픽셀이 있다");
     }
 
@@ -795,9 +857,9 @@ mod tests {
         // 카메라만 움직이면 같은 DisplayList 를 쓴다. 이게 깨지면 45MB 도면에서
         // 한 프레임이 15ms 에서 240ms 로 돌아간다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false).unwrap();
         let built = doc.cache.as_ref().map(|(_, t, _, _, dl)| (*t, dl.prims.len())).unwrap();
-        doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF, false).unwrap();
         let after = doc.cache.as_ref().map(|(_, t, _, _, dl)| (*t, dl.prims.len())).unwrap();
         assert_eq!(built, after, "팬만 했는데 목록이 다시 만들어졌다");
     }
@@ -807,13 +869,13 @@ mod tests {
         // tolerance 는 줌에 반비례한다. 2배 안쪽은 그대로 쓰고, 넘으면 다시
         // 만들어야 곡선이 거칠어지지 않는다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF, false).unwrap();
         let t0 = doc.cache.as_ref().unwrap().1;
 
-        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().1, t0, "1.5배 줌은 다시 만들 일이 아니다");
 
-        doc.raster("", 50.0, 25.0, 10.0, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 50.0, 25.0, 10.0, 64, 64, 0xFFFFFF, false).unwrap();
         assert_ne!(doc.cache.as_ref().unwrap().1, t0, "10배 줌인데 그대로 썼다");
     }
 
@@ -821,9 +883,9 @@ mod tests {
     fn 공간이_바뀌면_다시_만든다() {
         // 모형 ↔ 배치는 아예 다른 내용이다. 캐시를 그대로 쓰면 엉뚱한 걸 그린다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().0, "");
-        doc.raster("배치1", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("배치1", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().0, "배치1", "공간이 바뀌었는데 캐시가 그대로다");
     }
 
@@ -900,7 +962,7 @@ mod tests {
     #[test]
     fn 크기가_0_이면_실패를_돌려준다() {
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF).is_none());
+        assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF, false).is_none());
     }
 
     // ── 선택 · 스냅 ──
@@ -981,7 +1043,7 @@ mod tests {
 
     /// 지금 모형공간을 그리면 프리미티브가 몇 개인가.
     fn prim_count(doc: &mut Doc) -> usize {
-        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF).unwrap();
+        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF, false).unwrap();
         doc.cache.as_ref().unwrap().4.prims.len()
     }
 

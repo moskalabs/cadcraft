@@ -27,8 +27,8 @@
 //! "여기서는 안 한다" 가 맞는 것도 섞여 있다.
 
 use cadcraft_color::{Color, Rgb};
-use cadcraft_doc::{Drawing, Entity, EntityKind, Line, MText};
-use cadcraft_geom::Vec3;
+use cadcraft_doc::{Drawing, Entity, EntityKind, Line, LwPolyline, MText};
+use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -41,8 +41,11 @@ pub struct BimoveLoad {
     pub page_id: String,
     /// 그리지 **않은** 것. 사람이 읽는 문장이다.
     pub notes: Vec<String>,
+    /// 만든 엔티티 수 (선 + 폴리라인).
     pub line_count: usize,
     pub text_count: usize,
+    /// 이어 붙이기 전의 선분 수. `line_count` 와 견주면 얼마나 줄었는지 보인다.
+    pub segment_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -179,6 +182,46 @@ fn parse_path(d: &str) -> (Vec<[f64; 4]>, usize) {
     (segs, unknown)
 }
 
+/// 끝점이 같다고 볼 오차. 들여올 때 좌표를 소수 첫째 자리로 반올림했으므로
+/// (`toFixed(1)`) 그보다 작게 잡으면 붙어 있던 것도 안 붙는다.
+const JOIN_EPS: f64 = 0.05;
+
+/// 이어지는 선분을 **한 줄로 묶는다.**
+///
+/// Bimove 는 폴리라인을 `M a L b M b L c …` 로 쪼개 저장한다. 그대로 엔티티로
+/// 만들면 40점짜리 폴리라인 하나가 선 39개가 된다. 그게 그대로 프레임 시간이다
+/// — 래스터라이저는 프리미티브마다 path 를 만들어 한 번씩 stroke 하므로,
+/// 개수가 곧 비용이다 (60만 선분짜리에서 한 장에 900ms 를 쟀다).
+///
+/// 들어온 차례대로 보면서 앞 선분의 끝에서 시작하는 것만 잇는다. 정렬하거나
+/// 멀리서 찾아오지 않는다 — 들여올 때 같은 폴리라인의 선분이 이미 붙어 있고,
+/// 욕심내면 원래 떨어져 있던 선이 이어 붙어 **없던 선이 생긴다.**
+fn chain(segs: &[[f64; 4]]) -> Vec<Vec<(f64, f64)>> {
+    let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut cur: Vec<(f64, f64)> = Vec::new();
+    for sg in segs {
+        let (a, b) = ((sg[0], sg[1]), (sg[2], sg[3]));
+        match cur.last() {
+            Some(&last) if (last.0 - a.0).abs() <= JOIN_EPS && (last.1 - a.1).abs() <= JOIN_EPS => {
+                cur.push(b);
+            }
+            _ => {
+                if cur.len() >= 2 {
+                    out.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+                cur.push(a);
+                cur.push(b);
+            }
+        }
+    }
+    if cur.len() >= 2 {
+        out.push(cur);
+    }
+    out
+}
+
 /// `textsJson` 을 푼다 — 신형(테이블 압축)과 구형(그냥 배열) 둘 다.
 ///
 /// 신형은 `{F:[폰트], C:[색], T:[{…, fi, ci}]}` 다. 폰트·색 문자열이 글자마다
@@ -270,6 +313,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut unknown_cmds = 0usize;
     let mut line_count = 0usize;
     let mut text_count = 0usize;
+    let mut segment_count = 0usize;
 
     for sh in &shapes {
         let parent = s(sh, "parentId").unwrap_or("");
@@ -295,16 +339,26 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         if let Some(d) = s(&props, "pathData") {
             let (segs, unknown) = parse_path(d);
             unknown_cmds += unknown;
-            for sg in segs {
+            segment_count += segs.len();
+            // y 를 뒤집는다 — 캔버스는 아래로, 엔진은 위로 간다
+            let at = |p: (f64, f64)| Vec2::new(gx + p.0, -(gy + p.1));
+            for run in chain(&segs) {
                 let h = drawing.new_handle();
-                let mut e = Entity::new(
-                    h,
+                let kind = if run.len() == 2 {
                     EntityKind::Line(Line {
-                        // y 를 뒤집는다 — 캔버스는 아래로, 엔진은 위로 간다
-                        a: Vec3::new(gx + sg[0], -(gy + sg[1]), 0.0),
-                        b: Vec3::new(gx + sg[2], -(gy + sg[3]), 0.0),
-                    }),
-                );
+                        a: { let p = at(run[0]); Vec3::new(p.x, p.y, 0.0) },
+                        b: { let p = at(run[1]); Vec3::new(p.x, p.y, 0.0) },
+                    })
+                } else {
+                    EntityKind::LwPolyline(LwPolyline {
+                        vertices: run.iter().map(|&p| PolyVertex::new(at(p))).collect(),
+                        closed: false,
+                        const_width: 0.0,
+                        elevation: 0.0,
+                        plinegen: false,
+                    })
+                };
+                let mut e = Entity::new(h, kind);
                 e.common.layer = layer.clone();
                 e.common.color = color;
                 drawing.model.push(e);
@@ -367,7 +421,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         notes.push(format!("{k} {n}개 — 여기서 안 그린다 (Bimove overlay 몫)"));
     }
 
-    Ok(BimoveLoad { drawing, pages, page_id: want, notes, line_count, text_count })
+    Ok(BimoveLoad { drawing, pages, page_id: want, notes, line_count, text_count, segment_count })
 }
 
 #[cfg(test)]
@@ -439,6 +493,67 @@ mod tests {
         assert_eq!(parse_path("").0.len(), 0);
         assert_eq!(parse_path("Z").0.len(), 0);
         assert_eq!(parse_path("M0,0").0.len(), 0);
+    }
+
+    #[test]
+    fn 이어지는_선분이_한_줄로_묶인다() {
+        // Bimove 는 폴리라인을 M/L 짝으로 쪼개 저장한다. 그대로 두면 40점짜리
+        // 폴리라인 하나가 엔티티 39개가 되고, 그 개수가 그대로 프레임 시간이다.
+        let runs = chain(&[[0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 2.0, 0.0], [2.0, 0.0, 2.0, 1.0]]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0], vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (2.0, 1.0)]);
+    }
+
+    #[test]
+    fn 떨어진_선분은_잇지_않는다() {
+        // 욕심내서 이으면 **없던 선이 생긴다.** 도면에서 그건 치명적이다.
+        let runs = chain(&[[0.0, 0.0, 1.0, 0.0], [5.0, 5.0, 6.0, 5.0]]);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], vec![(0.0, 0.0), (1.0, 0.0)]);
+        assert_eq!(runs[1], vec![(5.0, 5.0), (6.0, 5.0)]);
+    }
+
+    #[test]
+    fn 반올림_오차만큼은_같은_점으로_본다() {
+        // 들여올 때 소수 첫째 자리로 반올림했다(toFixed(1)). 정확히 같기를
+        // 바라면 붙어 있던 폴리라인이 안 이어진다.
+        let runs = chain(&[[0.0, 0.0, 1.0, 0.0], [1.02, 0.0, 2.0, 0.0]]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len(), 3);
+    }
+
+    #[test]
+    fn 이어진_것은_폴리라인_떨어진_것은_선() {
+        let j = doc_json(
+            r#"{"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a1",
+                "parentId":"page:main",
+                "props":{"pathData":"M0,0L1,0M1,0L2,0M9,9L10,9"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.segment_count, 3);
+        assert_eq!(r.line_count, 2, "엔티티 2개(폴리라인 1 + 선 1)여야 한다");
+        let kinds: Vec<&str> = r.drawing.model.iter().map(|e| e.kind.type_name()).collect();
+        assert!(kinds.contains(&"Polyline"), "{kinds:?}");
+        assert!(kinds.contains(&"Line"), "{kinds:?}");
+    }
+
+    #[test]
+    fn 묶여도_점은_하나도_안_잃는다() {
+        // 이어 붙이기가 좌표를 먹으면 도면이 조용히 달라진다.
+        let j = doc_json(
+            r#"{"id":"shape:g","type":"dxfgroup","x":100,"y":50,"rotation":0,"index":"a1",
+                "parentId":"page:main",
+                "props":{"pathData":"M0,0L10,0M10,0L10,20"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        match &r.drawing.model.iter().next().unwrap().kind {
+            EntityKind::LwPolyline(p) => {
+                let pts: Vec<(f64, f64)> = p.vertices.iter().map(|v| (v.p.x, v.p.y)).collect();
+                // 도형 위치가 더해지고 y 가 뒤집힌다
+                assert_eq!(pts, vec![(100.0, -50.0), (110.0, -50.0), (110.0, -70.0)]);
+            }
+            k => panic!("폴리라인이 아니다: {}", k.type_name()),
+        }
     }
 
     fn doc_json(shapes: &str) -> String {

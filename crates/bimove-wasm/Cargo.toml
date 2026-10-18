@@ -20,6 +20,9 @@ cadcraft-geom = { workspace = true }
 cadcraft-fonts = { workspace = true }
 cadcraft-color = { workspace = true }
 cadcraft-engine = { workspace = true }
+# 래스터 픽셀을 제자리에서 손보려고 쓴다 (알파 되돌리기). render 가 주는
+# Pixmap 의 타입이라 버전이 어긋나면 안 돼서 workspace 것을 그대로 받는다.
+tiny-skia = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

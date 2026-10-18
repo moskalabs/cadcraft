@@ -452,6 +452,7 @@ dependencies = [
  "cadcraft-io",
  "cadcraft-render",
  "serde_json",
+ "tiny-skia",
  "wasm-bindgen",
 ]
 

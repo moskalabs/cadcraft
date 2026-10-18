@@ -75,8 +75,12 @@ export class BimoveDoc {
     /**
      * 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
      * `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
+     * `draft` 면 **그릴 거리를 다시 만들지 않는다** — 쓰던 걸 그대로 쓴다.
+     * 휠·드래그 중에 켜라. 60만 선분짜리에서 목록 다시 만들기가 프레임당
+     * 150ms 라, 그 프레임이 통째로 밀리면서 직전 그림이 남아 보인다.
+     * 손을 떼면 draft 를 끄고 한 번 더 그려서 제대로 맞춘다.
      */
-    renderPixels(layout: string, cx: number, cy: number, scale: number, w: number, h: number, bg: number): BimoveRaster | undefined;
+    renderPixels(layout: string, cx: number, cy: number, scale: number, w: number, h: number, bg: number, draft: boolean): BimoveRaster | undefined;
     /**
      * 도면 판번호. 편집할 때마다 올라간다 — UI 가 "다시 그려야 하나" 를 이걸로 안다.
      */
@@ -184,7 +188,7 @@ export interface InitOutput {
     readonly bimovedoc_pageNames: (a: number) => [number, number];
     readonly bimovedoc_pick: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly bimovedoc_pickWindow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
-    readonly bimovedoc_renderPixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+    readonly bimovedoc_renderPixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => number;
     readonly bimovedoc_revision: (a: number) => number;
     readonly bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
     readonly bimovedoc_textCount: (a: number) => number;

@@ -209,6 +209,10 @@ export class BimoveDoc {
     /**
      * 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
      * `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
+     * `draft` 면 **그릴 거리를 다시 만들지 않는다** — 쓰던 걸 그대로 쓴다.
+     * 휠·드래그 중에 켜라. 60만 선분짜리에서 목록 다시 만들기가 프레임당
+     * 150ms 라, 그 프레임이 통째로 밀리면서 직전 그림이 남아 보인다.
+     * 손을 떼면 draft 를 끄고 한 번 더 그려서 제대로 맞춘다.
      * @param {string} layout
      * @param {number} cx
      * @param {number} cy
@@ -216,12 +220,13 @@ export class BimoveDoc {
      * @param {number} w
      * @param {number} h
      * @param {number} bg
+     * @param {boolean} draft
      * @returns {BimoveRaster | undefined}
      */
-    renderPixels(layout, cx, cy, scale, w, h, bg) {
+    renderPixels(layout, cx, cy, scale, w, h, bg, draft) {
         const ptr0 = passStringToWasm0(layout, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.bimovedoc_renderPixels(this.__wbg_ptr, ptr0, len0, cx, cy, scale, w, h, bg);
+        const ret = wasm.bimovedoc_renderPixels(this.__wbg_ptr, ptr0, len0, cx, cy, scale, w, h, bg, draft);
         return ret === 0 ? undefined : BimoveRaster.__wrap(ret);
     }
     /**
