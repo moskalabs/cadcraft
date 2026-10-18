@@ -29,13 +29,41 @@ export class BimoveDoc {
      */
     exec(id: string, params_json: string): string;
     /**
+     * Bimove 문서(우리 포맷 JSON)를 읽는다. `page_id` 가 "" 면 첫 페이지.
+     *
+     * tldraw 로 저장된 도면을 엔진으로 그려보는 길이다. `pageIds`/`pageNames`
+     * 로 다른 페이지를 고르고, **`notes` 로 안 그린 것을 받는다** — 해치와
+     * Bimove 고유 도형(벽체·공간·치수…)은 아직 안 나온다.
+     */
+    static fromBimove(json: string, page_id: string): BimoveDoc;
+    /**
      * 배치 탭 이름들.
      */
     layoutNames(): string[];
     /**
+     * Bimove 문서에서 만든 선 개수.
+     */
+    lineCount(): number;
+    /**
+     * 옮기면서 **그리지 않은 것**. 비어 있으면 다 그렸다는 뜻이다.
+     */
+    notes(): string[];
+    /**
      * DXF 바이트를 읽는다 (ASCII/바이너리 둘 다).
      */
     static openDxf(bytes: Uint8Array): BimoveDoc;
+    /**
+     * 지금 보고 있는 페이지 id. "" 를 넘겼으면 첫 페이지가 여기 들어 있다.
+     */
+    pageId(): string;
+    /**
+     * Bimove 문서의 페이지 id 들 (DXF 에서 열었으면 빈 배열).
+     */
+    pageIds(): string[];
+    /**
+     * 같은 차례의 페이지 이름들.
+     */
+    pageNames(): string[];
     /**
      * 사각형 선택. `crossing` = 걸치기만 해도 잡기 (오→왼 드래그).
      */
@@ -58,6 +86,10 @@ export class BimoveDoc {
      * `baseX`/`baseY` 가 NaN 이면 시작점 없음으로 본다 (수직·연장이 그걸 본다).
      */
     snap(layout: string, x: number, y: number, aperture: number, osmode: number, base_x: number, base_y: number): BimoveSnap | undefined;
+    /**
+     * Bimove 문서에서 만든 글자 개수.
+     */
+    textCount(): number;
 }
 
 export class BimoveFrame {
@@ -142,13 +174,20 @@ export interface InitOutput {
     readonly __wbg_bimovesnap_free: (a: number, b: number) => void;
     readonly bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) => number;
     readonly bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly bimovedoc_layoutNames: (a: number) => [number, number];
+    readonly bimovedoc_lineCount: (a: number) => number;
+    readonly bimovedoc_notes: (a: number) => [number, number];
     readonly bimovedoc_openDxf: (a: number, b: number) => [number, number, number];
+    readonly bimovedoc_pageId: (a: number) => [number, number];
+    readonly bimovedoc_pageIds: (a: number) => [number, number];
+    readonly bimovedoc_pageNames: (a: number) => [number, number];
     readonly bimovedoc_pick: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly bimovedoc_pickWindow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
     readonly bimovedoc_renderPixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
     readonly bimovedoc_revision: (a: number) => number;
     readonly bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+    readonly bimovedoc_textCount: (a: number) => number;
     readonly bimoveframe_bounds: (a: number) => [number, number];
     readonly bimoveframe_expanded: (a: number) => number;
     readonly bimoveframe_primCount: (a: number) => number;

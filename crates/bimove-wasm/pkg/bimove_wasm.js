@@ -73,11 +73,50 @@ export class BimoveDoc {
         }
     }
     /**
+     * Bimove 문서(우리 포맷 JSON)를 읽는다. `page_id` 가 "" 면 첫 페이지.
+     *
+     * tldraw 로 저장된 도면을 엔진으로 그려보는 길이다. `pageIds`/`pageNames`
+     * 로 다른 페이지를 고르고, **`notes` 로 안 그린 것을 받는다** — 해치와
+     * Bimove 고유 도형(벽체·공간·치수…)은 아직 안 나온다.
+     * @param {string} json
+     * @param {string} page_id
+     * @returns {BimoveDoc}
+     */
+    static fromBimove(json, page_id) {
+        const ptr0 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(page_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.bimovedoc_fromBimove(ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return BimoveDoc.__wrap(ret[0]);
+    }
+    /**
      * 배치 탭 이름들.
      * @returns {string[]}
      */
     layoutNames() {
         const ret = wasm.bimovedoc_layoutNames(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]);
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * Bimove 문서에서 만든 선 개수.
+     * @returns {number}
+     */
+    lineCount() {
+        const ret = wasm.bimovedoc_lineCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * 옮기면서 **그리지 않은 것**. 비어 있으면 다 그렸다는 뜻이다.
+     * @returns {string[]}
+     */
+    notes() {
+        const ret = wasm.bimovedoc_notes(this.__wbg_ptr);
         var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]);
         wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
         return v1;
@@ -95,6 +134,42 @@ export class BimoveDoc {
             throw takeFromExternrefTable0(ret[1]);
         }
         return BimoveDoc.__wrap(ret[0]);
+    }
+    /**
+     * 지금 보고 있는 페이지 id. "" 를 넘겼으면 첫 페이지가 여기 들어 있다.
+     * @returns {string}
+     */
+    pageId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.bimovedoc_pageId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Bimove 문서의 페이지 id 들 (DXF 에서 열었으면 빈 배열).
+     * @returns {string[]}
+     */
+    pageIds() {
+        const ret = wasm.bimovedoc_pageIds(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]);
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * 같은 차례의 페이지 이름들.
+     * @returns {string[]}
+     */
+    pageNames() {
+        const ret = wasm.bimovedoc_pageNames(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]);
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
     /**
      * 사각형 선택. `crossing` = 걸치기만 해도 잡기 (오→왼 드래그).
@@ -174,6 +249,14 @@ export class BimoveDoc {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.bimovedoc_snap(this.__wbg_ptr, ptr0, len0, x, y, aperture, osmode, base_x, base_y);
         return ret === 0 ? undefined : BimoveSnap.__wrap(ret);
+    }
+    /**
+     * Bimove 문서에서 만든 글자 개수.
+     * @returns {number}
+     */
+    textCount() {
+        const ret = wasm.bimovedoc_textCount(this.__wbg_ptr);
+        return ret >>> 0;
     }
 }
 if (Symbol.dispose) BimoveDoc.prototype[Symbol.dispose] = BimoveDoc.prototype.free;

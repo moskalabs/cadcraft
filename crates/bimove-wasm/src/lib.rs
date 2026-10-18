@@ -9,6 +9,8 @@
 //! 으로 하나씩 넘기면 경계를 넘는 비용이 그리는 비용보다 커진다. 도면 하나가
 //! 수만 개 선분이라 이게 전부다.
 
+mod bimove;
+
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
 use cadcraft_render::{DisplayList, Kind, Options};
@@ -312,6 +314,14 @@ fn set_fallbacks(list: &str) {
 /// 안 된다 — 명령·되돌리기·선택이 전부 Session 에 매달려 있다.
 pub struct Doc {
     session: Session,
+    /// Bimove 문서에서 왔을 때의 페이지 목록 `(id, 이름)`. DXF 에서 왔으면 빈 배열.
+    pages: Vec<(String, String)>,
+    /// 옮기면서 **그리지 않은 것**. 조용히 빼면 "다 나왔다" 로 보인다.
+    notes: Vec<String>,
+    /// Bimove 문서에서 만든 선/글자 수 (상태줄에 띄운다).
+    counts: (usize, usize),
+    /// 실제로 옮긴 페이지 id. "" 를 넘겼을 때 **무엇이 골라졌는지** 알려준다.
+    page_id: String,
     /// 마지막으로 만든 DisplayList 와 그때의 (공간, tolerance).
     ///
     /// **이게 성능의 전부다.** 매 프레임 build 하면 45MB 도면에서 한 장이
@@ -335,9 +345,27 @@ const TOL_SLACK: f64 = 2.0;
 impl Doc {
     fn open(bytes: &[u8]) -> Result<Doc, String> {
         let drawing = cadcraft_io::read_dxf(bytes).map_err(|e| e.to_string())?;
+        Ok(Doc::of(drawing, Vec::new(), Vec::new(), (0, 0), String::new()))
+    }
+
+    /// Bimove 문서(우리 포맷 JSON)를 읽는다.
+    ///
+    /// DXF 를 거치지 않는다. 저장된 도면을 DXF 로 다시 써서 읽히는 길도 있지만,
+    /// 그 왕복에서 색·레이어·글자 맞춤이 한 번 더 뭉개진다 — 그리고 애초에
+    /// 지금 저장된 건 DXF 가 아니라 평평해진 선분이라 되돌릴 원본이 없다.
+    fn from_bimove(json: &str, page_id: &str) -> Result<Doc, String> {
+        let load = bimove::drawing_from_bimove(json, page_id)?;
+        let counts = (load.line_count, load.text_count);
+        Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
+    }
+
+    fn of(
+        drawing: cadcraft_doc::Drawing, pages: Vec<(String, String)>, notes: Vec<String>,
+        counts: (usize, usize), page_id: String,
+    ) -> Doc {
         let mut session = Session::empty();
         session.open_drawing(drawing, "bimove", None);
-        Ok(Doc { session, cache: None })
+        Doc { session, pages, notes, counts, page_id, cache: None }
     }
 
     fn drawing(&self) -> &cadcraft_doc::Drawing {
@@ -421,6 +449,51 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = openDxf)]
     pub fn open_dxf(bytes: &[u8]) -> Result<BimoveDoc, JsError> {
         Doc::open(bytes).map(BimoveDoc).map_err(|e| JsError::new(&e))
+    }
+
+    /// Bimove 문서(우리 포맷 JSON)를 읽는다. `page_id` 가 "" 면 첫 페이지.
+    ///
+    /// tldraw 로 저장된 도면을 엔진으로 그려보는 길이다. `pageIds`/`pageNames`
+    /// 로 다른 페이지를 고르고, **`notes` 로 안 그린 것을 받는다** — 해치와
+    /// Bimove 고유 도형(벽체·공간·치수…)은 아직 안 나온다.
+    #[wasm_bindgen(js_name = fromBimove)]
+    pub fn from_bimove(json: &str, page_id: &str) -> Result<BimoveDoc, JsError> {
+        Doc::from_bimove(json, page_id).map(BimoveDoc).map_err(|e| JsError::new(&e))
+    }
+
+    /// Bimove 문서의 페이지 id 들 (DXF 에서 열었으면 빈 배열).
+    #[wasm_bindgen(js_name = pageIds)]
+    pub fn page_ids(&self) -> Vec<String> {
+        self.0.pages.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// 같은 차례의 페이지 이름들.
+    #[wasm_bindgen(js_name = pageNames)]
+    pub fn page_names(&self) -> Vec<String> {
+        self.0.pages.iter().map(|(_, name)| name.clone()).collect()
+    }
+
+    /// 옮기면서 **그리지 않은 것**. 비어 있으면 다 그렸다는 뜻이다.
+    pub fn notes(&self) -> Vec<String> {
+        self.0.notes.clone()
+    }
+
+    /// 지금 보고 있는 페이지 id. "" 를 넘겼으면 첫 페이지가 여기 들어 있다.
+    #[wasm_bindgen(js_name = pageId)]
+    pub fn page_id(&self) -> String {
+        self.0.page_id.clone()
+    }
+
+    /// Bimove 문서에서 만든 선 개수.
+    #[wasm_bindgen(js_name = lineCount)]
+    pub fn line_count(&self) -> usize {
+        self.0.counts.0
+    }
+
+    /// Bimove 문서에서 만든 글자 개수.
+    #[wasm_bindgen(js_name = textCount)]
+    pub fn text_count(&self) -> usize {
+        self.0.counts.1
     }
 
     /// 배치 탭 이름들.
@@ -639,6 +712,73 @@ mod tests {
         let ink = (w as usize) * (h as usize) - bg;
         assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 선이 안 찍혔다");
         assert!(bg > 0, "전부 잉크다 — 배경색이 안 먹었다");
+    }
+
+    // ── Bimove 문서로 여는 길 ──
+
+    /// dxfgroup 하나짜리 Bimove 문서. 선 하나 + 글자 하나.
+    fn bimove_json() -> String {
+        r##"{"version":1,
+          "pages":[{"id":"page:main","name":"모형","index":"a1"}],
+          "shapes":[{"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a1",
+            "parentId":"page:main",
+            "props":{"pathData":"M0,0L100,50",
+                     "textsJson":"[{\"x\":10,\"y\":10,\"t\":\"거실\",\"h\":8}]",
+                     "hatchesJson":"[{}]"},
+            "meta":{"dxfLayer":"A-WALL","dxfColor":"#ff0000"}},
+            {"id":"shape:w","type":"wall","x":0,"y":0,"rotation":0,"index":"a2",
+             "parentId":"page:main","props":{"thickness":20}}],
+          "records":{},"skipped":0,
+          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":2}}"##
+            .to_string()
+    }
+
+    #[test]
+    fn bimove_문서를_열어_픽셀로_그린다() {
+        // 여기까지 통하면 렌더·선택·스냅·편집이 전부 같은 길로 붙는다.
+        // 배경색뿐이면 "그려진 척" 이므로 잉크를 센다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let (w, h) = (200, 100);
+        // 캔버스 y 가 뒤집히므로 도면은 y = -50..0 에 있다
+        let r = doc.raster("", 50.0, -25.0, 1.5, w, h, 0xFFFFFF).expect("래스터 실패");
+        let bg = r.rgba.chunks_exact(4).filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255).count();
+        let ink = (w as usize) * (h as usize) - bg;
+        assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 아무것도 안 찍혔다");
+    }
+
+    #[test]
+    fn bimove_문서의_범위가_y를_뒤집은_자리에_있다() {
+        // 안 뒤집으면 도면이 화면 밖(위아래 반대)에 생겨서 "빈 화면" 으로 보인다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let f = doc.build("", 1.0);
+        assert!(f.bounds[1] < 0.0 && f.bounds[3] <= 0.0, "y 범위 {:?}", f.bounds);
+    }
+
+    #[test]
+    fn bimove_문서는_안_그린_것을_알려준다() {
+        // 조용히 빼면 "다 나왔다" 로 보인다. 해치와 벽체가 아직 안 나온다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let notes = doc.notes.join(" | ");
+        assert!(notes.contains("해치"), "{notes}");
+        assert!(notes.contains("wall"), "{notes}");
+        assert_eq!(doc.pages, vec![("page:main".to_string(), "모형".to_string())]);
+    }
+
+    #[test]
+    fn bimove_문서에서도_편집과_되돌리기가_된다() {
+        // DisplayList 를 직접 넘기는 길로는 안 되는 것. 엔티티로 바꾼 값이 여기다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let before = doc.build("", 1.0).prims.len();
+        doc.exec("line", r#"{"points":[[0,0],[10,10]]}"#).unwrap();
+        let after = doc.build("", 1.0).prims.len();
+        assert!(after > before, "{before} → {after}");
+        doc.exec("u", "{}").unwrap();
+        assert_eq!(doc.build("", 1.0).prims.len(), before);
+    }
+
+    #[test]
+    fn 깨진_bimove_문서는_에러로_돌려준다() {
+        assert!(Doc::from_bimove("나는 JSON 이 아니다", "").is_err());
     }
 
     #[test]
