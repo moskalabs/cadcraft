@@ -94,6 +94,14 @@ export class BimoveDoc {
         return BimoveDoc.__wrap(ret[0]);
     }
     /**
+     * Bimove 문서에서 만든 해치 개수.
+     * @returns {number}
+     */
+    hatchCount() {
+        const ret = wasm.bimovedoc_hatchCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * 배치 탭 이름들.
      * @returns {string[]}
      */

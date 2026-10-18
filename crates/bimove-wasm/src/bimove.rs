@@ -27,7 +27,8 @@
 //! "여기서는 안 한다" 가 맞는 것도 섞여 있다.
 
 use cadcraft_color::{Color, Rgb};
-use cadcraft_doc::{Drawing, Entity, EntityKind, Line, LwPolyline, MText};
+use cadcraft_doc::library::PatternLine;
+use cadcraft_doc::{Drawing, Entity, EntityKind, Hatch, HatchLoop, Line, LwPolyline, MText};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -46,6 +47,7 @@ pub struct BimoveLoad {
     pub text_count: usize,
     /// 이어 붙이기 전의 선분 수. `line_count` 와 견주면 얼마나 줄었는지 보인다.
     pub segment_count: usize,
+    pub hatch_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -222,6 +224,166 @@ fn chain(segs: &[[f64; 4]]) -> Vec<Vec<(f64, f64)>> {
     out
 }
 
+// ── 해치 ──
+//
+// Bimove 는 해치를 `hatchesJson` 에 이렇게 싣는다 (dxf.ts 의 packHatchPattern):
+//
+//   { d: 경계 SVG path(그룹 로컬 좌표), p: 패턴이름, s: 축척, a: 각도,
+//     sp?: 정의선 간격, n?: 정의선 수, dl?: [{a,s,d?}], c?: 색, f?: 1이면 솔리드,
+//     hs?: 스타일, dim?: 해치 바운딩박스 최대 변 }
+//
+// 엔진의 `Hatch` 가 경계·패턴·스타일을 다 받으므로 **패턴을 우리가 그릴 필요가
+// 없다.** 정의선(`dl`)을 `pattern_lines` 로 넘기면 엔진이 경계에 맞춰 잘라 그린다.
+// 지금 Bimove 가 SVG `<pattern>` 으로 흉내 내던 것보다 충실하다.
+//
+// 단위: `dl[].s` 는 **캔버스 px** 다 (들여올 때 autoScale 이 곱해진 뒤 잰 값).
+// 우리가 만드는 도형도 같은 px 공간이라 `scale: 1` 로 두면 맞아떨어진다.
+// DXF 의 `patternScale` 을 그대로 쓰면 안 된다 — 그건 원본 도면 단위다.
+
+/// 간격을 해치 크기에 견줘 가둔다.
+///
+/// 간격이 아주 촘촘하면(도면 전체 축척에서 1px 수준) 패턴이 통짜 회색으로
+/// 뭉개지고, 엔진이 선을 수만 개 만든다. 반대로 너무 성기면 해치 안에 선이
+/// 한 줄도 안 들어간다. 지금 Bimove 가 쓰는 것과 **같은 울타리**를 쓴다
+/// (해치 한 변에 4~60번 반복).
+fn clamp_spacing(sp: f64, dim: f64) -> f64 {
+    let dim = if dim.is_finite() && dim > 1.0 { dim } else { 400.0 };
+    sp.clamp(dim / 60.0, dim / 4.0)
+}
+
+/// 닫힌 부분경로들을 해치 고리로. 넓이가 가장 큰 것을 바깥 고리로 본다.
+fn hatch_loops(runs: Vec<Vec<(f64, f64)>>, at: impl Fn((f64, f64)) -> Vec2) -> Vec<HatchLoop> {
+    let mut areas: Vec<(usize, f64)> = Vec::new();
+    let mut loops: Vec<HatchLoop> = Vec::new();
+    for (i, mut run) in runs.into_iter().enumerate() {
+        // 닫힌 path 는 마지막 점이 첫 점과 같다. 고리는 그걸 되풀이하지 않는다.
+        if run.len() > 2 {
+            if let (Some(&a), Some(&b)) = (run.first(), run.last()) {
+                if (a.0 - b.0).abs() <= JOIN_EPS && (a.1 - b.1).abs() <= JOIN_EPS {
+                    run.pop();
+                }
+            }
+        }
+        if run.len() < 3 {
+            continue;
+        }
+        // 신발끈 공식 — 부호는 감는 방향이라 크기만 본다.
+        let mut area2 = 0.0;
+        for k in 0..run.len() {
+            let (x1, y1) = run[k];
+            let (x2, y2) = run[(k + 1) % run.len()];
+            area2 += x1 * y2 - x2 * y1;
+        }
+        areas.push((i, area2.abs()));
+        loops.push(HatchLoop {
+            vertices: run.into_iter().map(|p| PolyVertex::new(at(p))).collect(),
+            outer: false,
+            sources: Vec::new(),
+        });
+    }
+    // 바깥 고리가 하나도 없으면 아무것도 안 칠해질 수 있다. 가장 큰 것을 세운다.
+    if let Some((best, _)) = areas.iter().enumerate().max_by(|a, b| a.1 .1.total_cmp(&b.1 .1)) {
+        if let Some(l) = loops.get_mut(best) {
+            l.outer = true;
+        }
+    }
+    loops
+}
+
+/// `hatchesJson` 의 해치들을 도면에 넣는다. 넣은 개수를 돌려준다.
+fn add_hatches(
+    drawing: &mut Drawing, json: &str, gx: f64, gy: f64, layer: &str, group_color: Color,
+) -> usize {
+    if json.trim().is_empty() {
+        return 0;
+    }
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(json) else {
+        return 0;
+    };
+    // y 를 뒤집는다 — 다른 도형과 같은 변환
+    let at = |p: (f64, f64)| Vec2::new(gx + p.0, -(gy + p.1));
+    let mut made = 0;
+
+    for h in &items {
+        let Some(d) = s(h, "d") else { continue };
+        let (segs, _) = parse_path(d);
+        let loops = hatch_loops(chain(&segs), at);
+        if loops.is_empty() {
+            continue;
+        }
+
+        let name = s(h, "p").unwrap_or("").to_ascii_uppercase();
+        let solid = f(h, "f", 0.0) != 0.0 || name == "SOLID";
+        let dim = f(h, "dim", 400.0);
+
+        // 정의선. 캔버스에서 y 가 뒤집히므로 각도의 부호도 뒤집는다
+        // (지금 SVG 렌더러가 `rotate(-angle)` 하는 것과 같은 이유다).
+        let mut lines: Vec<PatternLine> = Vec::new();
+        if !solid {
+            if let Some(Value::Array(dl)) = h.get("dl") {
+                for e in dl {
+                    let sp = clamp_spacing(f(e, "s", 0.0), dim);
+                    if !(sp.is_finite() && sp > 0.0) {
+                        continue;
+                    }
+                    lines.push(PatternLine {
+                        angle: -f(e, "a", 0.0),
+                        origin: (0.0, 0.0),
+                        delta: (0.0, sp),
+                        dashes: e
+                            .get("d")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+            if lines.is_empty() {
+                // 정의선이 안 실린 옛 데이터. 이름만 가지고는 px 간격을 알 수
+                // 없어서, 지금 Bimove 가 쓰는 추정과 같은 값을 쓴다.
+                //
+                // **비워 두면 안 된다.** 비면 엔진이 표준 라이브러리의 같은
+                // 이름 패턴을 `scale` 로 그리는데, 우리 scale 은 1 이고
+                // 라이브러리 ANSI31 의 간격은 0.125 **도면 단위**다 — 우리
+                // 단위가 캔버스 px 라 0.125px 간격이 되어 통짜로 뭉개진다.
+                let est = (dim / 40.0).max(10.0) * f(h, "s", 1.0).max(0.5);
+                lines.push(PatternLine {
+                    angle: -f(h, "a", 45.0),
+                    origin: (0.0, 0.0),
+                    delta: (0.0, clamp_spacing(est, dim)),
+                    dashes: Vec::new(),
+                });
+            }
+        }
+
+        let handle = drawing.new_handle();
+        let mut e = Entity::new(
+            handle,
+            EntityKind::Hatch(Hatch {
+                pattern: if name.is_empty() { "ANSI31".into() } else { name },
+                solid,
+                loops,
+                // 간격·각도를 이미 우리 공간으로 옮겨 실었다. 여기서 또 돌리거나
+                // 키우면 두 번 먹는다.
+                scale: 1.0,
+                angle: 0.0,
+                associative: false,
+                style: f(h, "hs", 0.0).clamp(0.0, 2.0) as u8,
+                elevation: 0.0,
+                gradient: None,
+                origin: Vec2::ZERO,
+                background: None,
+                pattern_lines: lines,
+            }),
+        );
+        e.common.layer = layer.to_string();
+        e.common.color = s(h, "c").and_then(Rgb::parse_hex).map_or(group_color, Color::True);
+        drawing.model.push(e);
+        made += 1;
+    }
+    made
+}
+
 /// `textsJson` 을 푼다 — 신형(테이블 압축)과 구형(그냥 배열) 둘 다.
 ///
 /// 신형은 `{F:[폰트], C:[색], T:[{…, fi, ci}]}` 다. 폰트·색 문자열이 글자마다
@@ -309,7 +471,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut drawing = Drawing::new_metric();
     let mut layers: BTreeMap<String, ()> = BTreeMap::new();
     let mut skipped_types: BTreeMap<String, usize> = BTreeMap::new();
-    let mut hatch_groups = 0usize;
+    let mut hatch_count = 0usize;
     let mut unknown_cmds = 0usize;
     let mut line_count = 0usize;
     let mut text_count = 0usize;
@@ -396,9 +558,8 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             text_count += 1;
         }
 
-        if s(&props, "hatchesJson").is_some_and(|h| !h.trim().is_empty()) {
-            hatch_groups += 1;
-        }
+        hatch_count +=
+            add_hatches(&mut drawing, s(&props, "hatchesJson").unwrap_or(""), gx, gy, &layer, color);
     }
 
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
@@ -411,9 +572,6 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     }
 
     let mut notes = Vec::new();
-    if hatch_groups > 0 {
-        notes.push(format!("해치가 든 그룹 {hatch_groups}개 — 해치는 아직 안 그린다"));
-    }
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
     }
@@ -421,7 +579,16 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         notes.push(format!("{k} {n}개 — 여기서 안 그린다 (Bimove overlay 몫)"));
     }
 
-    Ok(BimoveLoad { drawing, pages, page_id: want, notes, line_count, text_count, segment_count })
+    Ok(BimoveLoad {
+        drawing,
+        pages,
+        page_id: want,
+        notes,
+        line_count,
+        text_count,
+        segment_count,
+        hatch_count,
+    })
 }
 
 #[cfg(test)]
@@ -646,7 +813,147 @@ mod tests {
         let all = r.notes.join(" | ");
         assert!(all.contains("wall 1개"), "{all}");
         assert!(all.contains("zone 1개"), "{all}");
-        assert!(all.contains("해치"), "{all}");
+        // 해치는 이제 **그린다** — 못 그리는 것 목록에 있으면 안 된다
+        assert!(!all.contains("해치"), "{all}");
+    }
+
+    // ── 해치 ──
+
+    fn hatch_doc(hatches: &str) -> String {
+        format!(
+            r#"{{"version":1,"pages":[{{"id":"page:main","name":"모형","index":"a1"}}],
+             "shapes":[{{"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a1",
+               "parentId":"page:main","props":{{"pathData":"","hatchesJson":{}}},
+               "meta":{{"dxfLayer":"바닥"}}}}],
+             "records":{{}},"skipped":0,
+             "source":{{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":1}}}}"#,
+            serde_json::Value::String(hatches.to_string())
+        )
+    }
+
+    #[test]
+    fn 해치가_경계와_패턴을_갖고_들어온다() {
+        let j = hatch_doc(
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","p":"ANSI31","s":1,"a":45,
+                 "dl":[{"a":45,"s":10}],"dim":100}]"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.hatch_count, 1);
+        match &r.drawing.model.iter().next().unwrap().kind {
+            EntityKind::Hatch(h) => {
+                assert_eq!(h.pattern, "ANSI31");
+                assert!(!h.solid);
+                assert_eq!(h.loops.len(), 1);
+                // 닫는 점은 되풀이하지 않는다 — 사각형은 꼭짓점 4개다
+                assert_eq!(h.loops[0].vertices.len(), 4);
+                assert!(h.loops[0].outer, "바깥 고리가 없으면 안 칠해질 수 있다");
+                // y 가 뒤집혀 있다
+                let ys: Vec<f64> = h.loops[0].vertices.iter().map(|v| v.p.y).collect();
+                assert!(ys.iter().all(|y| *y <= 0.0), "{ys:?}");
+                // 간격·각도를 우리 공간으로 옮겨 실었으니 여기서 또 돌리면 안 된다
+                assert_eq!(h.scale, 1.0);
+                assert_eq!(h.angle, 0.0);
+                assert_eq!(h.pattern_lines.len(), 1);
+                assert_eq!(h.pattern_lines[0].angle, -45.0, "y 뒤집힘이 각도에 반영돼야 한다");
+                assert_eq!(h.pattern_lines[0].delta, (0.0, 10.0));
+            }
+            k => panic!("Hatch 가 아니다: {}", k.type_name()),
+        }
+    }
+
+    #[test]
+    fn 솔리드는_패턴을_안_만든다() {
+        let j = hatch_doc(r#"[{"d":"M0,0L10,0L10,10Z","p":"SOLID","f":1,"dim":10}]"#);
+        let r = drawing_from_bimove(&j, "").unwrap();
+        match &r.drawing.model.iter().next().unwrap().kind {
+            EntityKind::Hatch(h) => {
+                assert!(h.solid);
+                assert!(h.pattern_lines.is_empty());
+            }
+            k => panic!("Hatch 가 아니다: {}", k.type_name()),
+        }
+    }
+
+    #[test]
+    fn 구멍이_있는_해치는_고리가_여럿이다() {
+        // 안쪽 고리를 잃으면 구멍이 메워져 나온다.
+        let j = hatch_doc(
+            r#"[{"d":"M0,0L100,0L100,100L0,100ZM30,30L70,30L70,70L30,70Z","p":"ANSI31",
+                 "dl":[{"a":45,"s":10}],"dim":100,"hs":1}]"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        match &r.drawing.model.iter().next().unwrap().kind {
+            EntityKind::Hatch(h) => {
+                assert_eq!(h.loops.len(), 2);
+                // 넓은 쪽이 바깥이다
+                assert!(h.loops[0].outer && !h.loops[1].outer);
+                assert_eq!(h.style, 1);
+            }
+            k => panic!("Hatch 가 아니다: {}", k.type_name()),
+        }
+    }
+
+    #[test]
+    fn 간격을_해치_크기에_가둔다() {
+        // 아주 촘촘한 간격은 통짜 회색으로 뭉개지고 엔진이 선을 수만 개 만든다.
+        assert_eq!(clamp_spacing(0.001, 600.0), 10.0);
+        // 너무 성기면 해치 안에 선이 한 줄도 안 들어간다
+        assert_eq!(clamp_spacing(99999.0, 600.0), 150.0);
+        // 멀쩡한 값은 그대로
+        assert_eq!(clamp_spacing(20.0, 600.0), 20.0);
+        // dim 이 말이 안 되면 기본값으로 민다
+        assert!(clamp_spacing(1.0, f64::NAN) > 1.0);
+    }
+
+    #[test]
+    fn 패턴_해치는_정의선을_반드시_하나는_갖는다() {
+        // 비어 있으면 엔진이 표준 라이브러리 패턴을 **우리 scale(=1)** 로
+        // 그린다. 라이브러리 ANSI31 의 간격은 0.125 도면 단위인데 우리 단위는
+        // 캔버스 px 라, 0.125px 간격이 되어 해치가 통짜로 뭉개진다.
+        for h in [
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","p":"ANSI31","dim":100}]"#,
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","p":"모르는패턴","dim":100}]"#,
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","dim":100}]"#,
+            // 간격이 0 이거나 말이 안 되면 그 줄은 버려지는데, 그래도 비면 안 된다
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","p":"ANSI31","dl":[{"a":0,"s":0}],"dim":100}]"#,
+        ] {
+            let r = drawing_from_bimove(&hatch_doc(h), "").unwrap();
+            match &r.drawing.model.iter().next().unwrap().kind {
+                EntityKind::Hatch(e) => {
+                    assert!(!e.solid);
+                    assert!(!e.pattern_lines.is_empty(), "{h}");
+                    let sp = e.pattern_lines[0].delta.1;
+                    assert!(sp >= 100.0 / 60.0 && sp <= 100.0 / 4.0, "간격 {sp} 가 울타리 밖이다");
+                }
+                k => panic!("Hatch 가 아니다: {}", k.type_name()),
+            }
+        }
+    }
+
+    #[test]
+    fn 색이_있으면_해치가_그_색이다() {
+        let j = hatch_doc(
+            r##"[{"d":"M0,0L10,0L10,10Z","p":"ANSI31","c":"#0000ff","dl":[{"a":0,"s":2}],"dim":10}]"##,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(
+            r.drawing.model.iter().next().unwrap().common.color,
+            Color::True(Rgb(0, 0, 0xff))
+        );
+    }
+
+    #[test]
+    fn 말이_안_되는_해치는_건너뛴다() {
+        // 점이 셋도 안 되면 칠할 넓이가 없다. 터지지 말고 넘어가야 한다.
+        for bad in [
+            r#"[{"d":"M0,0L10,0","p":"ANSI31"}]"#,
+            r#"[{"p":"ANSI31"}]"#,
+            r#"[]"#,
+            r#"그냥 글자"#,
+        ] {
+            let r = drawing_from_bimove(&hatch_doc(bad), "").unwrap();
+            assert_eq!(r.hatch_count, 0, "{bad}");
+        }
     }
 
     #[test]

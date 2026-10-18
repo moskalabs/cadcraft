@@ -55,13 +55,26 @@ fn make_doc(groups: usize, polys: usize, pts: usize) -> String {
                 y = ny;
             }
         }
+        // 해치도 섞는다 — 진짜 도면은 벽 단면·바닥에 해치가 깔려 있고,
+        // 해치는 경계 하나가 패턴 선 수십 개로 불어나므로 프레임 시간에 크다.
+        //
+        // 문자열 안에 든 JSON 이라 이스케이프를 손으로 하면 틀린다. serde_json 에 맡긴다.
+        let hatches = if g % 10 == 0 {
+            serde_json::Value::String(
+                r#"[{"d":"M0,0L120,0L120,120L0,120Z","p":"ANSI31","dl":[{"a":45,"s":6}],"dim":120}]"#
+                    .to_string(),
+            )
+            .to_string()
+        } else {
+            String::from("\"\"")
+        };
         let texts = if g % 20 == 0 {
             r#""[{\"x\":5,\"y\":5,\"t\":\"거실 마감\",\"h\":8,\"ap\":1}]""#
         } else {
             r#""""#
         };
         shapes.push(format!(
-            r#"{{"id":"shape:{g}","type":"dxfgroup","x":{ox:.1},"y":{oy:.1},"rotation":0,"index":"a1","parentId":"page:main","props":{{"pathData":"{path}","textsJson":{texts}}},"meta":{{"dxfLayer":"L{}"}}}}"#,
+            r#"{{"id":"shape:{g}","type":"dxfgroup","x":{ox:.1},"y":{oy:.1},"rotation":0,"index":"a1","parentId":"page:main","props":{{"pathData":"{path}","textsJson":{texts},"hatchesJson":{hatches}}},"meta":{{"dxfLayer":"L{}"}}}}"#,
             g % 12
         ));
     }
@@ -81,12 +94,13 @@ fn main() {
     let t = Instant::now();
     let load = bimove_wasm::bimove::drawing_from_bimove(&json, "").expect("변환 실패");
     println!(
-        "변환 {:>6.0}ms · 선분 {} → 엔티티 {} ({:.1}배로 묶임) / 글자 {}",
+        "변환 {:>6.0}ms · 선분 {} → 엔티티 {} ({:.1}배로 묶임) / 글자 {} / 해치 {}",
         t.elapsed().as_secs_f64() * 1000.0,
         load.segment_count,
         load.line_count,
         load.segment_count as f64 / load.line_count.max(1) as f64,
-        load.text_count
+        load.text_count,
+        load.hatch_count
     );
 
     let mut doc = bimove_wasm::Doc::from_bimove(&json, "").expect("열기 실패");

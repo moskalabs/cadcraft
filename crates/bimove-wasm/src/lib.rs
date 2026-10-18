@@ -490,8 +490,8 @@ pub struct Doc {
     pages: Vec<(String, String)>,
     /// 옮기면서 **그리지 않은 것**. 조용히 빼면 "다 나왔다" 로 보인다.
     notes: Vec<String>,
-    /// Bimove 문서에서 만든 선/글자 수 (상태줄에 띄운다).
-    counts: (usize, usize),
+    /// Bimove 문서에서 만든 선/글자/해치 수 (상태줄에 띄운다).
+    counts: (usize, usize, usize),
     /// 실제로 옮긴 페이지 id. "" 를 넘겼을 때 **무엇이 골라졌는지** 알려준다.
     page_id: String,
     /// 마지막으로 만든 DisplayList 와 그때의 (공간, tolerance).
@@ -517,7 +517,7 @@ const TOL_SLACK: f64 = 2.0;
 impl Doc {
     fn open(bytes: &[u8]) -> Result<Doc, String> {
         let drawing = cadcraft_io::read_dxf(bytes).map_err(|e| e.to_string())?;
-        Ok(Doc::of(drawing, Vec::new(), Vec::new(), (0, 0), String::new()))
+        Ok(Doc::of(drawing, Vec::new(), Vec::new(), (0, 0, 0), String::new()))
     }
 
     /// Bimove 문서(우리 포맷 JSON)를 읽는다.
@@ -527,13 +527,13 @@ impl Doc {
     /// 지금 저장된 건 DXF 가 아니라 평평해진 선분이라 되돌릴 원본이 없다.
     pub fn from_bimove(json: &str, page_id: &str) -> Result<Doc, String> {
         let load = bimove::drawing_from_bimove(json, page_id)?;
-        let counts = (load.line_count, load.text_count);
+        let counts = (load.line_count, load.text_count, load.hatch_count);
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
     }
 
     fn of(
         drawing: cadcraft_doc::Drawing, pages: Vec<(String, String)>, notes: Vec<String>,
-        counts: (usize, usize), page_id: String,
+        counts: (usize, usize, usize), page_id: String,
     ) -> Doc {
         let mut session = Session::empty();
         session.open_drawing(drawing, "bimove", None);
@@ -666,6 +666,12 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = textCount)]
     pub fn text_count(&self) -> usize {
         self.0.counts.1
+    }
+
+    /// Bimove 문서에서 만든 해치 개수.
+    #[wasm_bindgen(js_name = hatchCount)]
+    pub fn hatch_count(&self) -> usize {
+        self.0.counts.2
     }
 
     /// 배치 탭 이름들.
@@ -1045,8 +1051,9 @@ mod tests {
         // 조용히 빼면 "다 나왔다" 로 보인다. 해치와 벽체가 아직 안 나온다.
         let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
         let notes = doc.notes.join(" | ");
-        assert!(notes.contains("해치"), "{notes}");
         assert!(notes.contains("wall"), "{notes}");
+        // 해치는 이제 그린다 — 못 그리는 것 목록에서 빠져야 한다
+        assert!(!notes.contains("해치"), "{notes}");
         assert_eq!(doc.pages, vec![("page:main".to_string(), "모형".to_string())]);
     }
 
@@ -1060,6 +1067,52 @@ mod tests {
         assert!(after > before, "{before} → {after}");
         doc.exec("u", "{}").unwrap();
         assert_eq!(doc.build("", 1.0).prims.len(), before);
+    }
+
+    #[test]
+    fn 해치가_실제로_찍힌다() {
+        // 엔티티가 맞게 들어가도 **화면에 아무것도 안 나오면** 소용이 없다.
+        // 경계만 있는 것(solid=false, 패턴 없음)과 견줘서, 패턴 선이 안을
+        // 채우는지 잉크 픽셀 수로 본다.
+        let doc_with = |hatches: &str| {
+            format!(
+                r#"{{"version":1,"pages":[{{"id":"page:main","name":"모형","index":"a1"}}],
+                 "shapes":[{{"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a1",
+                   "parentId":"page:main","props":{{"pathData":"","hatchesJson":{}}}}}],
+                 "records":{{}},"skipped":0,
+                 "source":{{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":1}}}}"#,
+                serde_json::Value::String(hatches.to_string())
+            )
+        };
+        // **안쪽만** 센다. 테두리 선은 패턴이 하나도 없어도 찍히므로, 전체를
+        // 세면 "경계만 그렸는데 다 된 줄" 아는 테스트가 된다 (실제로 그렇게
+        // 써놨다가 패턴을 통째로 없애도 안 깨지는 걸 보고 고쳤다).
+        let inner_ink = |json: &str| {
+            let mut d = Doc::from_bimove(json, "").unwrap();
+            let (w, h) = (200usize, 200usize);
+            let r = d.raster("", 50.0, -50.0, 1.8, w as u32, h as u32, 0xFFFFFF, false).unwrap();
+            let mut n = 0;
+            for y in h / 4..h * 3 / 4 {
+                for x in w / 4..w * 3 / 4 {
+                    let p = &r.rgba[(y * w + x) * 4..][..4];
+                    if !(p[0] == 255 && p[1] == 255 && p[2] == 255) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let ink = inner_ink;
+
+        let hatched = ink(&doc_with(
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","p":"ANSI31","dl":[{"a":45,"s":8}],"dim":100}]"#,
+        ));
+        let solid = ink(&doc_with(
+            r#"[{"d":"M0,0L100,0L100,100L0,100Z","p":"SOLID","f":1,"dim":100}]"#,
+        ));
+
+        assert!(hatched > 200, "안쪽에 {hatched} 픽셀뿐 — 패턴이 안을 안 채웠다");
+        assert!(solid > hatched, "솔리드({solid})가 패턴({hatched})보다 안 짙다");
     }
 
     #[test]

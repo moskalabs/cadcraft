@@ -37,6 +37,10 @@ export class BimoveDoc {
      */
     static fromBimove(json: string, page_id: string): BimoveDoc;
     /**
+     * Bimove 문서에서 만든 해치 개수.
+     */
+    hatchCount(): number;
+    /**
      * 배치 탭 이름들.
      */
     layoutNames(): string[];
@@ -179,6 +183,7 @@ export interface InitOutput {
     readonly bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) => number;
     readonly bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly bimovedoc_hatchCount: (a: number) => number;
     readonly bimovedoc_layoutNames: (a: number) => [number, number];
     readonly bimovedoc_lineCount: (a: number) => number;
     readonly bimovedoc_notes: (a: number) => [number, number];

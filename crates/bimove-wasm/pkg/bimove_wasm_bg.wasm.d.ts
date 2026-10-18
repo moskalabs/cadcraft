@@ -8,6 +8,7 @@ export const __wbg_bimovesnap_free: (a: number, b: number) => void;
 export const bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) => number;
 export const bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) => [number, number, number];
+export const bimovedoc_hatchCount: (a: number) => number;
 export const bimovedoc_layoutNames: (a: number) => [number, number];
 export const bimovedoc_lineCount: (a: number) => number;
 export const bimovedoc_notes: (a: number) => [number, number];
