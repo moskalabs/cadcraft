@@ -10,6 +10,7 @@
 //! 수만 개 선분이라 이게 전부다.
 
 pub mod bimove;
+pub mod opening;
 pub mod wall;
 
 use cadcraft_doc::Space;
@@ -521,6 +522,8 @@ struct Counts {
     walls: usize,
     /// 그 벽을 묶어 만든 MLINE 수. `walls` 보다 작아야 묶기가 듣는 것이다.
     wall_mlines: usize,
+    /// 읽은 문·창 도형 수.
+    openings: usize,
 }
 
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
@@ -549,6 +552,7 @@ impl Doc {
             hatches: load.hatch_count,
             walls: load.wall_count,
             wall_mlines: load.wall_mline_count,
+            openings: load.opening_count,
         };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
     }
@@ -710,6 +714,15 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = wallMlineCount)]
     pub fn wall_mline_count(&self) -> usize {
         self.0.counts.wall_mlines
+    }
+
+    /// 읽은 문·창 **도형** 수.
+    ///
+    /// 하나가 엔티티 여럿이 된다 (벽을 가리는 사각형 + 잼브 둘 + 문짝 + 호).
+    /// 그래서 엔티티 수로는 몇 개가 들어왔는지 되짚을 수 없다.
+    #[wasm_bindgen(js_name = openingCount)]
+    pub fn opening_count(&self) -> usize {
+        self.0.counts.openings
     }
 
     /// 배치 탭 이름들.
@@ -1057,9 +1070,11 @@ mod tests {
                      "hatchesJson":"[{}]"},
             "meta":{"dxfLayer":"A-WALL","dxfColor":"#ff0000"}},
             {"id":"shape:w","type":"wall","x":0,"y":60,"rotation":0,"index":"a2",
-             "parentId":"page:main","props":{"x2":100,"y2":0,"thickness":20}}],
+             "parentId":"page:main","props":{"x2":100,"y2":0,"thickness":20}},
+            {"id":"shape:d","type":"door","x":50,"y":60,"rotation":0,"index":"a3",
+             "parentId":"page:main","props":{"width":40,"thickness":20,"swing":1,"flipped":false}}],
           "records":{},"skipped":0,
-          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":2}}"##
+          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":3}}"##
             .to_string()
     }
 
@@ -1113,6 +1128,20 @@ mod tests {
         assert_eq!(n, 1, "MLINE 이 {n}개다");
         assert_eq!(doc.counts.walls, 1);
         assert_eq!(doc.counts.wall_mlines, 1);
+    }
+
+    #[test]
+    fn bimove_문서의_문이_벽_뒤에_들어간다() {
+        // 문은 벽을 **가려서** 갭을 뚫는다. 그리는 차례에 기대는 구조라
+        // 벽보다 먼저 들어가면 갭이 벽에 덮여 사라진다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        assert_eq!(doc.counts.openings, 1);
+        let at = |f: fn(&cadcraft_doc::EntityKind) -> bool| {
+            doc.drawing().model.iter().position(|e| f(&e.kind))
+        };
+        let mline = at(|k| matches!(k, cadcraft_doc::EntityKind::MLine(_))).expect("벽이 없다");
+        let gap = at(|k| matches!(k, cadcraft_doc::EntityKind::Wipeout(_))).expect("가림이 없다");
+        assert!(mline < gap, "벽 {mline} / 가림 {gap}");
     }
 
     #[test]

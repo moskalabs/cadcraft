@@ -144,6 +144,17 @@ export class BimoveDoc {
         return BimoveDoc.__wrap(ret[0]);
     }
     /**
+     * 읽은 문·창 **도형** 수.
+     *
+     * 하나가 엔티티 여럿이 된다 (벽을 가리는 사각형 + 잼브 둘 + 문짝 + 호).
+     * 그래서 엔티티 수로는 몇 개가 들어왔는지 되짚을 수 없다.
+     * @returns {number}
+     */
+    openingCount() {
+        const ret = wasm.bimovedoc_openingCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * 지금 보고 있는 페이지 id. "" 를 넘겼으면 첫 페이지가 여기 들어 있다.
      * @returns {string}
      */

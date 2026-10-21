@@ -20,14 +20,17 @@
 //!
 //! ── 안 옮기는 것은 **센다** ──
 //!
-//! 남은 Bimove 고유 도형(문·창·치수·공간·물량표)은 아직 안 옮긴다. 조용히
-//! 빼면 "다 나왔다" 로 보이므로 종류별로 세서 `notes` 에 담는다.
+//! 남은 Bimove 고유 도형(치수·공간·물량표)은 아직 안 옮긴다. 조용히 빼면
+//! "다 나왔다" 로 보이므로 종류별로 세서 `notes` 에 담는다.
 //!
 //! 벽체는 **옮긴다** (`crate::wall`). 한때 "벽은 CAD 엔티티가 아니라 견적용
 //! 주석이라 overlay 로 그리는 게 맞다" 고 적어 뒀는데, 그건 tldraw 를 남겨
 //! 두는 전제에서만 맞는 말이었다. 걷어낼 거라면 벽도 엔진이 알아야 하고,
 //! 마침 **MLINE 이 평면도의 벽 그 자체**다 — 중심선·두께·miter·캡·속 채움이
 //! 전부 들어 있다. 손으로 miter 를 다시 계산할 이유가 없다.
+//!
+//! 문·창도 **옮긴다** (`crate::opening`). 벽을 가려서 갭을 뚫는 것이라 벽보다
+//! 나중에 넣어야 한다 — 그 차례가 거기서 지켜진다.
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::library::PatternLine;
@@ -36,6 +39,7 @@ use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use crate::opening::{self, Opening, OpeningKind, Swing};
 use crate::wall::WallSeg;
 
 /// 옮긴 결과.
@@ -58,6 +62,9 @@ pub struct BimoveLoad {
     /// 만든 MLINE 수. `wall_count` 보다 **작아야** 묶기가 듣는 것이다 —
     /// 같으면 이어진 벽을 하나도 못 묶었다는 뜻이고, 그러면 코너마다 캡이 선다.
     pub wall_mline_count: usize,
+    /// 읽은 문·창 **도형** 수. 하나가 엔티티 여럿(가림 + 잼브 + 문짝 + 호)이
+    /// 되므로 엔티티 수와는 다르다.
+    pub opening_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -491,6 +498,38 @@ fn wall_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<WallSeg> 
     })
 }
 
+/// 문·창 도형 하나를 읽는다.
+///
+/// 벽과 달리 `x,y` 가 **가운데**다 (벽선에 스냅된 그 점) — `rotation` 이 벽
+/// 방향이고, 제 좌표계는 x 가 벽을 따라, y 가 벽을 가로지른다. 돌리기와 y
+/// 뒤집기는 `opening` 안에서 한다: 호의 방향이 거울에 뒤집히므로 그 계산을
+/// 한 자리에 모아 둬야 한다.
+///
+/// `None` 이면 못 쓰는 것이다 (폭 0, 두께 0, NaN). 벽과 같이 **따로 세서**
+/// `notes` 에 담는다.
+fn opening_of(sh: &Value, props: &Value, meta: Option<&Value>, kind: &str) -> Option<Opening> {
+    let width = f(props, "width", 0.0);
+    let thickness = f(props, "thickness", 0.0);
+    let center = Vec2::new(f(sh, "x", 0.0), f(sh, "y", 0.0));
+    let o = Opening {
+        center,
+        rotation: f(sh, "rotation", 0.0),
+        width,
+        thickness,
+        layer: layer_of(meta),
+        kind: if kind == "door" {
+            OpeningKind::Door(Swing {
+                // 0 이 들어오면 문짝이 벽 위에 겹쳐 눕는다. 화면의 기본값이 +1 이다.
+                side: if f(props, "swing", 1.0) < 0.0 { -1.0 } else { 1.0 },
+                flipped: props.get("flipped").and_then(Value::as_bool).unwrap_or(false),
+            })
+        } else {
+            OpeningKind::Window
+        },
+    };
+    opening::usable(&o).then_some(o)
+}
+
 pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, String> {
     let doc: Value =
         serde_json::from_str(json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
@@ -532,6 +571,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     // 본 벽체 도형 수. `walls.len()` 과 다를 수 있다 — 두께 0 이나 길이 0 짜리는
     // 그릴 수가 없다. 그 차이를 세지 않으면 도형이 조용히 사라진다.
     let mut wall_seen = 0usize;
+    // 문·창도 모아 둔다 — 벽을 다 넣은 **뒤에** 넣어야 벽을 가린다 (`opening.rs`).
+    let mut openings: Vec<Opening> = Vec::new();
+    let mut opening_seen = 0usize;
 
     for sh in &shapes {
         let parent = s(sh, "parentId").unwrap_or("");
@@ -548,6 +590,15 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(w) = wall_seg(sh, &props, meta) {
                 layers.entry(w.layer.clone()).or_insert(());
                 walls.push(w);
+            }
+            continue;
+        }
+
+        if kind == "door" || kind == "window" {
+            opening_seen += 1;
+            if let Some(o) = opening_of(sh, &props, meta, kind) {
+                layers.entry(o.layer.clone()).or_insert(());
+                openings.push(o);
             }
             continue;
         }
@@ -632,6 +683,12 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let wall_dropped = wall_seen - walls.len();
     let wall_mline_count = crate::wall::add_walls(&mut drawing, &walls);
 
+    // 문·창은 그 **다음**이다. 벽을 가려서 갭을 뚫는 것이라 차례가 뒤집히면
+    // 벽이 문 위에 덮인다.
+    let opening_count = opening_seen;
+    let opening_dropped = opening_seen - openings.len();
+    opening::add_openings(&mut drawing, &openings);
+
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
     for name in layers.keys() {
         if name != "0" && !drawing.layers.iter().any(|l| &l.name == name) {
@@ -644,6 +701,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut notes = Vec::new();
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
+    }
+    if opening_dropped > 0 {
+        notes.push(format!("문·창 {opening_dropped}개를 못 그렸다 (폭이나 두께가 0)"));
     }
     if wall_dropped > 0 {
         notes.push(format!("벽체 {wall_dropped}개를 못 그렸다 (두께나 길이가 0)"));
@@ -663,6 +723,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         hatch_count,
         wall_count,
         wall_mline_count,
+        opening_count,
     })
 }
 
@@ -889,6 +950,8 @@ mod tests {
         assert!(!all.contains("해치"), "{all}");
         // 벽체도 이제 그린다. 전엔 여기 "wall 1개" 가 있었다.
         assert!(!all.contains("wall"), "{all}");
+        // 문·창도 그린다. 이 목록은 줄어들기만 한다.
+        assert!(!all.contains("door") && !all.contains("window"), "{all}");
     }
 
     // ── 벽체 ──
@@ -1018,6 +1081,126 @@ mod tests {
         );
         let r = drawing_from_bimove(&j, "page:main").unwrap();
         assert_eq!(r.wall_count, 1);
+    }
+
+    // ── 문·창 ──
+
+    /// 문 하나. `x`/`y` 는 **가운데**다 (벽선에 스냅된 그 점).
+    fn door_json(i: u32, x: f64, y: f64, w: f64, t: f64) -> String {
+        format!(
+            r#"{{"id":"shape:d{i}","type":"door","x":{x},"y":{y},"rotation":0,"index":"b{i}",
+               "parentId":"page:main","props":{{"width":{w},"thickness":{t},"swing":1,"flipped":false}}}}"#
+        )
+    }
+
+    fn window_json(i: u32, x: f64, y: f64, w: f64, t: f64) -> String {
+        format!(
+            r#"{{"id":"shape:n{i}","type":"window","x":{x},"y":{y},"rotation":0,"index":"c{i}",
+               "parentId":"page:main","props":{{"width":{w},"thickness":{t}}}}}"#
+        )
+    }
+
+    fn count_kind(r: &BimoveLoad, f: impl Fn(&EntityKind) -> bool) -> usize {
+        r.drawing.model.iter().filter(|e| f(&e.kind)).count()
+    }
+
+    #[test]
+    fn 문과_창을_엔티티로_넣는다() {
+        let j = doc_json(&format!("{},{}", door_json(1, 0.0, 0.0, 80.0, 20.0), window_json(2, 300.0, 0.0, 60.0, 20.0)));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.opening_count, 2);
+        // 문·창 하나마다 가림 하나
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Wipeout(_))), 2);
+        // 스윙 호는 문에만
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Arc(_))), 1);
+    }
+
+    #[test]
+    fn 문은_벽보다_나중에_들어간다() {
+        // 차례가 뒤집히면 벽이 문을 덮어서 갭이 사라진다. 그리는 차례에
+        // 기대는 구조라 이 순서가 **동작의 일부**다.
+        let j = doc_json(&format!("{},{}", door_json(1, 50.0, 0.0, 80.0, 20.0), wall_json(2, 0.0, 0.0, 200.0, 0.0, 20.0)));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let pos = |f: fn(&EntityKind) -> bool| r.drawing.model.iter().position(|e| f(&e.kind));
+        let mline = pos(|k| matches!(k, EntityKind::MLine(_))).expect("벽이 없다");
+        let gap = pos(|k| matches!(k, EntityKind::Wipeout(_))).expect("가림이 없다");
+        assert!(mline < gap, "벽 {mline} / 가림 {gap} — 문이 벽보다 먼저 들어갔다");
+    }
+
+    #[test]
+    fn 문의_갭이_벽_위에_놓인다() {
+        // 가운데가 (50, 0) 이면 엔진에서도 y 가 0 이고 x 는 10..90 이다
+        let j = doc_json(&door_json(1, 50.0, 0.0, 80.0, 20.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let b = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Wipeout(w) => Some(w.boundary.clone()),
+                _ => None,
+            })
+            .expect("가림이 없다");
+        assert_eq!(b.iter().map(|p| p.x).fold(f64::MAX, f64::min), 10.0);
+        assert_eq!(b.iter().map(|p| p.x).fold(f64::MIN, f64::max), 90.0);
+    }
+
+    #[test]
+    fn 문의_y_도_뒤집힌다() {
+        let j = doc_json(&door_json(1, 0.0, 60.0, 80.0, 20.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let ys: Vec<f64> = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Wipeout(w) => Some(w.boundary.iter().map(|p| p.y).collect()),
+                _ => None,
+            })
+            .expect("가림이 없다");
+        assert!(ys.iter().all(|y| *y < 0.0), "{ys:?} — y 가 안 뒤집혔다");
+    }
+
+    #[test]
+    fn 못_쓰는_문은_세서_알린다() {
+        // 폭 0 짜리. 조용히 빼면 도형이 사라진 걸 아무도 모른다.
+        let j = doc_json(&door_json(1, 0.0, 0.0, 0.0, 20.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.opening_count, 1);
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Wipeout(_))), 0);
+        assert!(r.notes.iter().any(|n| n.contains("문·창 1개")), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn 문도_레이어를_만든다() {
+        let j = doc_json(
+            r#"{"id":"shape:d1","type":"door","x":0,"y":0,"rotation":0,"index":"b1",
+                "parentId":"page:main","props":{"width":80,"thickness":20,"swing":1},
+                "meta":{"dxfLayer":"A-DOOR"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-DOOR"), "레이어가 없다");
+    }
+
+    #[test]
+    fn 스윙이_0_이면_한쪽으로_정한다() {
+        // 0 을 그대로 쓰면 문짝이 벽 위에 겹쳐 눕는다
+        let j = doc_json(
+            r#"{"id":"shape:d1","type":"door","x":0,"y":0,"rotation":0,"index":"b1",
+                "parentId":"page:main","props":{"width":80,"thickness":20,"swing":0}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let arc = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Arc(a) => Some(a.clone()),
+                _ => None,
+            })
+            .expect("호가 없다");
+        let span = (arc.end - arc.start).rem_euclid(std::f64::consts::TAU);
+        assert!((span - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "{}도", span.to_degrees());
     }
 
     // ── 해치 ──

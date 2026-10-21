@@ -57,6 +57,13 @@ export class BimoveDoc {
      */
     static openDxf(bytes: Uint8Array): BimoveDoc;
     /**
+     * 읽은 문·창 **도형** 수.
+     *
+     * 하나가 엔티티 여럿이 된다 (벽을 가리는 사각형 + 잼브 둘 + 문짝 + 호).
+     * 그래서 엔티티 수로는 몇 개가 들어왔는지 되짚을 수 없다.
+     */
+    openingCount(): number;
+    /**
      * 지금 보고 있는 페이지 id. "" 를 넘겼으면 첫 페이지가 여기 들어 있다.
      */
     pageId(): string;
@@ -200,6 +207,7 @@ export interface InitOutput {
     readonly bimovedoc_lineCount: (a: number) => number;
     readonly bimovedoc_notes: (a: number) => [number, number];
     readonly bimovedoc_openDxf: (a: number, b: number) => [number, number, number];
+    readonly bimovedoc_openingCount: (a: number) => number;
     readonly bimovedoc_pageId: (a: number) => [number, number];
     readonly bimovedoc_pageIds: (a: number) => [number, number];
     readonly bimovedoc_pageNames: (a: number) => [number, number];
