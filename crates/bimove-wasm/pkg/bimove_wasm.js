@@ -271,6 +271,26 @@ export class BimoveDoc {
         const ret = wasm.bimovedoc_textCount(this.__wbg_ptr);
         return ret >>> 0;
     }
+    /**
+     * 읽은 벽체 **도형** 수.
+     * @returns {number}
+     */
+    wallCount() {
+        const ret = wasm.bimovedoc_wallCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * 벽체로 만든 MLINE 수.
+     *
+     * `wallCount` 와 **같이** 띄워야 쓸모가 있다. 이어진 벽이 묶이면 이 쪽이
+     * 훨씬 작고, 둘이 같으면 하나도 못 묶었다는 뜻이다 — 그러면 코너마다
+     * 캡이 서서 "꺾이는 지점이 겹친" 옛 모양으로 돌아간다.
+     * @returns {number}
+     */
+    wallMlineCount() {
+        const ret = wasm.bimovedoc_wallMlineCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
 }
 if (Symbol.dispose) BimoveDoc.prototype[Symbol.dispose] = BimoveDoc.prototype.free;
 

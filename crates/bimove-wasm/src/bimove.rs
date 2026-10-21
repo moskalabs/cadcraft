@@ -20,11 +20,14 @@
 //!
 //! ── 안 옮기는 것은 **센다** ──
 //!
-//! 해치와 Bimove 고유 도형(벽체·문·창·치수·공간·물량표)은 아직 안 옮긴다.
-//! 조용히 빼면 "다 나왔다" 로 보이므로 종류별로 세서 `notes` 에 담는다.
-//! 벽체 같은 건 CAD 엔티티가 아니라 견적용 주석이라, DXF 엔티티로 밀어넣지
-//! 말고 Bimove 쪽 overlay 로 그리는 게 맞다 — 그래서 "아직" 이 아니라
-//! "여기서는 안 한다" 가 맞는 것도 섞여 있다.
+//! 남은 Bimove 고유 도형(문·창·치수·공간·물량표)은 아직 안 옮긴다. 조용히
+//! 빼면 "다 나왔다" 로 보이므로 종류별로 세서 `notes` 에 담는다.
+//!
+//! 벽체는 **옮긴다** (`crate::wall`). 한때 "벽은 CAD 엔티티가 아니라 견적용
+//! 주석이라 overlay 로 그리는 게 맞다" 고 적어 뒀는데, 그건 tldraw 를 남겨
+//! 두는 전제에서만 맞는 말이었다. 걷어낼 거라면 벽도 엔진이 알아야 하고,
+//! 마침 **MLINE 이 평면도의 벽 그 자체**다 — 중심선·두께·miter·캡·속 채움이
+//! 전부 들어 있다. 손으로 miter 를 다시 계산할 이유가 없다.
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::library::PatternLine;
@@ -32,6 +35,8 @@ use cadcraft_doc::{Drawing, Entity, EntityKind, Hatch, HatchLoop, Line, LwPolyli
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+use crate::wall::WallSeg;
 
 /// 옮긴 결과.
 pub struct BimoveLoad {
@@ -48,6 +53,11 @@ pub struct BimoveLoad {
     /// 이어 붙이기 전의 선분 수. `line_count` 와 견주면 얼마나 줄었는지 보인다.
     pub segment_count: usize,
     pub hatch_count: usize,
+    /// 읽은 벽체 **도형** 수.
+    pub wall_count: usize,
+    /// 만든 MLINE 수. `wall_count` 보다 **작아야** 묶기가 듣는 것이다 —
+    /// 같으면 이어진 벽을 하나도 못 묶었다는 뜻이고, 그러면 코너마다 캡이 선다.
+    pub wall_mline_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -441,6 +451,46 @@ fn to_mtext(plain: &str) -> String {
 /// `page_id` 가 비어 있으면 첫 페이지. 그 페이지에 직접 달린 도형만 옮긴다 —
 /// 그룹 안까지 따라 들어가는 건 다음 일이다 (지금 저장된 도면에는 dxfgroup 이
 /// 전부 페이지 직속이다).
+/// 벽체 도형 하나 → 중심선 선분.
+///
+/// 돌려주는 좌표는 **엔진** 것이다 (y-up). 캔버스에서 회전을 먹인 뒤 두 점의
+/// y 를 같이 뒤집는다 — 뒤집기는 거울이므로 회전각을 따로 고칠 필요가 없다.
+///
+/// `None` 이면 못 쓰는 벽이다 (두께 0, 길이 0, NaN). 부른 쪽이 **따로 세서**
+/// `notes` 에 담는다 — 그냥 빼면 도형이 하나 사라진 걸 아무도 모른다.
+fn wall_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<WallSeg> {
+    let (x2, y2) = (f(props, "x2", 0.0), f(props, "y2", 0.0));
+    let thickness = f(props, "thickness", 0.0);
+    if !(thickness > 0.0) || !(x2.hypot(y2) > 1e-9) {
+        return None;
+    }
+    let (gx, gy) = (f(sh, "x", 0.0), f(sh, "y", 0.0));
+    let rot = f(sh, "rotation", 0.0);
+    let (c, s_) = (rot.cos(), rot.sin());
+    let (ex, ey) = (gx + x2 * c - y2 * s_, gy + x2 * s_ + y2 * c);
+    if !(gx.is_finite() && gy.is_finite() && ex.is_finite() && ey.is_finite()) {
+        return None;
+    }
+
+    let hex = |key: &str| meta.and_then(|m| s(m, key)).and_then(Rgb::parse_hex);
+    Some(WallSeg {
+        a: Vec2::new(gx, -gy),
+        b: Vec2::new(ex, -ey),
+        thickness,
+        layer: layer_of(meta),
+        // 윤곽선은 못 주면 `ByLayer` 로 둔다. 엔진이 배경을 보고 잉크를 고르므로
+        // 어두운 배경에서도 읽힌다 — 여기서 `#222` 로 박으면 다크에서 묻는다.
+        color: hex("stroke").map_or_else(|| color_of(meta), Color::True),
+        // 속은 **흰색**이다. 평면도의 벽은 가는 윤곽선 두 줄 + 빈 속이 맞다
+        // (`WallShape.tsx` 의 `rawFill` 과 같은 기본값).
+        //
+        // 다크 배경에서는 이게 하얗게 뜬다. 고치려면 배경색이 여기까지
+        // 내려와야 하는데 `drawing_from_bimove` 는 그걸 모른다 — 색을 짐작하지
+        // 말고, 배경을 넘기게 될 때 같이 손대는 게 맞다.
+        fill: Some(hex("fill").map_or(Color::True(Rgb(255, 255, 255)), Color::True)),
+    })
+}
+
 pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, String> {
     let doc: Value =
         serde_json::from_str(json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
@@ -476,6 +526,12 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut line_count = 0usize;
     let mut text_count = 0usize;
     let mut segment_count = 0usize;
+    // 벽은 **모아 두고 한꺼번에** 넣는다. 이어진 벽을 한 MLINE 으로 묶으려면
+    // 이웃을 알아야 하고, 이웃은 도형을 다 읽은 뒤에야 다 보인다.
+    let mut walls: Vec<WallSeg> = Vec::new();
+    // 본 벽체 도형 수. `walls.len()` 과 다를 수 있다 — 두께 0 이나 길이 0 짜리는
+    // 그릴 수가 없다. 그 차이를 세지 않으면 도형이 조용히 사라진다.
+    let mut wall_seen = 0usize;
 
     for sh in &shapes {
         let parent = s(sh, "parentId").unwrap_or("");
@@ -486,6 +542,15 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         let kind = s(sh, "type").unwrap_or("");
         let props = sh.get("props").cloned().unwrap_or(Value::Null);
         let meta = sh.get("meta");
+
+        if kind == "wall" {
+            wall_seen += 1;
+            if let Some(w) = wall_seg(sh, &props, meta) {
+                layers.entry(w.layer.clone()).or_insert(());
+                walls.push(w);
+            }
+            continue;
+        }
 
         if kind != "dxfgroup" {
             *skipped_types.entry(kind.to_string()).or_insert(0) += 1;
@@ -562,6 +627,11 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             add_hatches(&mut drawing, s(&props, "hatchesJson").unwrap_or(""), gx, gy, &layer, color);
     }
 
+    // 벽은 맨 마지막에 넣는다 — 이웃을 다 본 뒤에야 줄기로 묶을 수 있다.
+    let wall_count = wall_seen;
+    let wall_dropped = wall_seen - walls.len();
+    let wall_mline_count = crate::wall::add_walls(&mut drawing, &walls);
+
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
     for name in layers.keys() {
         if name != "0" && !drawing.layers.iter().any(|l| &l.name == name) {
@@ -574,6 +644,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut notes = Vec::new();
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
+    }
+    if wall_dropped > 0 {
+        notes.push(format!("벽체 {wall_dropped}개를 못 그렸다 (두께나 길이가 0)"));
     }
     for (k, n) in &skipped_types {
         notes.push(format!("{k} {n}개 — 여기서 안 그린다 (Bimove overlay 몫)"));
@@ -588,6 +661,8 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         text_count,
         segment_count,
         hatch_count,
+        wall_count,
+        wall_mline_count,
     })
 }
 
@@ -801,9 +876,7 @@ mod tests {
     fn 안_그린_것을_센다() {
         // 조용히 빼면 "다 나왔다" 로 보인다.
         let j = doc_json(
-            r#"{"id":"shape:w","type":"wall","x":0,"y":0,"rotation":0,"index":"a1",
-                "parentId":"page:main","props":{"thickness":20}},
-               {"id":"shape:z","type":"zone","x":0,"y":0,"rotation":0,"index":"a2",
+            r#"{"id":"shape:z","type":"zone","x":0,"y":0,"rotation":0,"index":"a2",
                 "parentId":"page:main","props":{}},
                {"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a3",
                 "parentId":"page:main","props":{"pathData":"M0,0L1,0","hatchesJson":"[{}]"}}"#,
@@ -811,10 +884,140 @@ mod tests {
         let r = drawing_from_bimove(&j, "").unwrap();
         assert_eq!(r.line_count, 1);
         let all = r.notes.join(" | ");
-        assert!(all.contains("wall 1개"), "{all}");
         assert!(all.contains("zone 1개"), "{all}");
         // 해치는 이제 **그린다** — 못 그리는 것 목록에 있으면 안 된다
         assert!(!all.contains("해치"), "{all}");
+        // 벽체도 이제 그린다. 전엔 여기 "wall 1개" 가 있었다.
+        assert!(!all.contains("wall"), "{all}");
+    }
+
+    // ── 벽체 ──
+
+    /// 벽체 도형 하나. `x2`/`y2` 는 **제 시작점 기준** 상대 좌표다.
+    fn wall_json(i: u32, x: f64, y: f64, x2: f64, y2: f64, t: f64) -> String {
+        format!(
+            r#"{{"id":"shape:w{i}","type":"wall","x":{x},"y":{y},"rotation":0,"index":"a{i}",
+               "parentId":"page:main","props":{{"x2":{x2},"y2":{y2},"thickness":{t}}}}}"#
+        )
+    }
+
+    #[test]
+    fn 벽을_mline_으로_넣는다() {
+        let j = doc_json(&wall_json(1, 0.0, 0.0, 100.0, 0.0, 20.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.wall_count, 1);
+        assert_eq!(r.wall_mline_count, 1);
+        let mls: Vec<_> = r
+            .drawing
+            .model
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::MLine(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mls.len(), 1);
+        assert_eq!(mls[0].scale, 20.0);
+    }
+
+    #[test]
+    fn 이어진_벽은_mline_하나로_묶인다() {
+        // 벽 셋이 ㄴ 자로 이어진다. 묶이지 않으면 코너마다 캡이 선다.
+        let j = doc_json(&format!(
+            "{},{},{}",
+            wall_json(1, 0.0, 0.0, 100.0, 0.0, 20.0),
+            wall_json(2, 100.0, 0.0, 0.0, 100.0, 20.0),
+            wall_json(3, 100.0, 100.0, 100.0, 0.0, 20.0),
+        ));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.wall_count, 3);
+        assert_eq!(r.wall_mline_count, 1, "셋이 한 줄기여야 한다");
+    }
+
+    #[test]
+    fn 벽의_y_는_뒤집힌다() {
+        // 캔버스는 y 가 아래로, 엔진은 위로 간다. 선·글자와 같은 규칙이어야
+        // 벽이 도면 위에 제자리로 얹힌다.
+        let j = doc_json(&wall_json(1, 10.0, 50.0, 0.0, 30.0, 20.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let m = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MLine(m) => Some(m),
+                _ => None,
+            })
+            .expect("MLINE");
+        let ys: Vec<f64> = m.vertices.iter().map(|v| v.p.y).collect();
+        assert_eq!(ys, vec![-50.0, -80.0], "y 를 뒤집어야 한다");
+    }
+
+    #[test]
+    fn 회전한_벽의_끝점을_돌린다() {
+        // rotation 은 캔버스 기준이다. 90도 돌리면 (100,0) 이 (0,100) 이 되고,
+        // y 를 뒤집어 -100 으로 간다.
+        let j = doc_json(
+            r#"{"id":"shape:w1","type":"wall","x":0,"y":0,"rotation":1.5707963267948966,
+               "index":"a1","parentId":"page:main",
+               "props":{"x2":100,"y2":0,"thickness":20}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let m = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MLine(m) => Some(m),
+                _ => None,
+            })
+            .expect("MLINE");
+        let end = m.vertices[1].p;
+        assert!(end.x.abs() < 1e-9, "x: {}", end.x);
+        assert!((end.y - -100.0).abs() < 1e-9, "y: {}", end.y);
+    }
+
+    #[test]
+    fn 못_쓰는_벽은_세서_알린다() {
+        // 두께 0 과 길이 0. 조용히 빼면 도형이 사라진 걸 아무도 모른다.
+        let j = doc_json(&format!(
+            "{},{},{}",
+            wall_json(1, 0.0, 0.0, 100.0, 0.0, 0.0),
+            wall_json(2, 0.0, 0.0, 0.0, 0.0, 20.0),
+            wall_json(3, 0.0, 0.0, 100.0, 0.0, 20.0),
+        ));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.wall_count, 3, "본 것은 셋이다");
+        assert_eq!(r.wall_mline_count, 1, "그린 것은 하나다");
+        assert!(r.notes.join(" | ").contains("벽체 2개를 못 그렸다"), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn 벽도_레이어를_만든다() {
+        // 레이어를 안 만들면 엔진이 못 찾아 "0" 으로 보고 색이 틀어진다.
+        let j = doc_json(
+            r#"{"id":"shape:w1","type":"wall","x":0,"y":0,"rotation":0,"index":"a1",
+               "parentId":"page:main","props":{"x2":100,"y2":0,"thickness":20},
+               "meta":{"dxfLayer":"벽체"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "벽체"), "레이어가 없다");
+    }
+
+    #[test]
+    fn 다른_페이지의_벽은_안_읽는다() {
+        let j = format!(
+            r#"{{"version":1,
+             "pages":[{{"id":"page:main","name":"모형","index":"a1"}},
+                      {{"id":"page:two","name":"배치1","index":"a2"}}],
+             "shapes":[{},
+               {{"id":"shape:w9","type":"wall","x":0,"y":0,"rotation":0,"index":"a9",
+                 "parentId":"page:two","props":{{"x2":500,"y2":0,"thickness":20}}}}],
+             "records":{{}},"skipped":0}}"#,
+            wall_json(1, 0.0, 0.0, 100.0, 0.0, 20.0),
+        );
+        let r = drawing_from_bimove(&j, "page:main").unwrap();
+        assert_eq!(r.wall_count, 1);
     }
 
     // ── 해치 ──

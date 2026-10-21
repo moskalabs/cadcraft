@@ -10,6 +10,7 @@
 //! 수만 개 선분이라 이게 전부다.
 
 pub mod bimove;
+pub mod wall;
 
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
@@ -491,7 +492,7 @@ pub struct Doc {
     /// 옮기면서 **그리지 않은 것**. 조용히 빼면 "다 나왔다" 로 보인다.
     notes: Vec<String>,
     /// Bimove 문서에서 만든 선/글자/해치 수 (상태줄에 띄운다).
-    counts: (usize, usize, usize),
+    counts: Counts,
     /// 실제로 옮긴 페이지 id. "" 를 넘겼을 때 **무엇이 골라졌는지** 알려준다.
     page_id: String,
     /// 마지막으로 만든 DisplayList 와 그때의 (공간, tolerance).
@@ -507,6 +508,21 @@ pub struct Doc {
     cache: Option<(String, f64, u32, u64, DisplayList)>,
 }
 
+/// Bimove 문서에서 **무엇이 몇 개 나왔는지.**
+///
+/// 상태줄에 그대로 띄우는 숫자다. 튜플이 아니라 이름을 붙여 둔다 — `counts.3`
+/// 과 `counts.4` 가 벽인지 MLINE 인지 읽는 쪽에서 알 수가 없다.
+#[derive(Clone, Copy, Debug, Default)]
+struct Counts {
+    lines: usize,
+    texts: usize,
+    hatches: usize,
+    /// 읽은 벽체 도형 수.
+    walls: usize,
+    /// 그 벽을 묶어 만든 MLINE 수. `walls` 보다 작아야 묶기가 듣는 것이다.
+    wall_mlines: usize,
+}
+
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
 ///
 /// tolerance 는 "화면 반 픽셀"이라 줌에 반비례한다. 조금만 달라도 다시 만들면
@@ -517,7 +533,7 @@ const TOL_SLACK: f64 = 2.0;
 impl Doc {
     fn open(bytes: &[u8]) -> Result<Doc, String> {
         let drawing = cadcraft_io::read_dxf(bytes).map_err(|e| e.to_string())?;
-        Ok(Doc::of(drawing, Vec::new(), Vec::new(), (0, 0, 0), String::new()))
+        Ok(Doc::of(drawing, Vec::new(), Vec::new(), Counts::default(), String::new()))
     }
 
     /// Bimove 문서(우리 포맷 JSON)를 읽는다.
@@ -527,13 +543,19 @@ impl Doc {
     /// 지금 저장된 건 DXF 가 아니라 평평해진 선분이라 되돌릴 원본이 없다.
     pub fn from_bimove(json: &str, page_id: &str) -> Result<Doc, String> {
         let load = bimove::drawing_from_bimove(json, page_id)?;
-        let counts = (load.line_count, load.text_count, load.hatch_count);
+        let counts = Counts {
+            lines: load.line_count,
+            texts: load.text_count,
+            hatches: load.hatch_count,
+            walls: load.wall_count,
+            wall_mlines: load.wall_mline_count,
+        };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
     }
 
     fn of(
         drawing: cadcraft_doc::Drawing, pages: Vec<(String, String)>, notes: Vec<String>,
-        counts: (usize, usize, usize), page_id: String,
+        counts: Counts, page_id: String,
     ) -> Doc {
         let mut session = Session::empty();
         session.open_drawing(drawing, "bimove", None);
@@ -659,19 +681,35 @@ impl BimoveDoc {
     /// Bimove 문서에서 만든 선 개수.
     #[wasm_bindgen(js_name = lineCount)]
     pub fn line_count(&self) -> usize {
-        self.0.counts.0
+        self.0.counts.lines
     }
 
     /// Bimove 문서에서 만든 글자 개수.
     #[wasm_bindgen(js_name = textCount)]
     pub fn text_count(&self) -> usize {
-        self.0.counts.1
+        self.0.counts.texts
     }
 
     /// Bimove 문서에서 만든 해치 개수.
     #[wasm_bindgen(js_name = hatchCount)]
     pub fn hatch_count(&self) -> usize {
-        self.0.counts.2
+        self.0.counts.hatches
+    }
+
+    /// 읽은 벽체 **도형** 수.
+    #[wasm_bindgen(js_name = wallCount)]
+    pub fn wall_count(&self) -> usize {
+        self.0.counts.walls
+    }
+
+    /// 벽체로 만든 MLINE 수.
+    ///
+    /// `wallCount` 와 **같이** 띄워야 쓸모가 있다. 이어진 벽이 묶이면 이 쪽이
+    /// 훨씬 작고, 둘이 같으면 하나도 못 묶었다는 뜻이다 — 그러면 코너마다
+    /// 캡이 서서 "꺾이는 지점이 겹친" 옛 모양으로 돌아간다.
+    #[wasm_bindgen(js_name = wallMlineCount)]
+    pub fn wall_mline_count(&self) -> usize {
+        self.0.counts.wall_mlines
     }
 
     /// 배치 탭 이름들.
@@ -1018,8 +1056,8 @@ mod tests {
                      "textsJson":"[{\"x\":10,\"y\":10,\"t\":\"거실\",\"h\":8}]",
                      "hatchesJson":"[{}]"},
             "meta":{"dxfLayer":"A-WALL","dxfColor":"#ff0000"}},
-            {"id":"shape:w","type":"wall","x":0,"y":0,"rotation":0,"index":"a2",
-             "parentId":"page:main","props":{"thickness":20}}],
+            {"id":"shape:w","type":"wall","x":0,"y":60,"rotation":0,"index":"a2",
+             "parentId":"page:main","props":{"x2":100,"y2":0,"thickness":20}}],
           "records":{},"skipped":0,
           "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":2}}"##
             .to_string()
@@ -1048,13 +1086,33 @@ mod tests {
 
     #[test]
     fn bimove_문서는_안_그린_것을_알려준다() {
-        // 조용히 빼면 "다 나왔다" 로 보인다. 해치와 벽체가 아직 안 나온다.
+        // 조용히 빼면 "다 나왔다" 로 보인다.
+        //
+        // 이 목록은 **줄어드는 쪽으로만** 바뀐다. 해치가 먼저 빠졌고 이번에
+        // 벽체가 빠졌다. 그래서 "무엇이 없는가" 로 적는다 — 있는 것만 적으면
+        // 다음에 하나를 옮겼을 때 이 테스트가 아무것도 안 지킨다.
         let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
         let notes = doc.notes.join(" | ");
-        assert!(notes.contains("wall"), "{notes}");
-        // 해치는 이제 그린다 — 못 그리는 것 목록에서 빠져야 한다
-        assert!(!notes.contains("해치"), "{notes}");
+        assert!(!notes.contains("해치"), "해치는 그린다: {notes}");
+        assert!(!notes.contains("wall"), "벽체는 그린다: {notes}");
+        assert!(!notes.contains("못 그렸다"), "성한 도형을 빼먹었다: {notes}");
         assert_eq!(doc.pages, vec![("page:main".to_string(), "모형".to_string())]);
+    }
+
+    #[test]
+    fn bimove_문서의_벽이_mline_으로_들어간다() {
+        // 벽을 MLINE 으로 넣는 게 코너가 맞물리는 이유다. 폴리라인으로 넣으면
+        // miter 를 손으로 계산해야 하고, 그게 tldraw 쪽에서 세 번 틀렸다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let n = doc
+            .drawing()
+            .model
+            .iter()
+            .filter(|e| matches!(e.kind, cadcraft_doc::EntityKind::MLine(_)))
+            .count();
+        assert_eq!(n, 1, "MLINE 이 {n}개다");
+        assert_eq!(doc.counts.walls, 1);
+        assert_eq!(doc.counts.wall_mlines, 1);
     }
 
     #[test]
