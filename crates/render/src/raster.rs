@@ -78,6 +78,21 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
     let mut pm = Pixmap::new(view.width, view.height)?;
     pm.fill(tiny_skia::Color::from_rgba8(o.background.0, o.background.1, o.background.2, 255));
     let vis = view.world_bounds();
+    // 같은 붓으로 **잇달아** 오는 선들을 한 path 에 모아 한 번에 긋는다.
+    //
+    // 전엔 프리미티브마다 `PathBuilder` 를 새로 만들고 `stroke_path` 를 따로
+    // 불렀다. 큰 도면은 그게 한 프레임에 1만 번을 넘고, 호출마다 윤곽선
+    // path 를 새로 만드는 비용이 붙는다 — 점을 옮기는 일보다 그 간접비가
+    // 크다.
+    //
+    // **잇달아 오는 것만** 묶는다. 멀리 있는 같은 색을 끌어다 붙이면 그리는
+    // 차례가 바뀌어서, 문·창의 가림이나 공간의 비치는 면이 엉뚱한 것을
+    // 덮는다 (`opening.rs`·`zone.rs` 가 그 차례에 기대고 있다).
+    //
+    // **불투명한 것만** 묶는다. 반투명한 선 둘이 겹칠 때, 따로 그으면 두 번
+    // 섞이고 한 path 로 그으면 한 번 섞인다 — 그림이 달라진다.
+    let mut brush: Option<Brush> = None;
+    let mut pb = PathBuilder::new();
     for p in &list.prims {
         let c = p.display_rgb(o.background);
         let mut paint = Paint::default();
@@ -87,11 +102,16 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
         let pts = list.points(p);
         match p.kind {
             Kind::Polyline => {
-                let bb = Bounds2::from_points(pts.iter().copied());
-                if !bb.intersects(&vis) {
+                if !visible(pts, &vis) {
                     continue;
                 }
-                let mut pb = PathBuilder::new();
+                let w = if o.px_per_mm > 0.0 && p.lw > 0.0 { (p.lw * o.px_per_mm).max(o.hairline) } else { o.hairline };
+                let want = Brush { rgb: c, alpha: p.alpha(), width: w };
+                // 붓이 바뀌면 쓰던 것을 먼저 긋는다
+                if brush != Some(want) {
+                    flush(&mut pm, &mut pb, &mut brush, o.antialias);
+                    brush = Some(want);
+                }
                 for (i, q) in pts.iter().enumerate() {
                     let (x, y) = view.to_screen(*q);
                     if i == 0 {
@@ -100,12 +120,17 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
                         pb.line_to(x, y);
                     }
                 }
-                if let Some(path) = pb.finish() {
-                    let w = if o.px_per_mm > 0.0 && p.lw > 0.0 { (p.lw * o.px_per_mm).max(o.hairline) } else { o.hairline };
-                    let stroke = Stroke { width: w, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
-                    pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                // 반투명은 모으지 않는다 — 겹치면 섞이는 횟수가 달라진다
+                if want.alpha != 255 {
+                    flush(&mut pm, &mut pb, &mut brush, o.antialias);
                 }
+                continue;
             }
+            _ => flush(&mut pm, &mut pb, &mut brush, o.antialias),
+        }
+        match p.kind {
+            // 위에서 `continue` 했다
+            Kind::Polyline => {}
             Kind::Tris | Kind::Mask => {
                 if p.kind == Kind::Mask {
                     paint.set_color_rgba8(o.background.0, o.background.1, o.background.2, 255);
@@ -152,7 +177,48 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
             }
         }
     }
+    flush(&mut pm, &mut pb, &mut brush, o.antialias);
     Some(pm)
+}
+
+/// 이 선이 화면에 걸치나 — **걸치는 걸 알자마자 그만둔다.**
+///
+/// 폴리라인이 화면에 걸치는지는 제 경계상자가 화면과 겹치는지로 본다. 전엔
+/// `Bounds2::from_points` 로 **점을 끝까지 훑어** 상자를 만들고 나서 봤다.
+/// 보이는 선(흔한 쪽)은 몇 점만 봐도 이미 겹치는데도 그랬다 — 큰 도면은
+/// 한 프레임에 61만 점을 그렇게 한 번 더 돌았다 (path 를 만들 때 또 돈다).
+///
+/// 상자를 키워 가다 겹치는 순간 멈춘다. 안 보이는 선은 어차피 끝까지 봐야
+/// 하지만, 그건 그리기를 통째로 건너뛰는 값이라 싸다.
+fn visible(pts: &[Vec2], vis: &Bounds2) -> bool {
+    let mut bb = Bounds2::EMPTY;
+    for q in pts {
+        bb.add(*q);
+        if bb.intersects(vis) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The paint a run of polylines shares.
+#[derive(Clone, Copy, PartialEq)]
+struct Brush {
+    rgb: Rgb,
+    alpha: u8,
+    width: f32,
+}
+
+/// Stroke what has been gathered, and start a fresh path.
+fn flush(pm: &mut Pixmap, pb: &mut PathBuilder, brush: &mut Option<Brush>, antialias: bool) {
+    let Some(b) = brush.take() else { return };
+    let built = std::mem::replace(pb, PathBuilder::new());
+    let Some(path) = built.finish() else { return };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(b.rgb.0, b.rgb.1, b.rgb.2, b.alpha);
+    paint.anti_alias = antialias;
+    let stroke = Stroke { width: b.width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
+    pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
 }
 
 /// Render and encode as PNG.

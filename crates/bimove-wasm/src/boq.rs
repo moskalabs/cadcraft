@@ -143,9 +143,14 @@ fn table_width() -> f64 {
 /// 정확하겠지만, 그러면 화면과 다른 자리에서 잘려서 두 그림이 달라진다.
 fn fit_text(text: &str, width: f64) -> String {
     let budget = (width - PAD * 2.0) / FONT;
-    let wide = |c: char| {
-        matches!(c, '\u{3131}'..='\u{D79D}' | '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}')
-    };
+    // 화면의 `/[ㄱ-힝一-鿿぀-ヿ]/` 과 **같은 집합**이다.
+    //
+    // 한자 범위는 한글 범위 안에 통째로 들어간다 (U+4E00..U+9FFF ⊂
+    // U+3131..U+D79D) — 그대로 옮겨 적으면 "닿지 않는 갈래" 경고가 난다.
+    // 그렇다고 둘을 `U+3040..U+D79D` 한 줄로 합치면 **안 된다**: 가나 끝과
+    // 한글 시작 사이의 U+3100..U+3130 (31자) 이 딸려 들어와 화면과 다른
+    // 자리에서 잘린다.
+    let wide = |c: char| matches!(c, '\u{3040}'..='\u{30FF}' | '\u{3131}'..='\u{D79D}');
     let mut used = 0.0;
     for (i, c) in text.chars().enumerate() {
         used += if wide(c) { 1.0 } else { 0.55 };

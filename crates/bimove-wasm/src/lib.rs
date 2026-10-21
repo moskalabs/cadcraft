@@ -185,6 +185,10 @@ impl Doc {
             width: w,
             height: h,
         };
+        // 조작 중에도 **계단은 다듬는다.** 안티앨리어싱을 끄면 빨라질 것
+        // 같지만 재보니 **느려졌다** — draft 평균 21.3 → 35.3ms, 최악
+        // 97 → 230ms. tiny-skia 의 비-AA 경로가 얇은 선에서 더 비싸다.
+        // 그 측정을 남겨 둔다; 다시 시도할 사람이 또 재지 않도록.
         let ro = cadcraft_render::raster::RasterOptions { background: bg_rgb, ..Default::default() };
         let mut pm = cadcraft_render::raster::render(dl, &view, &ro)?;
 

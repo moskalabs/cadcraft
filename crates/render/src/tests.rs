@@ -924,3 +924,118 @@ fn cancelled_build_stops_early() {
     assert!(!crate::hatch::pattern_lines_until(&drawing, &h, &loops, 0.0, None, None).is_empty());
     assert!(crate::hatch::pattern_lines_until(&drawing, &h, &loops, 0.0, None, set.as_deref()).is_empty());
 }
+
+// ── 붓 묶기 ──
+//
+// 잇달아 오는 같은 붓의 선들은 한 path 로 모아 한 번에 긋는다. 거기서 깨질
+// 수 있는 건 둘이다: **그리는 차례**와 **반투명이 섞이는 횟수**.
+
+/// 가로선 하나짜리 폴리라인 프리미티브.
+fn line_prim(l: &mut DisplayList, y: f64, rgb: Rgb, transparency: u8) {
+    let start = l.verts.len() as u32;
+    l.verts.push(Vec2::new(-50.0, y));
+    l.verts.push(Vec2::new(50.0, y));
+    l.prims.push(DPrim {
+        handle: cadcraft_doc::Handle(0),
+        color: rgb,
+        aci7: false,
+        lw: 0.0,
+        transparency,
+        kind: Kind::Polyline,
+        start,
+        len: 2,
+    });
+}
+
+/// 화면을 가리는 마스크 (배경색으로 칠한다).
+fn mask_prim(l: &mut DisplayList) {
+    let start = l.tris.len() as u32;
+    for p in [
+        Vec2::new(-60.0, -60.0), Vec2::new(60.0, -60.0), Vec2::new(60.0, 60.0),
+        Vec2::new(-60.0, -60.0), Vec2::new(60.0, 60.0), Vec2::new(-60.0, 60.0),
+    ] {
+        l.tris.push(p);
+    }
+    l.prims.push(DPrim {
+        handle: cadcraft_doc::Handle(0),
+        color: Rgb(0, 0, 0),
+        aci7: false,
+        lw: 0.0,
+        transparency: 0,
+        kind: Kind::Mask,
+        start,
+        len: 6,
+    });
+}
+
+#[test]
+fn 묶기가_그리는_차례를_안_깨뜨린다() {
+    // 빨강 → 가림 → 빨강. 멀리 있는 같은 색을 끌어다 붙이면 **뒤의 빨강이
+    // 가림보다 먼저** 그려져서 지워진다. 문·창의 갭이 그 차례에 기대고 있다.
+    let mut l = DisplayList::default();
+    line_prim(&mut l, -20.0, Rgb(255, 0, 0), 0);
+    mask_prim(&mut l);
+    line_prim(&mut l, 20.0, Rgb(255, 0, 0), 0);
+
+    let v = View { center: Vec2::ZERO, scale: 2.0, width: 200, height: 200 };
+    let o = RasterOptions { background: Rgb(255, 255, 255), antialias: false, ..Default::default() };
+    let pm = render(&l, &v, &o).unwrap();
+
+    let red_rows: Vec<u32> = (0..pm.height())
+        .filter(|y| (0..pm.width()).any(|x| {
+            let p = pm.pixel(x, *y).unwrap();
+            p.red() > 200 && p.green() < 60
+        }))
+        .collect();
+    // 가림 뒤에 온 빨강 **하나만** 남아야 한다
+    assert!(!red_rows.is_empty(), "빨강이 통째로 사라졌다");
+    let span = red_rows.last().unwrap() - red_rows.first().unwrap();
+    assert!(span < 4, "빨강이 두 줄 남았다 — 가림보다 먼저 그려졌다: {red_rows:?}");
+}
+
+#[test]
+fn 반투명은_묶지_않는다() {
+    // 반투명 선 둘이 **같은 자리에** 겹치면 두 번 섞여야 한다. 한 path 로
+    // 모으면 한 번만 섞여서 더 옅게 나온다.
+    let mut twice = DisplayList::default();
+    line_prim(&mut twice, 0.0, Rgb(0, 0, 0), 50);
+    line_prim(&mut twice, 0.0, Rgb(0, 0, 0), 50);
+
+    let mut once = DisplayList::default();
+    line_prim(&mut once, 0.0, Rgb(0, 0, 0), 50);
+
+    let v = View { center: Vec2::ZERO, scale: 2.0, width: 64, height: 64 };
+    let o = RasterOptions { background: Rgb(255, 255, 255), antialias: false, ..Default::default() };
+    let darkest = |l: &DisplayList| {
+        let pm = render(l, &v, &o).unwrap();
+        pm.pixels().iter().map(|p| p.red()).min().unwrap_or(255)
+    };
+    assert!(
+        darkest(&twice) < darkest(&once),
+        "두 번 겹쳐도 한 번과 같다 — 반투명이 묶였다 ({} vs {})",
+        darkest(&twice),
+        darkest(&once)
+    );
+}
+
+#[test]
+fn 같은_붓이_이어지면_한_번에_긋는다() {
+    // 묶어도 **그림은 같아야** 한다. 색만 번갈아 넣어 묶이지 못하게 한
+    // 것과, 같은 색으로 이어 둔 것이 같은 자리에 같은 잉크를 남기는지 본다.
+    let mut merged = DisplayList::default();
+    let mut split = DisplayList::default();
+    for i in 0..8 {
+        let y = -30.0 + f64::from(i) * 8.0;
+        line_prim(&mut merged, y, Rgb(0, 0, 0), 0);
+        // 사이에 다른 색을 끼워 붓이 끊기게 한다
+        line_prim(&mut split, y, Rgb(0, 0, 0), 0);
+        line_prim(&mut split, y + 4.0, Rgb(255, 255, 255), 0);
+    }
+    let v = View { center: Vec2::ZERO, scale: 2.0, width: 200, height: 200 };
+    let o = RasterOptions { background: Rgb(255, 255, 255), antialias: false, ..Default::default() };
+    let black = |l: &DisplayList| {
+        let pm = render(l, &v, &o).unwrap();
+        pm.pixels().iter().filter(|p| p.red() < 60).count()
+    };
+    assert_eq!(black(&merged), black(&split), "묶었더니 잉크 양이 달라졌다");
+}
