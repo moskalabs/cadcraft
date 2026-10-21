@@ -10,7 +10,9 @@
 //! 수만 개 선분이라 이게 전부다.
 
 pub mod bimove;
+pub mod boq;
 pub mod dim;
+pub mod jsnum;
 pub mod opening;
 pub mod wall;
 pub mod zone;
@@ -375,9 +377,21 @@ fn readable_on(c: cadcraft_color::Rgb, bg: cadcraft_color::Rgb) -> cadcraft_colo
     }
 }
 
-/// 배경에 묻히는 색을 끌어낸다. **DisplayList 를 제자리에서 고친다.**
+/// 배경에 묻히는 **잉크**를 끌어낸다. **DisplayList 를 제자리에서 고친다.**
+///
+/// 채움(`Kind::Tris`)과 가림(`Kind::Mask`)은 건드리지 않는다. 면은 잉크가
+/// 아니라 **바닥**이고, 연한 건 연한 게 목적이다 — 물량표의 제목·머리·합계
+/// 띠(`#f1f3f4` 들)나 공간의 비치는 회색이 그렇다. 묻힌다고 끌어내리면 연한
+/// 띠가 **숯색 덩어리**가 되어, 그 위에 얹힌 글자까지 못 읽게 된다. 읽혀야
+/// 하는 건 면 위의 글자이고, 그건 여기서 따로 손본다.
+///
+/// 어두운 배경에서 어두운 면은 안 보이게 된다. 그건 받아들인다 — Bimove 의
+/// 캔버스는 흰색이고, 면을 밝히면 흰 배경에서 띠가 사라진다.
 fn make_readable(dl: &mut DisplayList, bg: cadcraft_color::Rgb) {
     for p in &mut dl.prims {
+        if matches!(p.kind, Kind::Tris | Kind::Mask) {
+            continue;
+        }
         // 색 7번은 display_rgb 가 이미 배경에 맞춰 흑백으로 뒤집는다. 그 결과를
         // 가지고 판단해야 "이미 검은 글씨" 를 또 손대지 않는다.
         let shown = cadcraft_color::display_rgb(p.color, p.aci7, bg);
@@ -530,6 +544,8 @@ struct Counts {
     dims: usize,
     /// 읽은 공간 도형 수.
     zones: usize,
+    /// 읽은 물량표 도형 수.
+    boqs: usize,
 }
 
 /// 그릴 거리를 만드는 옵션.
@@ -576,6 +592,7 @@ impl Doc {
             openings: load.opening_count,
             dims: load.dim_count,
             zones: load.zone_count,
+            boqs: load.boq_count,
         };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
     }
@@ -763,6 +780,14 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = zoneCount)]
     pub fn zone_count(&self) -> usize {
         self.0.counts.zones
+    }
+
+    /// 읽은 물량표 **도형** 수.
+    ///
+    /// 하나가 엔티티 하나다 (TABLE). 칸과 괘선은 엔진이 그 안에서 만든다.
+    #[wasm_bindgen(js_name = boqCount)]
+    pub fn boq_count(&self) -> usize {
+        self.0.counts.boqs
     }
 
     /// 배치 탭 이름들.
@@ -1119,9 +1144,14 @@ mod tests {
              "parentId":"page:main",
              "props":{"points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":60},{"x":0,"y":60}],
                       "label":"거실","areaM2":6,"perimeterM":0,
-                      "wallHeightMm":2400,"color":"#34a853"}}],
+                      "wallHeightMm":2400,"color":"#34a853"}},
+            {"id":"shape:t","type":"boqtable","x":200,"y":0,"rotation":0,"index":"a6",
+             "parentId":"page:main",
+             "props":{"w":612,"h":96,"title":"마감재 물량 산출표",
+                      "rowsJson":"[{\"category\":\"벽체\",\"item\":\"석고보드\",\"spec\":\"9.5T\",\"areaM2\":6,\"qty\":4,\"unit\":\"장\"}]",
+                      "totalAreaM2":6}}],
           "records":{},"skipped":0,
-          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":5}}"##
+          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":6}}"##
             .to_string()
     }
 
@@ -1204,6 +1234,27 @@ mod tests {
         let mline = at(|k| matches!(k, cadcraft_doc::EntityKind::MLine(_))).expect("벽이 없다");
         let fill = at(|k| matches!(k, cadcraft_doc::EntityKind::Hatch(_))).expect("공간 면이 없다");
         assert!(mline < fill, "벽 {mline} / 공간 {fill}");
+    }
+
+    #[test]
+    fn bimove_문서의_물량표가_table_로_들어간다() {
+        // 선·글자로 풀면 그림만 같고 표가 아니게 된다 — 칸을 집을 수도,
+        // DXF 로 내보내 다른 CAD 에서 표로 읽을 수도 없다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        assert_eq!(doc.counts.boqs, 1);
+        let t = doc
+            .drawing()
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                cadcraft_doc::EntityKind::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("표가 없다");
+        assert_eq!(t.col_widths.len(), 6);
+        // 제목 + 머리 + 본문 1 + 합계
+        assert_eq!(t.row_heights.len(), 4);
+        assert_eq!(t.cells[2][1].text, "석고보드");
     }
 
     #[test]

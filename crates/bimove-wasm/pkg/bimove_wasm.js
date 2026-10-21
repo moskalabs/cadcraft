@@ -18,6 +18,16 @@ export class BimoveDoc {
         wasm.__wbg_bimovedoc_free(ptr, 0);
     }
     /**
+     * 읽은 물량표 **도형** 수.
+     *
+     * 하나가 엔티티 하나다 (TABLE). 칸과 괘선은 엔진이 그 안에서 만든다.
+     * @returns {number}
+     */
+    boqCount() {
+        const ret = wasm.bimovedoc_boqCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * 그릴 거리를 만든다. `layout` 이 "" 면 모형공간.
      * @param {string} layout
      * @param {number} tolerance

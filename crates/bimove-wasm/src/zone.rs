@@ -43,6 +43,8 @@ use cadcraft_doc::{
 };
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 
+use crate::jsnum::to_fixed;
+
 /// 공간 하나. 좌표는 **캔버스** 것이다 — y 뒤집기는 이 안에서 한다.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
@@ -82,27 +84,6 @@ const AREA_DROP: f64 = 12.0;
 fn transparency_of(alpha: f64) -> Transparency {
     let pct = ((1.0 - alpha.clamp(0.0, 1.0)) * 100.0).round();
     Transparency::Percent(pct.clamp(0.0, 90.0) as u8)
-}
-
-/// `Number.prototype.toFixed(1)` 과 **같은 문자열**을 낸다.
-///
-/// Rust 의 `{:.1}` 은 딱 중간인 값을 짝수 쪽으로 굽히고(`8.25` → `"8.2"`), JS 는
-/// 0 에서 먼 쪽으로 굽힌다(`"8.3"`). 둘이 갈리는 건 **정확히 중간인 값**뿐이다 —
-/// 화면과 다른 숫자가 뜨면 "어느 쪽이 맞나" 를 아무도 못 가린다.
-///
-/// 소수 한 자리에서 정확히 중간인 double 은 `j/4` (j 는 홀수) 꼴, 즉 `.25` 나
-/// `.75` 로 끝나는 값뿐이다. `(2k+1)/20` 은 분모에 5 가 남아 이진수로 떨어지지
-/// 않고, 떨어지려면 분자가 그 5 를 지워야 하기 때문이다. 그래서 `v*4` 가
-/// 홀수인지만 보면 된다.
-fn fixed1(v: f64) -> String {
-    let q = v * 4.0;
-    if q.fract() == 0.0 && q.abs() < 9e15 && (q as i64) % 2 != 0 {
-        // 중간값이다. `v*10` 은 정확한 반정수이고 `f64::round` 는 0 에서 먼
-        // 쪽으로 굽히므로, JS 와 같은 자리에 떨어진다.
-        let n = (v * 10.0).round() as i64;
-        return format!("{}.{}", n / 10, (n % 10).abs());
-    }
-    format!("{v:.1}")
 }
 
 /// MTEXT 붙임점 5 = 가운데-가운데. 화면의 `textAnchor="middle"` +
@@ -215,7 +196,7 @@ fn one(drawing: &mut Drawing, z: &Zone) {
 
     // 4. 면적 — 가운데 아래. 0 이면 안 띄운다 (화면과 같다)
     if z.area_m2 > 0.0 {
-        let s = format!("{}m²", fixed1(z.area_m2));
+        let s = format!("{}m²", to_fixed(z.area_m2, 1));
         text(drawing, z, Vec2::new(c.x, c.y - AREA_DROP), AREA_HEIGHT, AREA_INK, &s);
     }
 }
@@ -398,26 +379,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn 면적_문자열이_화면과_같다() {
-        // `toFixed(1)` 을 그대로 흉내낸다. Rust 의 `{:.1}` 은 딱 중간인 값을
-        // 짝수 쪽으로 굽혀서 8.25 가 "8.2" 가 된다 — 화면은 "8.3" 이다.
-        //
-        // 아래 값들은 node 에서 `v.toFixed(1)` 을 돌려 받아온 것이다.
-        for (v, want) in [
-            (8.25, "8.3"),
-            (8.35, "8.3"),
-            (0.15, "0.1"),
-            (2.675, "2.7"),
-            (1.005, "1.0"),
-            (8.45, "8.4"),
-            (0.75, "0.8"),
-            (2.5, "2.5"),
-            (0.0, "0.0"),
-        ] {
-            assert_eq!(fixed1(v), want, "{v}");
-        }
-    }
 
     #[test]
     fn 면적을_다시_재지_않는다() {

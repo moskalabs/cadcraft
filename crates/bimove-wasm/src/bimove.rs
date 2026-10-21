@@ -20,8 +20,8 @@
 //!
 //! ── 안 옮기는 것은 **센다** ──
 //!
-//! 남은 Bimove 고유 도형(물량표)은 아직 안 옮긴다. 조용히 빼면 "다 나왔다"
-//! 로 보이므로 종류별로 세서 `notes` 에 담는다.
+//! 안 옮기는 도형은 종류별로 세서 `notes` 에 담는다. 조용히 빼면 "다 나왔다"
+//! 로 보인다. tldraw 기본 도형(geo/line/arrow/text)과 주석·블록이 거기 남는다.
 //!
 //! 벽체는 **옮긴다** (`crate::wall`). 한때 "벽은 CAD 엔티티가 아니라 견적용
 //! 주석이라 overlay 로 그리는 게 맞다" 고 적어 뒀는데, 그건 tldraw 를 남겨
@@ -35,6 +35,9 @@
 //! 공간도 **옮긴다** (`crate::zone`). 반투명이라 **맨 마지막**에 넣는다 —
 //! 밑에 뭐가 깔려 있는지가 결과에 들어오기 때문이다.
 //!
+//! 물량표도 **옮긴다** (`crate::boq`). 엔진 TABLE 이다 — 선·글자로 풀면
+//! 그림만 같고 표가 아니게 된다.
+//!
 //! 치수도 **옮긴다** (`crate::dim`). 다만 숫자가 걸린다: 캔버스 1px 이 몇 mm
 //! 인지는 tldraw 의 **세션 상태**에 있어서 문서에 안 들어온다. 문서에 `scale`
 //! 이 있으면 쓰고, 없으면 `1px = 1mm` 로 두고 **`notes` 로 알린다** — 조용히
@@ -47,6 +50,7 @@ use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use crate::boq::{self, BoqRow, BoqTable};
 use crate::dim::{self, DimScale, DimSeg};
 use crate::opening::{self, Opening, OpeningKind, Swing};
 use crate::wall::WallSeg;
@@ -79,6 +83,8 @@ pub struct BimoveLoad {
     pub dim_count: usize,
     /// 읽은 공간 **도형** 수.
     pub zone_count: usize,
+    /// 읽은 물량표 **도형** 수.
+    pub boq_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -597,6 +603,43 @@ fn zone_of(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<Zone> {
     zone::usable(&z).then_some(z)
 }
 
+/// 물량표 도형 하나를 읽는다.
+///
+/// `x,y` 는 표의 **좌상단**이고 (`getGeometry` 가 그 점에서 시작하는
+/// 사각형이다), 줄은 `props.rowsJson` 에 JSON 배열로 실려 있다. 칸 너비와
+/// 줄 높이는 화면과 엔진 양쪽에 같은 상수로 박혀 있으므로 `props.w`/`h` 는
+/// 읽지 않는다 — 둘이 어긋나면 상수 쪽이 맞다.
+///
+/// 회전은 먹이지 않는다. 표는 `canResize` 를 끄고 쓰는 것이고, 돌리면 엔진의
+/// TABLE 은 축에 맞춰 그려지므로 화면과 달라진다.
+///
+/// `None` 이면 못 쓰는 것이다 (자리가 NaN).
+fn boq_table(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<BoqTable> {
+    let rows = serde_json::from_str::<Value>(s(props, "rowsJson").unwrap_or("[]"))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|r| BoqRow {
+            category: s(r, "category").unwrap_or("").to_string(),
+            item: s(r, "item").unwrap_or("").to_string(),
+            spec: s(r, "spec").unwrap_or("").to_string(),
+            area_m2: f(r, "areaM2", 0.0),
+            qty: f(r, "qty", 0.0),
+            unit: s(r, "unit").unwrap_or("").to_string(),
+        })
+        .collect();
+
+    let t = BoqTable {
+        at: Vec2::new(f(sh, "x", 0.0), f(sh, "y", 0.0)),
+        title: s(props, "title").unwrap_or("마감재 물량 산출표").to_string(),
+        rows,
+        total_area_m2: f(props, "totalAreaM2", 0.0),
+        layer: layer_of(meta),
+    };
+    boq::usable(&t).then_some(t)
+}
+
 pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, String> {
     let doc: Value =
         serde_json::from_str(json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
@@ -647,6 +690,8 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     // 공간은 반투명이라 **맨 마지막**에 넣는다 (`zone.rs`).
     let mut zones: Vec<Zone> = Vec::new();
     let mut zone_seen = 0usize;
+    let mut boqs: Vec<BoqTable> = Vec::new();
+    let mut boq_seen = 0usize;
 
     for sh in &shapes {
         let parent = s(sh, "parentId").unwrap_or("");
@@ -672,6 +717,15 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(o) = opening_of(sh, &props, meta, kind) {
                 layers.entry(o.layer.clone()).or_insert(());
                 openings.push(o);
+            }
+            continue;
+        }
+
+        if kind == "boqtable" {
+            boq_seen += 1;
+            if let Some(t) = boq_table(sh, &props, meta) {
+                layers.entry(t.layer.clone()).or_insert(());
+                boqs.push(t);
             }
             continue;
         }
@@ -792,6 +846,13 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let zone_dropped = zone_seen - zones.len();
     zone::add_zones(&mut drawing, &zones);
 
+    // 물량표는 공간보다 뒤다. 도면틀 옆에 놓는 것이라 공간과 겹치는 일은
+    // 드물지만, 겹치면 **표가 위에** 있어야 읽힌다 (반투명 회색이 표를 덮으면
+    // 숫자가 흐려진다).
+    let boq_count = boq_seen;
+    let boq_dropped = boq_seen - boqs.len();
+    boq::add_tables(&mut drawing, &boqs);
+
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
     for name in layers.keys() {
         if name != "0" && !drawing.layers.iter().any(|l| &l.name == name) {
@@ -804,6 +865,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut notes = Vec::new();
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
+    }
+    if boq_dropped > 0 {
+        notes.push(format!("물량표 {boq_dropped}개를 못 그렸다 (자리를 못 읽었다)"));
     }
     if zone_dropped > 0 {
         notes.push(format!("공간 {zone_dropped}개를 못 그렸다 (점이 셋 미만)"));
@@ -842,6 +906,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         opening_count,
         dim_count,
         zone_count,
+        boq_count,
     })
 }
 
@@ -1055,7 +1120,7 @@ mod tests {
     fn 안_그린_것을_센다() {
         // 조용히 빼면 "다 나왔다" 로 보인다.
         let j = doc_json(
-            r#"{"id":"shape:t","type":"boqtable","x":0,"y":0,"rotation":0,"index":"a2",
+            r#"{"id":"shape:c","type":"comment","x":0,"y":0,"rotation":0,"index":"a2",
                 "parentId":"page:main","props":{}},
                {"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a3",
                 "parentId":"page:main","props":{"pathData":"M0,0L1,0","hatchesJson":"[{}]"}}"#,
@@ -1063,7 +1128,7 @@ mod tests {
         let r = drawing_from_bimove(&j, "").unwrap();
         assert_eq!(r.line_count, 1);
         let all = r.notes.join(" | ");
-        assert!(all.contains("boqtable 1개"), "{all}");
+        assert!(all.contains("comment 1개"), "{all}");
         // 아래는 **이제 그리는 것들**이다. 이 목록은 줄어드는 쪽으로만 바뀐다 —
         // 그래서 "있는 것" 이 아니라 "없어야 하는 것" 으로 적는다.
         assert!(!all.contains("해치"), "{all}");
@@ -1071,6 +1136,7 @@ mod tests {
         assert!(!all.contains("door") && !all.contains("window"), "{all}");
         assert!(!all.contains("dimension"), "{all}");
         assert!(!all.contains("zone"), "{all}");
+        assert!(!all.contains("boqtable"), "{all}");
     }
 
     // ── 벽체 ──
@@ -1320,6 +1386,99 @@ mod tests {
                 _ => None,
             })
             .expect("치수가 없다")
+    }
+
+    // ── 물량표 ──
+
+    fn boq_json(i: u32, x: f64, y: f64, rows: &str, total: f64) -> String {
+        format!(
+            r#"{{"id":"shape:t{i}","type":"boqtable","x":{x},"y":{y},"rotation":0,"index":"t{i}",
+               "parentId":"page:main","props":{{"w":612,"h":96,
+                 "title":"마감재 물량 산출표","rowsJson":"{rows}","totalAreaM2":{total}}}}}"#
+        )
+    }
+
+    /// `rowsJson` 은 **문자열 안의 JSON** 이라 따옴표를 이스케이프해야 한다.
+    fn rows_json(rows: &str) -> String {
+        rows.replace('"', "\\\"")
+    }
+
+    fn only_table(r: &BimoveLoad) -> cadcraft_doc::Table {
+        r.drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("표가 없다")
+    }
+
+    #[test]
+    fn 물량표를_table_로_넣는다() {
+        let rows = rows_json(r#"[{"category":"벽체","item":"석고보드","spec":"9.5T","areaM2":12.5,"qty":7,"unit":"장"}]"#);
+        let j = doc_json(&boq_json(1, 100.0, 50.0, &rows, 12.5));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.boq_count, 1);
+        let t = only_table(&r);
+        // 제목 + 머리 + 본문 1 + 합계
+        assert_eq!(t.row_heights.len(), 4);
+        assert_eq!(t.cells[2][0].text, "벽체");
+        assert_eq!(t.cells[2][1].text, "석고보드");
+        assert_eq!(t.cells[2][3].text, "12.50");
+        assert_eq!(t.cells[2][4].text, "7");
+    }
+
+    #[test]
+    fn 물량표의_좌상단이_그대로_들어간다() {
+        // 표는 넣은 점에서 아래로 자란다. y 만 뒤집는다.
+        let j = doc_json(&boq_json(1, 300.0, 120.0, "[]", 0.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(only_table(&r).insert.xy(), Vec2::new(300.0, -120.0));
+    }
+
+    #[test]
+    fn 줄이_없으면_내용없음_한_줄이다() {
+        let j = doc_json(&boq_json(1, 0.0, 0.0, "[]", 0.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let t = only_table(&r);
+        assert_eq!(t.row_heights.len(), 4);
+        assert!(t.cells[2][0].text.contains("없습니다"), "{:?}", t.cells[2][0].text);
+    }
+
+    #[test]
+    fn 못_읽는_rowsJson_은_빈_표가_된다() {
+        // 깨진 JSON 때문에 도면 전체가 안 열리면 안 된다
+        let j = doc_json(&boq_json(1, 0.0, 0.0, "{{망가짐", 0.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.boq_count, 1);
+        assert!(only_table(&r).cells[2][0].text.contains("없습니다"));
+    }
+
+    #[test]
+    fn 물량표는_공간보다_나중에_들어간다() {
+        // 반투명 회색이 표를 덮으면 숫자가 흐려진다
+        let j = doc_json(&format!(
+            "{},{}",
+            boq_json(1, 0.0, 0.0, "[]", 0.0),
+            zone_json(2, 0.0, 0.0, 300.0, 200.0, "거실", 60.0),
+        ));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let pos = |f: fn(&EntityKind) -> bool| r.drawing.model.iter().position(|e| f(&e.kind));
+        let fill = pos(|k| matches!(k, EntityKind::Hatch(_))).expect("공간 면");
+        let table = pos(|k| matches!(k, EntityKind::Table(_))).expect("표");
+        assert!(fill < table, "공간 {fill} / 표 {table}");
+    }
+
+    #[test]
+    fn 물량표도_레이어를_만든다() {
+        let j = doc_json(
+            r#"{"id":"shape:t1","type":"boqtable","x":0,"y":0,"rotation":0,"index":"t1",
+                "parentId":"page:main","props":{"title":"표","rowsJson":"[]","totalAreaM2":0},
+                "meta":{"dxfLayer":"A-BOQ"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-BOQ"), "레이어가 없다");
     }
 
     // ── 공간 ──

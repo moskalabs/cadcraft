@@ -6,6 +6,12 @@ export class BimoveDoc {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * 읽은 물량표 **도형** 수.
+     *
+     * 하나가 엔티티 하나다 (TABLE). 칸과 괘선은 엔진이 그 안에서 만든다.
+     */
+    boqCount(): number;
+    /**
      * 그릴 거리를 만든다. `layout` 이 "" 면 모형공간.
      */
     buildFrame(layout: string, tolerance: number): BimoveFrame;
@@ -212,6 +218,7 @@ export interface InitOutput {
     readonly __wbg_bimoveframe_free: (a: number, b: number) => void;
     readonly __wbg_bimoveraster_free: (a: number, b: number) => void;
     readonly __wbg_bimovesnap_free: (a: number, b: number) => void;
+    readonly bimovedoc_boqCount: (a: number) => number;
     readonly bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) => number;
     readonly bimovedoc_dimCount: (a: number) => number;
     readonly bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];

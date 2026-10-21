@@ -5,6 +5,7 @@ export const __wbg_bimovedoc_free: (a: number, b: number) => void;
 export const __wbg_bimoveframe_free: (a: number, b: number) => void;
 export const __wbg_bimoveraster_free: (a: number, b: number) => void;
 export const __wbg_bimovesnap_free: (a: number, b: number) => void;
+export const bimovedoc_boqCount: (a: number) => number;
 export const bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) => number;
 export const bimovedoc_dimCount: (a: number) => number;
 export const bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
