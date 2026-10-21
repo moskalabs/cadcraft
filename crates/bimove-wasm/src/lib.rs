@@ -13,6 +13,7 @@ pub mod bimove;
 pub mod dim;
 pub mod opening;
 pub mod wall;
+pub mod zone;
 
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
@@ -114,7 +115,7 @@ impl Doc {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn decimate_report(&self, layout: &str, tol: f64) -> (usize, usize) {
         let space = Self::space_of(layout);
-        let opts = Options { tolerance: tol, ..Options::default() };
+        let opts = render_opts(tol);
         let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
         decimate(&mut dl, tol)
     }
@@ -167,7 +168,7 @@ impl Doc {
             // 동시에 산다 — 60만 선분이면 그만큼이 한 번 더 필요하다.
             self.cache = None;
             let space = Self::space_of(layout);
-            let opts = Options { tolerance: tol, ..Options::default() };
+            let opts = render_opts(tol);
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
             make_readable(&mut dl, bg_rgb);
             // 그릴 때 쓰는 tolerance 와 **같은 값**으로 덜어낸다. 그래야
@@ -527,6 +528,23 @@ struct Counts {
     openings: usize,
     /// 읽은 치수 도형 수.
     dims: usize,
+    /// 읽은 공간 도형 수.
+    zones: usize,
+}
+
+/// 그릴 거리를 만드는 옵션.
+///
+/// **투명도를 켠다.** 엔진은 기본으로 끈 채 그린다 (AutoCAD 의
+/// TRANSPARENCYDISPLAY 를 따르는 자리다). 그러면 `Common::transparency` 가
+/// 통째로 무시되고, Bimove 의 **공간(zone)이 불투명한 회색 덩어리**가 되어
+/// 평면도를 덮는다 — 공간은 벽·가구 위에 비치게 깔리는 것이다
+/// (`zone.rs`, `lib/zoneStyle.ts`).
+///
+/// DXF 로 연 도면에도 같이 걸린다. 그 쪽은 **더 맞는 그림**이 된다:
+/// AutoCAD 도 TRANSPARENCYDISPLAY 기본이 켜짐이라, 투명하게 그려 둔 객체를
+/// 지금까지는 불투명하게 보여주고 있었다.
+fn render_opts(tolerance: f64) -> Options {
+    Options { tolerance, transparency: true, ..Options::default() }
 }
 
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
@@ -557,6 +575,7 @@ impl Doc {
             wall_mlines: load.wall_mline_count,
             openings: load.opening_count,
             dims: load.dim_count,
+            zones: load.zone_count,
         };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
     }
@@ -736,6 +755,14 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = dimCount)]
     pub fn dim_count(&self) -> usize {
         self.0.counts.dims
+    }
+
+    /// 읽은 공간 **도형** 수.
+    ///
+    /// 하나가 엔티티 넷이 된다 (면 + 테두리 + 이름 + 면적).
+    #[wasm_bindgen(js_name = zoneCount)]
+    pub fn zone_count(&self) -> usize {
+        self.0.counts.zones
     }
 
     /// 배치 탭 이름들.
@@ -1087,9 +1114,14 @@ mod tests {
             {"id":"shape:d","type":"door","x":50,"y":60,"rotation":0,"index":"a3",
              "parentId":"page:main","props":{"width":40,"thickness":20,"swing":1,"flipped":false}},
             {"id":"shape:m","type":"dimension","x":0,"y":60,"rotation":0,"index":"a4",
-             "parentId":"page:main","props":{"x2":100,"y2":0,"offset":40}}],
+             "parentId":"page:main","props":{"x2":100,"y2":0,"offset":40}},
+            {"id":"shape:z","type":"zone","x":0,"y":0,"rotation":0,"index":"a5",
+             "parentId":"page:main",
+             "props":{"points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":60},{"x":0,"y":60}],
+                      "label":"거실","areaM2":6,"perimeterM":0,
+                      "wallHeightMm":2400,"color":"#34a853"}}],
           "records":{},"skipped":0,
-          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":4}}"##
+          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":5}}"##
             .to_string()
     }
 
@@ -1158,6 +1190,20 @@ mod tests {
         let mline = at(|k| matches!(k, cadcraft_doc::EntityKind::MLine(_))).expect("벽이 없다");
         let gap = at(|k| matches!(k, cadcraft_doc::EntityKind::Wipeout(_))).expect("가림이 없다");
         assert!(mline < gap, "벽 {mline} / 가림 {gap}");
+    }
+
+    #[test]
+    fn bimove_문서의_공간이_맨_마지막에_들어간다() {
+        // 공간은 반투명이라 밑에 깔린 것이 결과에 들어온다. 먼저 들어가면
+        // 벽이 공간 위에 덮여서 비치는 효과가 사라진다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        assert_eq!(doc.counts.zones, 1);
+        let at = |f: fn(&cadcraft_doc::EntityKind) -> bool| {
+            doc.drawing().model.iter().position(|e| f(&e.kind))
+        };
+        let mline = at(|k| matches!(k, cadcraft_doc::EntityKind::MLine(_))).expect("벽이 없다");
+        let fill = at(|k| matches!(k, cadcraft_doc::EntityKind::Hatch(_))).expect("공간 면이 없다");
+        assert!(mline < fill, "벽 {mline} / 공간 {fill}");
     }
 
     #[test]

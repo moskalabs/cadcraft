@@ -124,6 +124,12 @@ export class BimoveDoc {
      * 캡이 서서 "꺾이는 지점이 겹친" 옛 모양으로 돌아간다.
      */
     wallMlineCount(): number;
+    /**
+     * 읽은 공간 **도형** 수.
+     *
+     * 하나가 엔티티 넷이 된다 (면 + 테두리 + 이름 + 면적).
+     */
+    zoneCount(): number;
 }
 
 export class BimoveFrame {
@@ -227,6 +233,7 @@ export interface InitOutput {
     readonly bimovedoc_textCount: (a: number) => number;
     readonly bimovedoc_wallCount: (a: number) => number;
     readonly bimovedoc_wallMlineCount: (a: number) => number;
+    readonly bimovedoc_zoneCount: (a: number) => number;
     readonly bimoveframe_bounds: (a: number) => [number, number];
     readonly bimoveframe_expanded: (a: number) => number;
     readonly bimoveframe_primCount: (a: number) => number;

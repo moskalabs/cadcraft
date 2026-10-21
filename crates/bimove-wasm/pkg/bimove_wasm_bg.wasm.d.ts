@@ -26,6 +26,7 @@ export const bimovedoc_snap: (a: number, b: number, c: number, d: number, e: num
 export const bimovedoc_textCount: (a: number) => number;
 export const bimovedoc_wallCount: (a: number) => number;
 export const bimovedoc_wallMlineCount: (a: number) => number;
+export const bimovedoc_zoneCount: (a: number) => number;
 export const bimoveframe_bounds: (a: number) => [number, number];
 export const bimoveframe_expanded: (a: number) => number;
 export const bimoveframe_primCount: (a: number) => number;

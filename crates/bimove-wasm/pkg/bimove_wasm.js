@@ -313,6 +313,16 @@ export class BimoveDoc {
         const ret = wasm.bimovedoc_wallMlineCount(this.__wbg_ptr);
         return ret >>> 0;
     }
+    /**
+     * 읽은 공간 **도형** 수.
+     *
+     * 하나가 엔티티 넷이 된다 (면 + 테두리 + 이름 + 면적).
+     * @returns {number}
+     */
+    zoneCount() {
+        const ret = wasm.bimovedoc_zoneCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
 }
 if (Symbol.dispose) BimoveDoc.prototype[Symbol.dispose] = BimoveDoc.prototype.free;
 

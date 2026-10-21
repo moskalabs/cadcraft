@@ -20,8 +20,8 @@
 //!
 //! ── 안 옮기는 것은 **센다** ──
 //!
-//! 남은 Bimove 고유 도형(공간·물량표)은 아직 안 옮긴다. 조용히 빼면
-//! "다 나왔다" 로 보이므로 종류별로 세서 `notes` 에 담는다.
+//! 남은 Bimove 고유 도형(물량표)은 아직 안 옮긴다. 조용히 빼면 "다 나왔다"
+//! 로 보이므로 종류별로 세서 `notes` 에 담는다.
 //!
 //! 벽체는 **옮긴다** (`crate::wall`). 한때 "벽은 CAD 엔티티가 아니라 견적용
 //! 주석이라 overlay 로 그리는 게 맞다" 고 적어 뒀는데, 그건 tldraw 를 남겨
@@ -31,6 +31,9 @@
 //!
 //! 문·창도 **옮긴다** (`crate::opening`). 벽을 가려서 갭을 뚫는 것이라 벽보다
 //! 나중에 넣어야 한다 — 그 차례가 거기서 지켜진다.
+//!
+//! 공간도 **옮긴다** (`crate::zone`). 반투명이라 **맨 마지막**에 넣는다 —
+//! 밑에 뭐가 깔려 있는지가 결과에 들어오기 때문이다.
 //!
 //! 치수도 **옮긴다** (`crate::dim`). 다만 숫자가 걸린다: 캔버스 1px 이 몇 mm
 //! 인지는 tldraw 의 **세션 상태**에 있어서 문서에 안 들어온다. 문서에 `scale`
@@ -47,6 +50,7 @@ use std::collections::BTreeMap;
 use crate::dim::{self, DimScale, DimSeg};
 use crate::opening::{self, Opening, OpeningKind, Swing};
 use crate::wall::WallSeg;
+use crate::zone::{self, Zone};
 
 /// 옮긴 결과.
 pub struct BimoveLoad {
@@ -73,6 +77,8 @@ pub struct BimoveLoad {
     pub opening_count: usize,
     /// 읽은 치수 **도형** 수.
     pub dim_count: usize,
+    /// 읽은 공간 **도형** 수.
+    pub zone_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -560,6 +566,37 @@ fn dim_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<DimSeg> {
     dim::usable(&d).then_some(d)
 }
 
+/// 공간 도형 하나를 읽는다.
+///
+/// `props.points` 는 **첫 점 기준 상대 좌표**다 (`points[0]` 이 원점이고 도형의
+/// `x,y` 가 그 첫 점이다 — `TopBar` 의 공간 도구가 그렇게 만든다). 회전은
+/// 캔버스에서 먹이고 y 뒤집기는 `zone` 안에서 한다.
+///
+/// `None` 이면 못 쓰는 것이다 (점이 셋 미만, NaN).
+fn zone_of(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<Zone> {
+    let raw = props.get("points")?.as_array()?;
+    let (gx, gy) = (f(sh, "x", 0.0), f(sh, "y", 0.0));
+    let rot = f(sh, "rotation", 0.0);
+    let (c, s_) = (rot.cos(), rot.sin());
+    let points: Vec<Vec2> = raw
+        .iter()
+        .map(|p| {
+            let (lx, ly) = (f(p, "x", 0.0), f(p, "y", 0.0));
+            Vec2::new(gx + lx * c - ly * s_, gy + lx * s_ + ly * c)
+        })
+        .collect();
+
+    let z = Zone {
+        points,
+        label: s(props, "label").unwrap_or("").to_string(),
+        area_m2: f(props, "areaM2", 0.0),
+        // 이름 글자 색. 못 읽으면 화면의 첫 번째 공간 색을 쓴다
+        color: s(props, "color").and_then(Rgb::parse_hex).unwrap_or(Rgb(0x1a, 0x73, 0xe8)),
+        layer: layer_of(meta),
+    };
+    zone::usable(&z).then_some(z)
+}
+
 pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, String> {
     let doc: Value =
         serde_json::from_str(json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
@@ -607,6 +644,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     // 치수도 모아 둔다. 스타일을 한 번만 만들려면 다 본 뒤에 넣는 게 낫다.
     let mut dims: Vec<DimSeg> = Vec::new();
     let mut dim_seen = 0usize;
+    // 공간은 반투명이라 **맨 마지막**에 넣는다 (`zone.rs`).
+    let mut zones: Vec<Zone> = Vec::new();
+    let mut zone_seen = 0usize;
 
     for sh in &shapes {
         let parent = s(sh, "parentId").unwrap_or("");
@@ -632,6 +672,15 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(o) = opening_of(sh, &props, meta, kind) {
                 layers.entry(o.layer.clone()).or_insert(());
                 openings.push(o);
+            }
+            continue;
+        }
+
+        if kind == "zone" {
+            zone_seen += 1;
+            if let Some(z) = zone_of(sh, &props, meta) {
+                layers.entry(z.layer.clone()).or_insert(());
+                zones.push(z);
             }
             continue;
         }
@@ -738,6 +787,11 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let dim_dropped = dim_seen - dims.len();
     dim::add_dims(&mut drawing, &dims, &scale);
 
+    // 공간이 **맨 마지막**이다. 반투명이라 밑에 깔린 것이 비쳐 보여야 한다.
+    let zone_count = zone_seen;
+    let zone_dropped = zone_seen - zones.len();
+    zone::add_zones(&mut drawing, &zones);
+
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
     for name in layers.keys() {
         if name != "0" && !drawing.layers.iter().any(|l| &l.name == name) {
@@ -750,6 +804,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut notes = Vec::new();
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
+    }
+    if zone_dropped > 0 {
+        notes.push(format!("공간 {zone_dropped}개를 못 그렸다 (점이 셋 미만)"));
     }
     if dim_dropped > 0 {
         notes.push(format!("치수 {dim_dropped}개를 못 그렸다 (길이가 0)"));
@@ -784,6 +841,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         wall_mline_count,
         opening_count,
         dim_count,
+        zone_count,
     })
 }
 
@@ -997,7 +1055,7 @@ mod tests {
     fn 안_그린_것을_센다() {
         // 조용히 빼면 "다 나왔다" 로 보인다.
         let j = doc_json(
-            r#"{"id":"shape:z","type":"zone","x":0,"y":0,"rotation":0,"index":"a2",
+            r#"{"id":"shape:t","type":"boqtable","x":0,"y":0,"rotation":0,"index":"a2",
                 "parentId":"page:main","props":{}},
                {"id":"shape:g","type":"dxfgroup","x":0,"y":0,"rotation":0,"index":"a3",
                 "parentId":"page:main","props":{"pathData":"M0,0L1,0","hatchesJson":"[{}]"}}"#,
@@ -1005,14 +1063,14 @@ mod tests {
         let r = drawing_from_bimove(&j, "").unwrap();
         assert_eq!(r.line_count, 1);
         let all = r.notes.join(" | ");
-        assert!(all.contains("zone 1개"), "{all}");
-        // 해치는 이제 **그린다** — 못 그리는 것 목록에 있으면 안 된다
+        assert!(all.contains("boqtable 1개"), "{all}");
+        // 아래는 **이제 그리는 것들**이다. 이 목록은 줄어드는 쪽으로만 바뀐다 —
+        // 그래서 "있는 것" 이 아니라 "없어야 하는 것" 으로 적는다.
         assert!(!all.contains("해치"), "{all}");
-        // 벽체도 이제 그린다. 전엔 여기 "wall 1개" 가 있었다.
         assert!(!all.contains("wall"), "{all}");
-        // 문·창도 그린다. 이 목록은 줄어들기만 한다.
         assert!(!all.contains("door") && !all.contains("window"), "{all}");
         assert!(!all.contains("dimension"), "{all}");
+        assert!(!all.contains("zone"), "{all}");
     }
 
     // ── 벽체 ──
@@ -1262,6 +1320,109 @@ mod tests {
                 _ => None,
             })
             .expect("치수가 없다")
+    }
+
+    // ── 공간 ──
+
+    /// 공간 하나. `points` 는 **첫 점 기준 상대 좌표**다.
+    fn zone_json(i: u32, x: f64, y: f64, w: f64, h: f64, label: &str, area: f64) -> String {
+        format!(
+            r##"{{"id":"shape:z{i}","type":"zone","x":{x},"y":{y},"rotation":0,"index":"z{i}",
+               "parentId":"page:main","props":{{
+                 "points":[{{"x":0,"y":0}},{{"x":{w},"y":0}},{{"x":{w},"y":{h}}},{{"x":0,"y":{h}}}],
+                 "label":"{label}","areaM2":{area},"perimeterM":0,
+                 "wallHeightMm":2400,"color":"#34a853"}}}}"##
+        )
+    }
+
+    #[test]
+    fn 공간을_면_테두리_글자로_넣는다() {
+        let j = doc_json(&zone_json(1, 0.0, 0.0, 100.0, 80.0, "거실", 8.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.zone_count, 1);
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Hatch(_))), 1);
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::LwPolyline(_))), 1);
+        // 이름 + 면적
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::MText(_))), 2);
+    }
+
+    #[test]
+    fn 공간의_points_는_상대_좌표다() {
+        // 절대로 읽으면 공간이 원점 쪽으로 찌그러진다
+        let j = doc_json(&zone_json(1, 300.0, 200.0, 100.0, 80.0, "거실", 8.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let xs: Vec<f64> = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Hatch(h) => Some(h.loops[0].vertices.iter().map(|v| v.p.x).collect()),
+                _ => None,
+            })
+            .expect("면이 없다");
+        assert_eq!(xs.iter().cloned().fold(f64::MAX, f64::min), 300.0);
+        assert_eq!(xs.iter().cloned().fold(f64::MIN, f64::max), 400.0);
+    }
+
+    #[test]
+    fn 공간은_벽과_문창보다_나중에_들어간다() {
+        // 반투명이라 밑에 깔린 것이 결과에 들어온다. 먼저 들어가면 벽이
+        // 공간 위에 덮여서 비치는 효과가 사라진다.
+        let j = doc_json(&format!(
+            "{},{},{}",
+            zone_json(1, 0.0, 0.0, 300.0, 200.0, "거실", 60.0),
+            wall_json(2, 0.0, 0.0, 300.0, 0.0, 20.0),
+            door_json(3, 150.0, 0.0, 80.0, 20.0),
+        ));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let pos = |f: fn(&EntityKind) -> bool| r.drawing.model.iter().position(|e| f(&e.kind));
+        let mline = pos(|k| matches!(k, EntityKind::MLine(_))).expect("벽");
+        let gap = pos(|k| matches!(k, EntityKind::Wipeout(_))).expect("가림");
+        let fill = pos(|k| matches!(k, EntityKind::Hatch(_))).expect("공간 면");
+        assert!(mline < fill && gap < fill, "벽 {mline} / 가림 {gap} / 공간 {fill}");
+    }
+
+    #[test]
+    fn 공간의_y_도_뒤집힌다() {
+        let j = doc_json(&zone_json(1, 0.0, 60.0, 100.0, 80.0, "거실", 8.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let ys: Vec<f64> = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Hatch(h) => Some(h.loops[0].vertices.iter().map(|v| v.p.y).collect()),
+                _ => None,
+            })
+            .expect("면이 없다");
+        assert!(ys.iter().all(|y| *y < 0.0), "{ys:?} — y 가 안 뒤집혔다");
+    }
+
+    #[test]
+    fn 못_쓰는_공간은_세서_알린다() {
+        // 점이 둘뿐이면 면이 안 된다
+        let j = doc_json(
+            r##"{"id":"shape:z1","type":"zone","x":0,"y":0,"rotation":0,"index":"z1",
+                "parentId":"page:main","props":{"points":[{"x":0,"y":0},{"x":10,"y":0}],
+                "label":"","areaM2":0,"color":"#34a853"}}"##,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.zone_count, 1);
+        assert!(r.notes.iter().any(|n| n.contains("공간 1개")), "{:?}", r.notes);
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Hatch(_))), 0);
+    }
+
+    #[test]
+    fn 공간도_레이어를_만든다() {
+        let j = doc_json(
+            r##"{"id":"shape:z1","type":"zone","x":0,"y":0,"rotation":0,"index":"z1",
+                "parentId":"page:main",
+                "props":{"points":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10}],
+                "label":"거실","areaM2":1,"color":"#34a853"},
+                "meta":{"dxfLayer":"A-ZONE"}}"##,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE"), "레이어가 없다");
     }
 
     #[test]
