@@ -10,6 +10,7 @@
 //! 수만 개 선분이라 이게 전부다.
 
 pub mod bimove;
+pub mod dim;
 pub mod opening;
 pub mod wall;
 
@@ -524,6 +525,8 @@ struct Counts {
     wall_mlines: usize,
     /// 읽은 문·창 도형 수.
     openings: usize,
+    /// 읽은 치수 도형 수.
+    dims: usize,
 }
 
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
@@ -553,6 +556,7 @@ impl Doc {
             walls: load.wall_count,
             wall_mlines: load.wall_mline_count,
             openings: load.opening_count,
+            dims: load.dim_count,
         };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
     }
@@ -723,6 +727,15 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = openingCount)]
     pub fn opening_count(&self) -> usize {
         self.0.counts.openings
+    }
+
+    /// 읽은 치수 **도형** 수.
+    ///
+    /// 숫자가 맞는지는 이것만 봐서는 모른다 — 축척을 문서에서 못 찾으면
+    /// `notes` 에 그 얘기가 올라오므로 **둘을 같이** 봐야 한다.
+    #[wasm_bindgen(js_name = dimCount)]
+    pub fn dim_count(&self) -> usize {
+        self.0.counts.dims
     }
 
     /// 배치 탭 이름들.
@@ -1072,9 +1085,11 @@ mod tests {
             {"id":"shape:w","type":"wall","x":0,"y":60,"rotation":0,"index":"a2",
              "parentId":"page:main","props":{"x2":100,"y2":0,"thickness":20}},
             {"id":"shape:d","type":"door","x":50,"y":60,"rotation":0,"index":"a3",
-             "parentId":"page:main","props":{"width":40,"thickness":20,"swing":1,"flipped":false}}],
+             "parentId":"page:main","props":{"width":40,"thickness":20,"swing":1,"flipped":false}},
+            {"id":"shape:m","type":"dimension","x":0,"y":60,"rotation":0,"index":"a4",
+             "parentId":"page:main","props":{"x2":100,"y2":0,"offset":40}}],
           "records":{},"skipped":0,
-          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":3}}"##
+          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":4}}"##
             .to_string()
     }
 
@@ -1111,6 +1126,7 @@ mod tests {
         assert!(!notes.contains("해치"), "해치는 그린다: {notes}");
         assert!(!notes.contains("wall"), "벽체는 그린다: {notes}");
         assert!(!notes.contains("못 그렸다"), "성한 도형을 빼먹었다: {notes}");
+        assert!(!notes.contains("dimension"), "치수는 그린다: {notes}");
         assert_eq!(doc.pages, vec![("page:main".to_string(), "모형".to_string())]);
     }
 
@@ -1142,6 +1158,26 @@ mod tests {
         let mline = at(|k| matches!(k, cadcraft_doc::EntityKind::MLine(_))).expect("벽이 없다");
         let gap = at(|k| matches!(k, cadcraft_doc::EntityKind::Wipeout(_))).expect("가림이 없다");
         assert!(mline < gap, "벽 {mline} / 가림 {gap}");
+    }
+
+    #[test]
+    fn bimove_문서의_치수가_dimension_으로_들어간다() {
+        // 선과 글자를 따로 넣으면 그 순간 숫자가 굳는다. DIMENSION 이면
+        // 두 점만 들고 있고 길이는 렌더 때 다시 잰다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        assert_eq!(doc.counts.dims, 1);
+        let d = doc
+            .drawing()
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                cadcraft_doc::EntityKind::Dimension(d) => Some(d.clone()),
+                _ => None,
+            })
+            .expect("치수가 없다");
+        assert!(d.text.is_empty(), "글자를 박아 뒀다: {:?}", d.text);
+        // 축척이 문서에 없으므로 그 얘기가 올라와 있어야 한다
+        assert!(doc.notes.iter().any(|n| n.contains("축척")), "{:?}", doc.notes);
     }
 
     #[test]

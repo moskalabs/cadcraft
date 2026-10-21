@@ -20,7 +20,7 @@
 //!
 //! ── 안 옮기는 것은 **센다** ──
 //!
-//! 남은 Bimove 고유 도형(치수·공간·물량표)은 아직 안 옮긴다. 조용히 빼면
+//! 남은 Bimove 고유 도형(공간·물량표)은 아직 안 옮긴다. 조용히 빼면
 //! "다 나왔다" 로 보이므로 종류별로 세서 `notes` 에 담는다.
 //!
 //! 벽체는 **옮긴다** (`crate::wall`). 한때 "벽은 CAD 엔티티가 아니라 견적용
@@ -31,6 +31,11 @@
 //!
 //! 문·창도 **옮긴다** (`crate::opening`). 벽을 가려서 갭을 뚫는 것이라 벽보다
 //! 나중에 넣어야 한다 — 그 차례가 거기서 지켜진다.
+//!
+//! 치수도 **옮긴다** (`crate::dim`). 다만 숫자가 걸린다: 캔버스 1px 이 몇 mm
+//! 인지는 tldraw 의 **세션 상태**에 있어서 문서에 안 들어온다. 문서에 `scale`
+//! 이 있으면 쓰고, 없으면 `1px = 1mm` 로 두고 **`notes` 로 알린다** — 조용히
+//! 1 로 두면 2000mm 짜리에 "200mm" 가 찍히고 아무도 모른다.
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::library::PatternLine;
@@ -39,6 +44,7 @@ use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use crate::dim::{self, DimScale, DimSeg};
 use crate::opening::{self, Opening, OpeningKind, Swing};
 use crate::wall::WallSeg;
 
@@ -65,6 +71,8 @@ pub struct BimoveLoad {
     /// 읽은 문·창 **도형** 수. 하나가 엔티티 여럿(가림 + 잼브 + 문짝 + 호)이
     /// 되므로 엔티티 수와는 다르다.
     pub opening_count: usize,
+    /// 읽은 치수 **도형** 수.
+    pub dim_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -530,6 +538,28 @@ fn opening_of(sh: &Value, props: &Value, meta: Option<&Value>, kind: &str) -> Op
     opening::usable(&o).then_some(o)
 }
 
+/// 치수 도형 하나를 읽는다.
+///
+/// `x,y` 가 재는 첫 점이고 `props.x2,y2` 는 **거기서의 상대 좌표**다 (벽과 같은
+/// 꼴). `props.offset` 은 치수선을 어느 쪽으로 얼마나 띄울지다.
+///
+/// 회전을 먹이지 않는다. 치수 도형에는 `rotation` 이 쓰이지 않고
+/// (`DimensionShape` 는 `canResize`/회전을 다 끄고 `x2`/`y2` 로만 방향을
+/// 잡는다), 여기서 괜히 돌리면 화면과 달라진다.
+///
+/// `None` 이면 못 쓰는 것이다 (길이 0, NaN). 따로 세서 `notes` 에 담는다.
+fn dim_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<DimSeg> {
+    let (gx, gy) = (f(sh, "x", 0.0), f(sh, "y", 0.0));
+    let (x2, y2) = (f(props, "x2", 0.0), f(props, "y2", 0.0));
+    let d = DimSeg {
+        a: Vec2::new(gx, gy),
+        b: Vec2::new(gx + x2, gy + y2),
+        offset: f(props, "offset", 0.0),
+        layer: layer_of(meta),
+    };
+    dim::usable(&d).then_some(d)
+}
+
 pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, String> {
     let doc: Value =
         serde_json::from_str(json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
@@ -574,6 +604,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     // 문·창도 모아 둔다 — 벽을 다 넣은 **뒤에** 넣어야 벽을 가린다 (`opening.rs`).
     let mut openings: Vec<Opening> = Vec::new();
     let mut opening_seen = 0usize;
+    // 치수도 모아 둔다. 스타일을 한 번만 만들려면 다 본 뒤에 넣는 게 낫다.
+    let mut dims: Vec<DimSeg> = Vec::new();
+    let mut dim_seen = 0usize;
 
     for sh in &shapes {
         let parent = s(sh, "parentId").unwrap_or("");
@@ -599,6 +632,15 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(o) = opening_of(sh, &props, meta, kind) {
                 layers.entry(o.layer.clone()).or_insert(());
                 openings.push(o);
+            }
+            continue;
+        }
+
+        if kind == "dimension" {
+            dim_seen += 1;
+            if let Some(d) = dim_seg(sh, &props, meta) {
+                layers.entry(d.layer.clone()).or_insert(());
+                dims.push(d);
             }
             continue;
         }
@@ -689,6 +731,13 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let opening_dropped = opening_seen - openings.len();
     opening::add_openings(&mut drawing, &openings);
 
+    // 치수는 스케일을 받아야 숫자가 맞는다. 문서에 없으면 1px = 1mm 로 둔다.
+    let doc_scale = DimScale::from_json(doc.get("scale"));
+    let scale = doc_scale.unwrap_or_default();
+    let dim_count = dim_seen;
+    let dim_dropped = dim_seen - dims.len();
+    dim::add_dims(&mut drawing, &dims, &scale);
+
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
     for name in layers.keys() {
         if name != "0" && !drawing.layers.iter().any(|l| &l.name == name) {
@@ -701,6 +750,16 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut notes = Vec::new();
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
+    }
+    if dim_dropped > 0 {
+        notes.push(format!("치수 {dim_dropped}개를 못 그렸다 (길이가 0)"));
+    }
+    // 스케일을 못 받았으면 **치수 숫자가 px 단위다.** 조용히 넘기면 아무도 모른다.
+    if doc_scale.is_none() && !dims.is_empty() {
+        notes.push(
+            "치수 축척을 문서에서 못 찾아 1px = 1mm 로 뒀다 (숫자가 실제 길이와 다를 수 있다)"
+                .to_string(),
+        );
     }
     if opening_dropped > 0 {
         notes.push(format!("문·창 {opening_dropped}개를 못 그렸다 (폭이나 두께가 0)"));
@@ -724,6 +783,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         wall_count,
         wall_mline_count,
         opening_count,
+        dim_count,
     })
 }
 
@@ -952,6 +1012,7 @@ mod tests {
         assert!(!all.contains("wall"), "{all}");
         // 문·창도 그린다. 이 목록은 줄어들기만 한다.
         assert!(!all.contains("door") && !all.contains("window"), "{all}");
+        assert!(!all.contains("dimension"), "{all}");
     }
 
     // ── 벽체 ──
@@ -1180,6 +1241,105 @@ mod tests {
         );
         let r = drawing_from_bimove(&j, "").unwrap();
         assert!(r.drawing.layers.iter().any(|l| l.name == "A-DOOR"), "레이어가 없다");
+    }
+
+    // ── 치수 ──
+
+    /// 치수 하나. `x2`/`y2` 는 **제 첫 점 기준** 상대 좌표다.
+    fn dim_json(i: u32, x: f64, y: f64, x2: f64, y2: f64, offset: f64) -> String {
+        format!(
+            r#"{{"id":"shape:m{i}","type":"dimension","x":{x},"y":{y},"rotation":0,"index":"d{i}",
+               "parentId":"page:main","props":{{"x2":{x2},"y2":{y2},"offset":{offset}}}}}"#
+        )
+    }
+
+    fn only_dim(r: &BimoveLoad) -> cadcraft_doc::Dimension {
+        r.drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Dimension(d) => Some(d.clone()),
+                _ => None,
+            })
+            .expect("치수가 없다")
+    }
+
+    #[test]
+    fn 치수를_dimension_으로_넣는다() {
+        let j = doc_json(&dim_json(1, 0.0, 0.0, 200.0, 0.0, 60.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.dim_count, 1);
+        let d = only_dim(&r);
+        assert_eq!(d.kind, cadcraft_doc::DimKind::Aligned);
+        // 재는 두 점. y 가 뒤집힌다
+        assert_eq!(d.p13.xy(), Vec2::new(0.0, 0.0));
+        assert_eq!(d.p14.xy(), Vec2::new(200.0, 0.0));
+    }
+
+    #[test]
+    fn 치수의_x2_는_상대_좌표다() {
+        // 절대 좌표로 읽으면 치수가 원점까지 늘어난다
+        let j = doc_json(&dim_json(1, 100.0, 50.0, 200.0, 0.0, 60.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let d = only_dim(&r);
+        assert_eq!(d.p13.xy(), Vec2::new(100.0, -50.0));
+        assert_eq!(d.p14.xy(), Vec2::new(300.0, -50.0));
+    }
+
+    #[test]
+    fn 스케일이_없으면_알린다() {
+        // 조용히 1px = 1mm 로 두면 2000mm 짜리에 "200mm" 가 찍힌다
+        let j = doc_json(&dim_json(1, 0.0, 0.0, 200.0, 0.0, 60.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.notes.iter().any(|n| n.contains("축척")), "{:?}", r.notes);
+        assert_eq!(r.drawing.dim_style(dim::STYLE).expect("스타일").linear_factor, 1.0);
+    }
+
+    #[test]
+    fn 치수가_없으면_축척_얘기도_안_한다() {
+        // 쓸 데가 없는 경고를 띄우면 다음 경고를 안 읽게 된다
+        let j = doc_json(&wall_json(1, 0.0, 0.0, 100.0, 0.0, 20.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(!r.notes.iter().any(|n| n.contains("축척")), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn 문서의_scale_로_숫자를_맞춘다() {
+        // 1:10 (1px = 10mm) → 200px 이 2000mm 로 찍혀야 한다
+        let j = format!(
+            r#"{{"version":1,
+             "pages":[{{"id":"page:main","name":"모형","index":"a1"}}],
+             "scale":{{"pxPerMm":0.1,"unit":"mm"}},
+             "shapes":[{}],
+             "records":{{}},"skipped":0}}"#,
+            dim_json(1, 0.0, 0.0, 200.0, 0.0, 60.0),
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let st = r.drawing.dim_style(dim::STYLE).expect("스타일이 없다");
+        assert_eq!(st.linear_factor, 10.0);
+        assert_eq!(st.post, "<>mm");
+        // 스케일을 받았으면 경고도 없다
+        assert!(!r.notes.iter().any(|n| n.contains("축척")), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn 못_쓰는_치수는_세서_알린다() {
+        let j = doc_json(&dim_json(1, 0.0, 0.0, 0.0, 0.0, 60.0));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.dim_count, 1);
+        assert!(r.notes.iter().any(|n| n.contains("치수 1개")), "{:?}", r.notes);
+        assert!(!r.drawing.model.iter().any(|e| matches!(e.kind, EntityKind::Dimension(_))));
+    }
+
+    #[test]
+    fn 치수도_레이어를_만든다() {
+        let j = doc_json(
+            r#"{"id":"shape:m1","type":"dimension","x":0,"y":0,"rotation":0,"index":"d1",
+                "parentId":"page:main","props":{"x2":200,"y2":0,"offset":60},
+                "meta":{"dxfLayer":"A-DIM"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-DIM"), "레이어가 없다");
     }
 
     #[test]

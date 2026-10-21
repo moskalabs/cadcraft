@@ -10,6 +10,13 @@ export class BimoveDoc {
      */
     buildFrame(layout: string, tolerance: number): BimoveFrame;
     /**
+     * 읽은 치수 **도형** 수.
+     *
+     * 숫자가 맞는지는 이것만 봐서는 모른다 — 축척을 문서에서 못 찾으면
+     * `notes` 에 그 얘기가 올라오므로 **둘을 같이** 봐야 한다.
+     */
+    dimCount(): number;
+    /**
      * 엔진 명령을 실행한다. 결과 JSON 을 돌려주고, 실패하면 throw 한다.
      *
      * 명령을 하나씩 바인딩하지 않고 **문 하나**로 연다 — 엔진에 명령이 수백 개라
@@ -200,6 +207,7 @@ export interface InitOutput {
     readonly __wbg_bimoveraster_free: (a: number, b: number) => void;
     readonly __wbg_bimovesnap_free: (a: number, b: number) => void;
     readonly bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) => number;
+    readonly bimovedoc_dimCount: (a: number) => number;
     readonly bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly bimovedoc_hatchCount: (a: number) => number;

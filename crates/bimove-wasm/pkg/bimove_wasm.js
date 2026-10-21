@@ -30,6 +30,17 @@ export class BimoveDoc {
         return BimoveFrame.__wrap(ret);
     }
     /**
+     * 읽은 치수 **도형** 수.
+     *
+     * 숫자가 맞는지는 이것만 봐서는 모른다 — 축척을 문서에서 못 찾으면
+     * `notes` 에 그 얘기가 올라오므로 **둘을 같이** 봐야 한다.
+     * @returns {number}
+     */
+    dimCount() {
+        const ret = wasm.bimovedoc_dimCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * 엔진 명령을 실행한다. 결과 JSON 을 돌려주고, 실패하면 throw 한다.
      *
      * 명령을 하나씩 바인딩하지 않고 **문 하나**로 연다 — 엔진에 명령이 수백 개라
