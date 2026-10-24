@@ -443,7 +443,11 @@ impl Doc {
             cadcraft_geom::Vec2 { x, y },
             aperture,
         )?;
-        Some(format!("{h:?}"))
+        // **`{h:?}` 를 쓰면 안 된다.** 그건 "Handle(257)" 로 나오는데, 명령이
+        // 받고 돌려주는 건 16진 문자열 "101" 이다. 그대로 내보내면 JS 에서
+        // 고른 것을 `exec` 에 다시 넣는 길이 끊긴다 — 누르면 선택은 되는데
+        // 옮기기·지우기가 "그런 handle 없다" 로 조용히 실패한다.
+        Some(h.hex())
     }
 
     /// 사각형으로 고른다. `crossing` 이면 걸치기만 해도, 아니면 완전히 들어와야.
@@ -640,6 +644,15 @@ impl Doc {
     /// 되돌리기 스냅샷은 엔진이 알아서 쌓는다 (`execute` 안에서 push_undo).
     /// 그래서 우리가 실행취소를 따로 만들 필요가 없다 — `u` / `redo` 명령이
     /// 같은 길로 들어온다.
+    /// 지금 도면을 DXF 글로 쓴다.
+    ///
+    /// 엔진이 문서를 들기로 한 이상 **저장도 엔진에서 나와야 한다.** 이게
+    /// 없으면 고친 것이 창을 닫는 순간 사라진다 — 그리기·되돌리기가 다 돌아도
+    /// 쓸 수가 없다.
+    fn to_dxf(&self) -> String {
+        cadcraft_io::write_dxf(self.drawing())
+    }
+
     fn exec(&mut self, id: &str, params_json: &str) -> Result<String, String> {
         let params: serde_json::Value = if params_json.trim().is_empty() {
             serde_json::json!({})
@@ -843,6 +856,12 @@ impl BimoveDoc {
     /// 도면 판번호. 편집할 때마다 올라간다 — UI 가 "다시 그려야 하나" 를 이걸로 안다.
     pub fn revision(&self) -> f64 {
         self.0.revision() as f64
+    }
+
+    /// 지금 도면을 DXF 글로. 저장할 때 이걸 올린다.
+    #[wasm_bindgen(js_name = toDxf)]
+    pub fn to_dxf(&self) -> String {
+        self.0.to_dxf()
     }
 
     /// 한 점을 찍어 엔티티를 고른다. `aperture` 는 **도면 단위** (픽셀 ÷ 줌).
@@ -1692,5 +1711,135 @@ mod tests {
     fn 깨진_입력은_에러로_돌려준다() {
         // 조용히 빈 도면을 주면 "열렸는데 아무것도 없네" 가 되어 원인을 못 찾는다.
         assert!(Doc::open(b"this is not a dxf at all").is_err());
+    }
+
+    // ───────────────────────── 문서를 엔진이 들 수 있나 ─────────────────────────
+    //
+    // Bimove 에서 tldraw 를 걷어내면서 "문서를 누가 들고 있나" 를 정했다 —
+    // **엔진이 든다.** UI 는 `exec` 로 명령을 보내고 결과를 읽기만 한다.
+    //
+    // 그 전제가 맞는지 여기서 못 박는다. 그리기·레이어·고르기·읽어오기·
+    // 옮기기·되돌리기가 전부 `exec` 하나로 되어야 TS 쪽에 저장소를 따로
+    // 만들 필요가 없다. 하나라도 안 되면 그만큼 JS 로 되돌아와야 한다.
+
+    /// `exec` 결과 JSON.
+    fn run(doc: &mut Doc, id: &str, params: &str) -> serde_json::Value {
+        let out = doc.exec(id, params).unwrap_or_else(|e| panic!("{id} 가 실패했다: {e}"));
+        serde_json::from_str(&out).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// 방금 그린 것의 handle. 명령마다 담는 칸이 달라서 흔한 자리를 훑는다.
+    fn handle_of(v: &serde_json::Value) -> String {
+        for key in ["handle", "handles", "added", "created"] {
+            match &v[key] {
+                serde_json::Value::String(s) => return s.clone(),
+                serde_json::Value::Array(a) => {
+                    if let Some(serde_json::Value::String(s)) = a.first() {
+                        return s.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("handle 을 못 찾았다: {v}")
+    }
+
+    #[test]
+    fn 벽을_그리고_레이어에_넣고_골라_읽는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+
+        // ① 레이어 — Bimove 의 '도면층' 패널이 하는 일
+        run(&mut doc, "layer.new", r#"{"name":"WALL","color":1,"current":true}"#);
+        let layers = run(&mut doc, "layer", "{}");
+        let names = layers.to_string();
+        assert!(names.contains("WALL"), "만든 레이어가 목록에 없다: {names}");
+
+        // ② 벽 하나 — 두께 있는 폴리라인
+        let drawn = run(
+            &mut doc,
+            "pline",
+            r#"{"vertices":[[0,0],[5000,0],[5000,3000]],"width":200}"#,
+        );
+        let wall = handle_of(&drawn);
+
+        // ③ 고르기 — 캔버스를 눌렀을 때
+        let picked = doc.pick("", 2500.0, 0.0, 50.0);
+        assert_eq!(picked.as_deref(), Some(wall.as_str()), "누른 자리에서 그 벽이 안 잡힌다");
+
+        // ④ 읽어오기 — 속성 패널·물량표가 보는 쪽.
+        //
+        // `list` 가 아니라 `properties` 를 쓴다. `list` 는 사람이 읽는 글
+        // 덩어리를 돌려줘서 (AutoCAD LIST 그대로) 패널을 못 몬다.
+        let props = run(&mut doc, "properties", &format!(r#"{{"handles":["{wall}"]}}"#));
+        eprintln!("properties → {props}");
+        assert!(props.is_object() || props.is_array(), "속성이 구조가 아니다: {props}");
+        let text = props.to_string();
+        assert!(text.contains("WALL"), "읽어온 것에 레이어가 없다: {text}");
+
+        // ⑤ 옮기기 + 되돌리기 — 둘 다 그냥 명령이다
+        let before = doc.revision();
+        run(&mut doc, "move", &format!(r#"{{"handles":["{wall}"],"delta":[100,0]}}"#));
+        assert!(doc.revision() > before, "옮겼는데 판번호가 안 올랐다");
+
+        // 옮긴 뒤에는 원래 자리에서 안 잡혀야 한다
+        assert_ne!(
+            doc.pick("", 0.0, 0.0, 10.0).as_deref(),
+            Some(wall.as_str()),
+            "옮겼는데 옛 자리에 그대로 있다"
+        );
+
+        run(&mut doc, "u", "{}");
+        assert_eq!(
+            doc.pick("", 2500.0, 0.0, 50.0).as_deref(),
+            Some(wall.as_str()),
+            "되돌렸는데 제자리로 안 왔다"
+        );
+    }
+
+    #[test]
+    fn 고친_도면을_다시_읽을_수_있다() {
+        // 저장 → 열기 가 안 되면 그린 게 창을 닫는 순간 사라진다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "layer.new", r#"{"name":"WALL","current":true}"#);
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[5000,0]],"width":200}"#);
+
+        let dxf = doc.to_dxf();
+        let again = Doc::open(dxf.as_bytes()).expect("쓴 DXF 를 다시 못 읽었다");
+
+        // 벽이 그 자리에 그대로 있나
+        let h = again.pick("", 2500.0, 0.0, 50.0).expect("다시 읽은 도면에 벽이 없다");
+        let mut again = again;
+        let props = run(&mut again, "properties", &format!(r#"{{"handles":["{h}"]}}"#));
+        assert_eq!(props["objects"][0]["layer"], "WALL", "레이어가 안 살아남았다: {props}");
+    }
+
+    #[test]
+    fn 지우고_되돌리면_살아난다() {
+        // 되돌리기를 우리가 안 만들어도 되는지가 A 의 핵심이다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "circle", r#"{"center":[0,0],"radius":500}"#));
+
+        run(&mut doc, "erase", &format!(r#"{{"handles":["{h}"]}}"#));
+        assert_eq!(doc.pick("", 500.0, 0.0, 20.0), None, "지웠는데 아직 잡힌다");
+
+        run(&mut doc, "u", "{}");
+        assert_eq!(doc.pick("", 500.0, 0.0, 20.0).as_deref(), Some(h.as_str()), "되돌렸는데 안 살아났다");
+
+        run(&mut doc, "redo", "{}");
+        assert_eq!(doc.pick("", 500.0, 0.0, 20.0), None, "다시 실행했는데 안 지워졌다");
+    }
+
+    #[test]
+    fn 여러_번_고쳐도_한_단계씩_돌아간다() {
+        // tldraw 의 `run()` 묶음에 기대던 걸 엔진이 대신 해주는지.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "circle", r#"{"center":[0,0],"radius":100}"#));
+        for _ in 0..3 {
+            run(&mut doc, "move", &format!(r#"{{"handles":["{h}"],"delta":[1000,0]}}"#));
+        }
+        // 3000 만큼 갔으니 거기서 잡힌다
+        assert_eq!(doc.pick("", 3100.0, 0.0, 20.0).as_deref(), Some(h.as_str()));
+        run(&mut doc, "u", "{}");
+        assert_eq!(doc.pick("", 2100.0, 0.0, 20.0).as_deref(), Some(h.as_str()), "한 단계만 돌아와야 한다");
     }
 }
