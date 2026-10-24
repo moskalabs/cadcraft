@@ -117,7 +117,7 @@ impl Doc {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn decimate_report(&self, layout: &str, tol: f64) -> (usize, usize) {
         let space = Self::space_of(layout);
-        let opts = render_opts(tol);
+        let opts = render_opts(tol, 0.0);
         let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
         decimate(&mut dl, tol)
     }
@@ -170,7 +170,12 @@ impl Doc {
             // 동시에 산다 — 60만 선분이면 그만큼이 한 번 더 필요하다.
             self.cache = None;
             let space = Self::space_of(layout);
-            let opts = render_opts(tol);
+            // 점 크기는 **화면 높이**를 따라간다 (render_opts 주석).
+            // `tol` 과 똑같이 1/scale 에 비례하므로, 위 캐시가 tol 을 봐주는
+            // 범위(2배) 안에서 같이 움직인다 — 따로 키를 늘릴 필요가 없다.
+            // 캔버스 높이가 2배 넘게 바뀌면 그만큼 어긋난 채로 한 번 더
+            // 그려지는데, 다음 줌에서 맞춰진다.
+            let opts = render_opts(tol, f64::from(h) / scale.max(1e-12));
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
             make_readable(&mut dl, bg_rgb);
             // 그릴 때 쓰는 tolerance 와 **같은 값**으로 덜어낸다. 그래야
@@ -563,8 +568,17 @@ struct Counts {
 /// DXF 로 연 도면에도 같이 걸린다. 그 쪽은 **더 맞는 그림**이 된다:
 /// AutoCAD 도 TRANSPARENCYDISPLAY 기본이 켜짐이라, 투명하게 그려 둔 객체를
 /// 지금까지는 불투명하게 보여주고 있었다.
-fn render_opts(tolerance: f64) -> Options {
-    Options { tolerance, transparency: true, ..Options::default() }
+/// `view_height` 는 **지금 화면에 들어오는 도면 높이**다 (세계 단위).
+///
+/// 이걸 안 주면 엔진이 "도면 전체 높이" 로 되돌아간다 — 그러면 PDSIZE 가 0 인
+/// POINT(치수의 DEFPOINTS 가 보통 그렇다)가 **도면 높이의 5%** 로 구워진다.
+/// 10만짜리 도면이면 X 하나가 5천 단위, 방만 하다. 줌을 해도 안 줄어든다 —
+/// 세계 좌표로 구워졌기 때문이다.
+///
+/// AutoCAD 는 PDSIZE 가 0 이면 **화면** 높이의 5% 로 그리고 화면을 다시 그릴
+/// 때마다 고쳐 잡는다. 화면 높이를 넘겨 주면 그와 같아진다 (늘 캔버스의 5%).
+fn render_opts(tolerance: f64, view_height: f64) -> Options {
+    Options { tolerance, transparency: true, view_height, ..Options::default() }
 }
 
 /// tolerance 가 이 배수 안쪽이면 다시 만들지 않는다.
@@ -1124,6 +1138,76 @@ mod tests {
         let r = doc.raster("", 50.0, -25.0, 1.5, 200, 100, 0xFFFFFF, false).unwrap();
         let ink = r.rgba.chunks_exact(4).filter(|p| !(p[0] == 255 && p[1] == 255 && p[2] == 255)).count();
         assert!(ink > 20, "덜어내고 나니 {ink} 픽셀뿐 — 도면이 사라졌다");
+    }
+
+
+    // ── 점 크기는 화면을 따라간다 ──
+
+    /// 선 둘로 크기를 정한 도면 + 가운데 POINT 하나짜리 ASCII DXF.
+    ///
+    /// `$PDSIZE` 가 0 이라 점은 **상대 크기**로 그려진다 — 무엇에 상대인지가
+    /// 이 테스트가 보는 것이다.
+    fn dxf_with_point(span: f64) -> Vec<u8> {
+        let mut v: Vec<String> = Vec::new();
+        let mut g = |code: &str, val: String| { v.push(code.into()); v.push(val) };
+        g("0", "SECTION".into()); g("2", "HEADER".into());
+        g("9", "$PDMODE".into()); g("70", "3".into());   // X 자
+        g("9", "$PDSIZE".into()); g("40", "0".into());   // 상대 크기
+        g("0", "ENDSEC".into());
+        g("0", "SECTION".into()); g("2", "ENTITIES".into());
+        g("0", "LINE".into()); g("8", "0".into());
+        g("10", "0".into()); g("20", "0".into());
+        g("11", format!("{span}")); g("21", "0".into());
+        g("0", "LINE".into()); g("8", "0".into());
+        g("10", "0".into()); g("20", "0".into());
+        g("11", "0".into()); g("21", format!("{}", span / 5.0));
+        g("0", "POINT".into()); g("8", "0".into());
+        g("10", format!("{}", span / 2.0)); g("20", format!("{}", span / 10.0));
+        g("0", "ENDSEC".into()); g("0", "EOF".into());
+        (v.join("\r\n") + "\r\n").into_bytes()
+    }
+
+    /// 창 안 잉크의 가로 폭(px). 선은 멀리 있어 안 들어온다 — 점만 잡힌다.
+    fn ink_width(doc: &mut Doc, cx: f64, cy: f64, scale: f64, w: u32, h: u32) -> u32 {
+        let r = doc.raster("", cx, cy, scale, w, h, 0xFFFFFF, false).expect("그려야 한다");
+        let px = &r.rgba;
+        let (mut lo, mut hi) = (u32::MAX, 0u32);
+        for i in (0..px.len()).step_by(4) {
+            if px[i] == 255 && px[i + 1] == 255 && px[i + 2] == 255 { continue }
+            let x = ((i / 4) as u32) % w;
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+        if lo == u32::MAX { 0 } else { hi - lo + 1 }
+    }
+
+    #[test]
+    fn 점은_줌을_해도_화면에서_같은_크기다() {
+        // 전엔 `view_height` 를 안 넘겨서 엔진이 **도면 전체 높이**로 되돌아갔다.
+        // 그러면 점이 도면 높이의 5% 로 **세계 좌표에 구워져** 10만짜리 도면에서
+        // X 하나가 5천 단위, 방만 해진다. 줌을 해도 안 줄어든다.
+        let span = 100_000.0;
+        let mut doc = Doc::open(&dxf_with_point(span)).expect("DXF 를 읽어야 한다");
+        let (at_x, at_y) = (span / 2.0, span / 10.0);
+        let (w, h) = (400u32, 400u32);
+
+        // 두 배율에서 재면 **같은 픽셀 수**가 나와야 한다 (화면의 5%).
+        let half = span / 40.0;
+        let s1 = f64::from(w) / 2.0 / half;
+        let a = ink_width(&mut doc, at_x, at_y, s1, w, h);
+        let b = ink_width(&mut doc, at_x, at_y, s1 * 4.0, w, h);
+
+        assert!(a > 0 && b > 0, "점이 안 그려졌다 ({a}px, {b}px)");
+        // 화면 높이의 5% 언저리. 창을 꽉 채우면 세계 좌표에 구워진 것이다.
+        assert!(
+            (10..=60).contains(&a) && (10..=60).contains(&b),
+            "점이 화면의 5% 가 아니다 — {a}px, {b}px (창 {h}px)",
+        );
+        let (lo, hi) = (a.min(b), a.max(b));
+        assert!(
+            hi <= lo + lo / 4 + 2,
+            "줌에 따라 점 크기가 달라진다 — {a}px vs {b}px",
+        );
     }
 
     // ── Bimove 문서로 여는 길 ──
