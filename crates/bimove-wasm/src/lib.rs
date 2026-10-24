@@ -1814,6 +1814,54 @@ mod tests {
     }
 
     #[test]
+    fn 마감재_같은_의미_정보가_저장을_건너도_살아남는다() {
+        // Bimove 도형은 CAD 프리미티브가 아니다 — 벽에는 마감재가, 공간에는
+        // 면적과 마감 데이터가 붙는다. 그게 엔티티에 안 붙어 있으면 DXF 로
+        // 내보내는 순간 떨어져 나가고, 돌아온 도면은 선만 남는다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[0,0],[5000,0]],"width":200}"#));
+
+        let meta = r#"{"kind":"wall","재질":"석고보드 9.5T","두께":200,"단가":12500}"#;
+        run(&mut doc, "xdata.set", &format!(r#"{{"handles":["{h}"],"data":{meta}}}"#));
+
+        // ① 그 자리에서 바로 읽힌다
+        let got = run(&mut doc, "xdata", &format!(r#"{{"handles":["{h}"]}}"#));
+        assert_eq!(got["objects"][0]["data"]["재질"], "석고보드 9.5T", "방금 넣은 걸 못 읽는다: {got}");
+
+        // ② 되돌리기에 들어간다
+        run(&mut doc, "u", "{}");
+        let after_undo = run(&mut doc, "xdata", &format!(r#"{{"handles":["{h}"]}}"#));
+        assert!(after_undo["objects"][0]["data"].is_null(), "되돌렸는데 남아 있다: {after_undo}");
+        run(&mut doc, "redo", "{}");
+
+        // ③ **저장하고 다시 읽어도 살아 있다** — 여기가 진짜다
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).expect("쓴 DXF 를 다시 못 읽었다");
+        let h2 = again.pick("", 2500.0, 0.0, 50.0).expect("다시 읽은 도면에 벽이 없다");
+        let back = run(&mut again, "xdata", &format!(r#"{{"handles":["{h2}"]}}"#));
+        assert_eq!(back["objects"][0]["data"]["재질"], "석고보드 9.5T", "저장을 건너며 마감재가 날아갔다: {back}");
+        assert_eq!(back["objects"][0]["data"]["단가"], 12500, "숫자가 안 돌아왔다: {back}");
+    }
+
+    #[test]
+    fn 긴_한글_의미_정보도_그대로_돌아온다() {
+        // 1000 그룹은 255 바이트까지다. 한글은 글자당 3 바이트라 조금만 길어도
+        // 쪼개진다 — 바이트로 자르면 글자가 반쪽 나서 깨진 채 돌아온다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "circle", r#"{"center":[0,0],"radius":100}"#));
+
+        let note = "현장 확인 필요 — ".repeat(40);
+        let data = serde_json::json!({ "메모": note });
+        run(&mut doc, "xdata.set", &format!(r#"{{"handles":["{h}"],"data":{data}}}"#));
+
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).unwrap();
+        let h2 = again.pick("", 100.0, 0.0, 20.0).unwrap();
+        let back = run(&mut again, "xdata", &format!(r#"{{"handles":["{h2}"]}}"#));
+        assert_eq!(back["objects"][0]["data"]["메모"], note, "긴 한글이 깨졌다");
+    }
+
+    #[test]
     fn 지우고_되돌리면_살아난다() {
         // 되돌리기를 우리가 안 만들어도 되는지가 A 의 핵심이다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
