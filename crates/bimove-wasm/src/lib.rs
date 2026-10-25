@@ -1813,6 +1813,129 @@ mod tests {
         assert_eq!(props["objects"][0]["layer"], "WALL", "레이어가 안 살아남았다: {props}");
     }
 
+    // ───────────────────── 레이어 패널이 엔진 위에서 서나 ─────────────────────
+    //
+    // Bimove 의 '도면층' 패널은 지금 tldraw 도형의 meta 를 세어 레이어인 척
+    // 한다 — 진짜 레이어가 아니라 셈이다. 엔진에는 진짜가 있다.
+    //
+    // 패널이 하는 일은 셋이다: **목록을 읽고 · 끄고 켜고 · 끈 게 화면에
+    // 반영되고.** 셋째가 제일 중요하다. 명령이 "성공" 을 돌려줘도 그린 게
+    // 그대로면 사용자에게는 아무 일도 안 일어난 것이다.
+
+    #[test]
+    fn 레이어_목록을_읽는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "layer.new", r#"{"name":"WALL","color":1}"#);
+        run(&mut doc, "layer.new", r#"{"name":"DIM","color":3}"#);
+
+        let v = run(&mut doc, "layer", "{}");
+        let names: Vec<String> = v["layers"]
+            .as_array()
+            .expect(&format!("layers 가 배열이 아니다: {v}"))
+            .iter()
+            .map(|l| l["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(names.contains(&"WALL".to_string()), "만든 레이어가 없다: {names:?}");
+        assert!(names.contains(&"DIM".to_string()), "만든 레이어가 없다: {names:?}");
+        // 패널이 쓸 칸들 — 이게 없으면 끈 상태를 화면에 되비출 수가 없다.
+        let wall = v["layers"].as_array().unwrap().iter().find(|l| l["name"] == "WALL").unwrap();
+        assert!(wall.get("on").is_some(), "on 칸이 없다: {wall}");
+    }
+
+    #[test]
+    fn 레이어를_끄면_화면에서_사라지고_켜면_돌아온다() {
+        // 여기가 패널의 전부다. 명령만 돌고 그림이 그대로면 쓸 수가 없다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "layer.new", r#"{"name":"WALL","current":true}"#);
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[200,0],[200,100]],"width":10}"#);
+
+        let on = prim_count(&mut doc);
+        run(&mut doc, "layer.set", r#"{"name":"WALL","on":false}"#);
+        let off = prim_count(&mut doc);
+        assert!(off < on, "레이어를 껐는데 그려지는 게 그대로다 ({on} → {off})");
+
+        run(&mut doc, "layer.set", r#"{"name":"WALL","on":true}"#);
+        assert_eq!(prim_count(&mut doc), on, "다시 켰는데 안 돌아왔다");
+    }
+
+    #[test]
+    fn 레이어_0_도_끄고_켤_수_있다() {
+        // 브라우저에서 레이어 "0" 을 껐다 켜니 **안 돌아왔다.** WALL 로 한
+        // 앞 시험은 통과했으므로 "0" 이 특별한 것인지 여기서 가린다.
+        // ("0" 은 지울 수 없는 기본 레이어다. 모든 도면에 있고, DXF 를 읽으면
+        //  대개 제일 많은 게 거기 있다 — 못 켜면 반쯤 못 쓰는 패널이다.)
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let on = prim_count(&mut doc);
+        assert!(on > 0, "밑그림이 비었다");
+
+        run(&mut doc, "layer.set", r#"{"name":"0","on":false}"#);
+        let off = prim_count(&mut doc);
+        assert!(off < on, "레이어 0 을 껐는데 그대로다 ({on} → {off})");
+
+        run(&mut doc, "layer.set", r#"{"name":"0","on":true}"#);
+        assert_eq!(prim_count(&mut doc), on, "레이어 0 을 다시 켰는데 안 돌아왔다");
+    }
+
+    #[test]
+    fn 켤_때_frozen_을_같이_풀어도_돌아온다() {
+        // UI 는 켤 때 `{on:true, frozen:false}` 를 보낸다 — 끔만 풀고 동결을
+        // 두면 "켰는데 안 나온다" 가 되기 때문이다. 그 조합이 괜찮은지 본다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let on = prim_count(&mut doc);
+
+        run(&mut doc, "layer.set", r#"{"name":"0","on":false}"#);
+        assert!(prim_count(&mut doc) < on);
+
+        run(&mut doc, "layer.set", r#"{"name":"0","on":true,"frozen":false}"#);
+        assert_eq!(prim_count(&mut doc), on, "frozen 을 같이 보내니 안 돌아온다");
+    }
+
+    #[test]
+    fn bimove_문서에서도_레이어를_껐다_켤_수_있다() {
+        // 브라우저에서 껐다 켜니 **안 돌아왔다.** DXF 로 연 경우는 멀쩡했으므로
+        // Bimove 문서로 연 쪽(화면이 실제로 쓰는 길)을 따로 본다 — 거기서는
+        // 레이어가 변환하면서 만들어지고, 엔티티 색은 레이어가 아니라
+        // 엔티티마다 붙는다. 그 차이가 짚이는 자리다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let all = prim_count(&mut doc);
+        assert!(all > 0, "밑그림이 비었다");
+
+        let names: Vec<String> = run(&mut doc, "layer", "{}")["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap_or("").to_string())
+            .collect();
+
+        // 레이어마다 껐다 켜서 **전부 제자리로 돌아오는지** 본다. 하나라도
+        // 안 돌아오면 패널이 도면을 야금야금 깎아먹는다.
+        for name in &names {
+            run(&mut doc, "layer.set", &format!(r#"{{"name":"{name}","on":false}}"#));
+            let off = prim_count(&mut doc);
+            run(&mut doc, "layer.set", &format!(r#"{{"name":"{name}","on":true,"frozen":false}}"#));
+            let back = prim_count(&mut doc);
+            assert_eq!(back, all, "'{name}' 을 껐다 켜니 안 돌아왔다 ({all} → {off} → {back})");
+        }
+    }
+
+    #[test]
+    fn 레이어별로_몇_개인지_셀_수_있다() {
+        // 패널이 레이어마다 옆에 붙이는 숫자. properties 로 센다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "layer.new", r#"{"name":"WALL","current":true}"#);
+        let a = handle_of(&run(&mut doc, "circle", r#"{"center":[0,0],"radius":50}"#));
+        let b = handle_of(&run(&mut doc, "circle", r#"{"center":[300,0],"radius":50}"#));
+
+        let v = run(&mut doc, "properties", &format!(r#"{{"handles":["{a}","{b}"]}}"#));
+        let on_wall = v["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["layer"] == "WALL")
+            .count();
+        assert_eq!(on_wall, 2, "레이어별 개수를 못 센다: {v}");
+    }
+
     #[test]
     fn 마감재_같은_의미_정보가_저장을_건너도_살아남는다() {
         // Bimove 도형은 CAD 프리미티브가 아니다 — 벽에는 마감재가, 공간에는
