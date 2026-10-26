@@ -1918,6 +1918,65 @@ mod tests {
         }
     }
 
+    // ───────────────────── 커서가 도면에 붙나 ─────────────────────
+    //
+    // 스냅이 없으면 그린 게 아무 데나 박힌다. 끝점에서 조금 어긋난 벽은
+    // 화면에서 안 보이지만 도면에서는 **안 닫힌 벽**이고, 그 위에 면적을
+    // 재면 틀린 값이 나온다.
+    //
+    // 브라우저에서 눈으로 보면 3px 쯤은 가릴 수가 없다 (화면 좌표로 오가며
+    // 반올림이 섞인다). 그래서 **엔진 좌표로 정확히** 여기서 못 박는다.
+
+    /// 끝점 스냅 비트 (OSMODE).
+    const OS_END: u32 = 1;
+    const OS_MID: u32 = 2;
+
+    #[test]
+    fn 끝점에_정확히_붙는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#);
+
+        // 끝점에서 **어긋난** 자리를 묻는다. 붙는 거리 안이면 끝점이 와야 한다.
+        let s = doc.snap("", 1007.0, 5.0, 20.0, OS_END, None).expect("끝점을 못 찾았다");
+        assert_eq!((s.x, s.y), (1000.0, 0.0), "커서 자리로 돌아왔다 — 안 붙었다");
+        assert_eq!(s.name, "Endpoint");
+    }
+
+    #[test]
+    fn 붙을_거리_밖이면_안_붙는다() {
+        // 아무 데나 다 붙으면 스냅이 아니라 방해다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#);
+        assert!(doc.snap("", 1500.0, 500.0, 20.0, OS_END, None).is_none());
+    }
+
+    #[test]
+    fn 중점도_찾는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#);
+        let s = doc.snap("", 505.0, 4.0, 20.0, OS_MID, None).expect("중점을 못 찾았다");
+        assert_eq!((s.x, s.y), (500.0, 0.0));
+        assert_eq!(s.name, "Midpoint");
+    }
+
+    #[test]
+    fn 붙을_거리는_도면_단위다() {
+        // UI 는 화면 픽셀을 배율로 나눠 넘긴다. 여기서 단위가 어긋나면 확대했을
+        // 때 손도 못 대고 축소했을 때 온 도면이 다 붙는다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#);
+        // 100 만큼 떨어진 자리: 아퍼처 10 이면 안 붙고, 200 이면 붙는다.
+        assert!(doc.snap("", 1100.0, 0.0, 10.0, OS_END, None).is_none());
+        assert!(doc.snap("", 1100.0, 0.0, 200.0, OS_END, None).is_some());
+    }
+
+    #[test]
+    fn 아무것도_안_켜면_안_붙는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#);
+        assert!(doc.snap("", 1000.0, 0.0, 20.0, 0, None).is_none());
+    }
+
     #[test]
     fn 레이어별로_몇_개인지_셀_수_있다() {
         // 패널이 레이어마다 옆에 붙이는 숫자. properties 로 센다.
