@@ -1977,6 +1977,120 @@ mod tests {
         assert!(doc.snap("", 1000.0, 0.0, 20.0, 0, None).is_none());
     }
 
+    // ───────────────────── 고르고 고치기 ─────────────────────
+    //
+    // 선택은 **엔진이 든다** (Session.selection). TS 쪽에 따로 두면 둘이
+    // 어긋나서, 화면에는 골라져 있는데 지우면 다른 게 지워진다.
+    //
+    // `pickWindow` 는 **개수만** 돌려준다. 손잡이를 얻으려면 `select` 로
+    // 고르고 `properties` 로 읽어야 한다 — 그 왕복이 서는지 본다.
+
+    /// 지금 골라진 것들의 handle.
+    fn selected(doc: &mut Doc) -> Vec<String> {
+        let v = run(doc, "properties", "{}");
+        v["objects"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|o| o["handle"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn 점으로_골라_읽는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#));
+
+        run(&mut doc, "select", r#"{"at":[500,0]}"#);
+        assert_eq!(selected(&mut doc), vec![h.clone()], "점으로 고른 게 안 읽힌다");
+    }
+
+    #[test]
+    fn 네모로_여럿을_고른다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        // **밑그림을 피해 멀리서 한다.** one_line_dxf 의 선이 (0,0)-(100,50) 에
+        // 있어서, 원점 근처에 네모를 치면 그것까지 걸린다 — 처음에 그렇게
+        // 짰다가 "둘만 골라져야 한다" 가 셋으로 나왔다.
+        let a = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[2000,0],[2100,0]]}"#));
+        let b = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[2000,200],[2100,200]]}"#));
+        run(&mut doc, "pline", r#"{"vertices":[[9000,0],[9100,0]]}"#);   // 멀리 있는 것
+
+        run(&mut doc, "select", r#"{"window":[[1950,-50],[2150,250]]}"#);
+        let mut got = selected(&mut doc);
+        got.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(got, want, "네모 안의 둘만 골라져야 한다");
+    }
+
+    #[test]
+    fn 걸치기와_포함은_다르다() {
+        // 오토캐드에서 왼→오 드래그는 **완전히 들어온 것**, 오→왼은 **걸친 것**.
+        // 둘이 같으면 드래그 방향이 아무 뜻도 없어진다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        // 밑그림에서 멀리 (위 주석과 같은 이유).
+        run(&mut doc, "pline", r#"{"vertices":[[2000,0],[3000,0]]}"#);
+
+        // 선의 **일부만** 덮는 네모
+        run(&mut doc, "select", r#"{"window":[[1950,-50],[2500,50]]}"#);
+        let contained = selected(&mut doc).len();
+        run(&mut doc, "select", r#"{"clear":true}"#);
+        run(&mut doc, "select", r#"{"window":[[1950,-50],[2500,50]],"crossing":true}"#);
+        let crossing = selected(&mut doc).len();
+
+        assert_eq!(contained, 0, "일부만 덮었는데 포함으로 잡혔다");
+        assert_eq!(crossing, 1, "걸쳤는데 안 잡혔다");
+    }
+
+    #[test]
+    fn 고른_것을_지우고_되돌린다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#));
+        let before = prim_count(&mut doc);
+
+        run(&mut doc, "select", r#"{"at":[500,0]}"#);
+        // handles 를 안 주면 **골라진 것**을 지운다 — 그게 UI 가 하는 짓이다.
+        run(&mut doc, "erase", "{}");
+        assert!(prim_count(&mut doc) < before, "지웠는데 그대로다");
+        assert_eq!(doc.pick("", 500.0, 0.0, 20.0), None);
+
+        run(&mut doc, "u", "{}");
+        assert_eq!(doc.pick("", 500.0, 0.0, 20.0).as_deref(), Some(h.as_str()), "되돌렸는데 안 살아났다");
+    }
+
+    #[test]
+    fn 고른_것을_옮긴다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#));
+        run(&mut doc, "select", r#"{"at":[500,0]}"#);
+        run(&mut doc, "move", r#"{"delta":[0,300]}"#);
+
+        assert_eq!(doc.pick("", 500.0, 0.0, 20.0), None, "옛 자리에 그대로 있다");
+        assert_eq!(doc.pick("", 500.0, 300.0, 20.0).as_deref(), Some(h.as_str()), "새 자리에 없다");
+    }
+
+    #[test]
+    fn 고른_것의_범위를_읽는다() {
+        // 화면에 "이게 골라졌다" 를 보여주려면 네모를 알아야 한다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,500]]}"#);
+        run(&mut doc, "select", r#"{"at":[500,250]}"#);
+
+        let v = run(&mut doc, "properties", "{}");
+        let b = &v["objects"][0]["bounds"];
+        assert!(b.is_array(), "범위가 없다: {v}");
+        assert_eq!(b[0][0].as_f64(), Some(0.0));
+        assert_eq!(b[1][0].as_f64(), Some(1000.0));
+    }
+
+    #[test]
+    fn 비우면_아무것도_안_골라진다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        run(&mut doc, "pline", r#"{"vertices":[[0,0],[1000,0]]}"#);
+        run(&mut doc, "select", r#"{"at":[500,0]}"#);
+        assert_eq!(selected(&mut doc).len(), 1);
+        run(&mut doc, "select", r#"{"clear":true}"#);
+        assert_eq!(selected(&mut doc).len(), 0, "비웠는데 남아 있다");
+    }
+
     #[test]
     fn 레이어별로_몇_개인지_셀_수_있다() {
         // 패널이 레이어마다 옆에 붙이는 숫자. properties 로 센다.
