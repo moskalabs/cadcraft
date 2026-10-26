@@ -195,9 +195,18 @@ fn hue_fractions(h: usize) -> (f64, f64, f64) {
 }
 
 /// The closest index colour to an RGB value (1..=255).
+///
+/// **Never returns 7.** Index 7 is not a colour: it flips to contrast with the background
+/// (white on dark, black on light, as [`display_rgb`] does and as CAD programs draw it). Its
+/// palette entry is white, so a true white used to land on it — and then came back black on
+/// paper. A drawing saved from Bimove showed its walls' white fill as solid black blobs that
+/// way. Pure white goes to 255 instead, which is white whatever the background.
 pub fn nearest_aci(c: Rgb) -> u8 {
-    let mut best = (u32::MAX, 7u8);
+    let mut best = (u32::MAX, 255u8);
     for i in 1..=255u8 {
+        if i == 7 {
+            continue;
+        }
         let p = aci_rgb(i);
         let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).pow(2) as u32;
         let dist = d(p.0, c.0) + d(p.1, c.1) + d(p.2, c.2);
@@ -264,5 +273,33 @@ mod tests {
         // Only colour 7 flips: ACI 255 / true-colour white and dark index colours keep their RGB.
         assert_eq!(display_rgb(Rgb(255, 255, 255), false, Rgb(255, 255, 255)), Rgb(255, 255, 255));
         assert_eq!(display_rgb(aci_rgb(250), false, Rgb(33, 40, 48)), aci_rgb(250));
+    }
+}
+
+#[cfg(test)]
+mod nearest_aci_tests {
+    use super::*;
+
+    #[test]
+    fn 참_흰색은_7_이_아니라_255_로_간다() {
+        // 7 은 색이 아니라 "배경 반대" 다. 거기로 내리면 흰 종이에서 **검정**이
+        // 되어 돌아온다 — Bimove 벽의 흰 채우기가 까맣게 뭉개진 자리다.
+        assert_eq!(nearest_aci(Rgb(255, 255, 255)), 255);
+        assert_eq!(aci_rgb(255), Rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn 어떤_색도_7_로_안_간다() {
+        for rgb in [Rgb(0, 0, 0), Rgb(254, 254, 254), Rgb(128, 128, 128), Rgb(1, 1, 1)] {
+            assert_ne!(nearest_aci(rgb), 7, "{rgb:?} 가 7 로 갔다");
+        }
+    }
+
+    #[test]
+    fn 또렷한_색은_그대로_간다() {
+        // 7 을 건너뛴다고 빨강·초록까지 달라지면 안 된다.
+        assert_eq!(nearest_aci(Rgb(255, 0, 0)), 1);
+        assert_eq!(nearest_aci(Rgb(0, 255, 0)), 3);
+        assert_eq!(nearest_aci(Rgb(0, 0, 255)), 5);
     }
 }

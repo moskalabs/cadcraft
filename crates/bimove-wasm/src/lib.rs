@@ -2249,6 +2249,235 @@ mod tests {
         assert_eq!(prim_count(&mut doc), after, "다시 실행이 반만 돌아왔다");
     }
 
+    // ──────────────── 저장본이 DXF 를 건너도 같은가 ────────────────
+    //
+    // 저장을 엔진으로 넘기기 전에 반드시 재야 한다. 한 번 넘기면 한의 실제
+    // 도면이 그 포맷으로 가고, 그때 "벽이 까맣게 뭉개졌다" 를 알게 되면
+    // 되돌릴 방법이 없다.
+    //
+    // 브라우저로 11 개를 돌려 봤더니 벽만 있는 도면이 다시 읽을 때 **검게
+    // 칠해진 덩어리**가 됐다. 여기서 그 자리를 좁힌다.
+
+    /// 지금 모형공간의 엔티티 종류별 개수.
+    fn kinds(doc: &mut Doc) -> std::collections::BTreeMap<String, usize> {
+        run(doc, "select", r#"{"window":[[-1e9,-1e9],[1e9,1e9]],"crossing":true}"#);
+        let mut m = std::collections::BTreeMap::new();
+        if let Some(a) = run(doc, "properties", "{}")["objects"].as_array() {
+            for o in a {
+                *m.entry(o["type"].as_str().unwrap_or("?").to_string()).or_insert(0) += 1;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn bimove_벽이_dxf_를_건너도_mline_으로_남는다() {
+        // 벽은 MLINE 으로 들어간다 (wall.rs). DXF 를 거쳐 돌아올 때 그게
+        // 다른 것으로 바뀌면 **두께가 면으로 칠해져** 도면이 까맣게 뭉개진다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let before = kinds(&mut doc);
+        assert!(before.contains_key("MLine"), "벽이 MLINE 이 아니다: {before:?}");
+
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).expect("쓴 DXF 를 다시 못 읽었다");
+        let after = kinds(&mut again);
+
+        assert!(
+            after.contains_key("MLine"),
+            "DXF 를 건너니 MLINE 이 사라졌다\n  전 {before:?}\n  후 {after:?}",
+        );
+    }
+
+    #[test]
+    fn bimove_저장본이_dxf_를_건너도_그리는_양이_비슷하다() {
+        // 종류가 같아도 그려지는 양이 확 달라지면 뭔가 잘못 해석된 것이다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let before = prim_count(&mut doc);
+
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).unwrap();
+        let after = prim_count(&mut again);
+
+        let ratio = after as f64 / before.max(1) as f64;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "DXF 를 건너며 그릴 거리가 {ratio:.1} 배로 달라졌다 ({before} → {after})",
+        );
+    }
+
+    /// 한의 실제 도면에서 뽑은 DXF — 벽만 있는 것 (MLINE 4 개).
+    ///
+    /// 브라우저에서 이걸 다시 읽으니 벽이 **까맣게 칠해진 덩어리**가 됐다.
+    /// 픽스처(벽 하나)로는 재현이 안 돼서 실제 바이트를 들여온다.
+    const WALLS_DXF: &str = include_str!("../tests/walls.dxf");
+
+    /// 같은 도면을 **고친 뒤에 다시 받은 것.** 손으로 만든 게 아니라 브라우저가
+    /// 실제로 내려준 바이트다. 두 파일의 차이는 벽 스타일의 채움 색 한 군데다 —
+    /// ACI 7 → 255 ([`cadcraft_color::nearest_aci`]).
+    const WALLS_FIXED_DXF: &str = include_str!("../tests/walls-fixed.dxf");
+
+    #[test]
+    fn 옛_내보내기는_채움이_aci_7_이라_검게_나온다() {
+        // **증거를 남겨 둔다.** 이 바이트는 고치기 전 쓰기가 낸 것이고, 그걸
+        // 읽으면 까맣다 — AutoCAD 도 흰 바탕에서 똑같이 검게 그린다. 즉 파일이
+        // 틀린 것이고, 읽기 쪽을 고칠 자리가 아니다. 나중에 누가 "ACI 7 을
+        // 흰색으로 읽자" 로 고치려 들면 여기서 왜 아닌지 읽게 된다.
+        let at = WALLS_DXF.rfind("BIMOVE_WALL_200000").unwrap();
+        assert!(
+            WALLS_DXF[at..].contains("\r\n 62\r\n7\r\n"),
+            "들여온 바이트에 채움 62=7 이 없다 — 픽스처가 바뀌었다",
+        );
+
+        let mut doc = Doc::open(WALLS_DXF.as_bytes()).expect("DXF 를 못 읽었다");
+        assert!(ink_fraction(&mut doc) > 0.30, "옛 내보내기가 검지 않다 — 다른 데가 달라졌다");
+    }
+
+    #[test]
+    fn 실제_벽_도면을_다시_읽어도_뭉개지지_않는다() {
+        let mut doc = Doc::open(WALLS_FIXED_DXF.as_bytes()).expect("DXF 를 못 읽었다");
+        let k = kinds(&mut doc);
+        assert_eq!(k.get("MLine").copied().unwrap_or(0), 4, "MLINE 4 개가 아니다: {k:?}");
+
+        // **면이 있는 건 정상이다.** 벽은 흰색으로 채워 속을 가린다
+        // (`bimove.rs` 의 기본 채움). 처음에 삼각형 수로 쟀다가 틀렸다 —
+        // 고친 뒤에도 삼각형은 그대로 204 개이고, 달라진 건 **색**이다.
+        // 그래서 채우는 면마다 색을 본다.
+        let f = doc.build("", 1.0);
+        let mut filled = 0;
+        for p in f.prims.chunks_exact(PRIM_STRIDE) {
+            if p[0] != KIND_TRIS {
+                continue;
+            }
+            filled += 1;
+            let (c, aci7) = (p[1] as u32, p[5] != 0);
+            let (r, g, b) = (c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF);
+            // aci7 은 색이 아니라 "바탕과 반대" 다 — 흰 종이에서 검정이 된다.
+            assert!(!aci7, "벽 채움이 ACI 7 이다 — 흰 종이에서 검게 뒤집힌다");
+            assert!(
+                r > 200 && g > 200 && b > 200,
+                "벽 채움이 어둡다 (#{r:02X}{g:02X}{b:02X}) — 도면이 덩어리로 뭉개진다",
+            );
+        }
+        assert!(filled > 0, "벽에 채움이 아예 없다 — 속이 비어 뒤가 보인다");
+    }
+
+    #[test]
+    fn 실제_벽_도면이_화면을_덮지_않는다() {
+        // 사람이 보는 건 결국 픽셀이다. 벽 4 줄짜리 도면이 화면을 까맣게
+        // 덮으면 **그게 고장이다** — 브라우저에서 실제로 그랬다.
+        let mut doc = Doc::open(WALLS_FIXED_DXF.as_bytes()).unwrap();
+        let f = doc.build("", 1.0);
+        let [minx, miny, maxx, maxy] = f.bounds;
+        let (w, h) = (600u32, 400u32);
+        let scale = ((f64::from(w) - 48.0) / (maxx - minx).max(1e-9))
+            .min((f64::from(h) - 48.0) / (maxy - miny).max(1e-9));
+
+        let r = doc
+            .raster("", (minx + maxx) / 2.0, (miny + maxy) / 2.0, scale, w, h, 0xFFFFFF, false)
+            .expect("못 그렸다");
+        let px = &r.rgba;
+        let mut ink = 0usize;
+        for p in px.chunks_exact(4) {
+            if p[0] < 240 || p[1] < 240 || p[2] < 240 {
+                ink += 1;
+            }
+        }
+        let frac = ink as f64 / f64::from(w * h);
+        assert!(frac < 0.30, "벽 4 줄인데 화면의 {:.0}% 가 칠해졌다", frac * 100.0);
+    }
+
+    /// 지금 도면을 한 장 그려 **칠해진 픽셀 비율**을 돌려준다 (0..1).
+    fn ink_fraction(doc: &mut Doc) -> f64 {
+        let f = doc.build("", 1.0);
+        let [minx, miny, maxx, maxy] = f.bounds;
+        let (w, h) = (600u32, 400u32);
+        let scale = ((f64::from(w) - 48.0) / (maxx - minx).max(1e-9))
+            .min((f64::from(h) - 48.0) / (maxy - miny).max(1e-9));
+        let Some(r) = doc.raster("", (minx + maxx) / 2.0, (miny + maxy) / 2.0, scale, w, h, 0xFFFFFF, false)
+        else {
+            return 0.0;
+        };
+        let ink = r.rgba.chunks_exact(4).filter(|p| p[0] < 240 || p[1] < 240 || p[2] < 240).count();
+        ink as f64 / f64::from(w * h)
+    }
+
+    /// 벽만 있는 Bimove 문서 — 다른 도형에 묻히지 않게.
+    fn walls_only_json() -> String {
+        r##"{"version":1,
+          "pages":[{"id":"page:main","name":"모형","index":"a1"}],
+          "shapes":[
+            {"id":"shape:w1","type":"wall","x":0,"y":0,"rotation":0,"index":"a1",
+             "parentId":"page:main","props":{"x2":4000,"y2":0,"thickness":200}},
+            {"id":"shape:w2","type":"wall","x":4000,"y":0,"rotation":0,"index":"a2",
+             "parentId":"page:main","props":{"x2":0,"y2":3000,"thickness":200}}],
+          "records":{},"skipped":0,
+          "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":2}}"##
+            .to_string()
+    }
+
+    #[test]
+    fn 벽만_있는_도면이_dxf_를_건너며_검게_칠해지지_않는다() {
+        // 브라우저에서 본 것이 이것이다: 벽만 있는 저장본을 열면 가는 윤곽선인데,
+        // DXF 로 꺼내 다시 읽으면 **까맣게 칠해진 덩어리**가 됐다 (잉크 41 배).
+        //
+        // 자리는 `bimove.rs` 의 벽 채우기다 — 메모리에서는 **참 흰색**
+        // (`Color::True(255,255,255)`) 이라 흰 바탕에서 안 보인다. 그런데 DXF 에는
+        // `62 = 7` (ACI 7) 로 나간다. ACI 7 은 **밝은 바탕에서 검정**이다
+        // (CAD 관례). 그래서 돌아오면 벽 속이 까맣다.
+        let mut doc = Doc::from_bimove(&walls_only_json(), "").unwrap();
+        let direct = ink_fraction(&mut doc);
+
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).unwrap();
+        let round = ink_fraction(&mut again);
+
+        assert!(
+            round < direct * 2.0 + 0.02,
+            "DXF 를 건너니 칠해진 양이 {:.1}% → {:.1}% 로 늘었다",
+            direct * 100.0, round * 100.0,
+        );
+    }
+
+    #[test]
+    fn 벽이_dxf_를_건너며_검게_칠해지지_않는다() {
+        // 브라우저에서 본 것: 저장본을 열면 벽이 가는 윤곽선인데, 그걸 DXF 로
+        // 꺼내 다시 읽으면 **까맣게 칠해진 덩어리**가 된다. 같은 도면을 두 길로
+        // 그려 나란히 본다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let direct = ink_fraction(&mut doc);
+
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).unwrap();
+        let round = ink_fraction(&mut again);
+
+        assert!(
+            round < direct * 2.0 + 0.05,
+            "DXF 를 건너니 칠해진 양이 {:.0}% → {:.0}% 로 늘었다 — 벽 두께가 면으로 칠해진 것이다",
+            direct * 100.0, round * 100.0,
+        );
+    }
+
+    #[test]
+    fn 벽_채움은_aci_7_로_안_나간다() {
+        // 위 두 테스트는 **그려진 양**을 보니 렌더가 달라지면 같이 흔들린다.
+        // 고친 자리 자체를 못 박아 둔다: 벽 스타일의 채움 색(62) 은 7 이 아니다.
+        // 7 은 색이 아니라 "바탕과 반대" 라서, 흰 종이에서 검정이 된다.
+        let mut doc = Doc::from_bimove(&walls_only_json(), "").unwrap();
+        let dxf = doc.to_dxf();
+
+        let at = dxf.rfind("BIMOVE_WALL").expect("벽 스타일이 안 나갔다");
+        let style = &dxf[at..];
+        // 스타일 기록 안의 **첫** 62 가 채움 색이다 (그 뒤는 선마다의 색).
+        let fill = style
+            .lines()
+            .skip_while(|l| l.trim() != "62")
+            .nth(1)
+            .expect("채움 색이 없다")
+            .trim()
+            .to_string();
+        assert_ne!(fill, "7", "벽 채움이 ACI 7 로 나갔다 — 흰 종이에서 검게 뒤집힌다");
+    }
+
     #[test]
     fn 레이어별로_몇_개인지_셀_수_있다() {
         // 패널이 레이어마다 옆에 붙이는 숫자. properties 로 센다.
