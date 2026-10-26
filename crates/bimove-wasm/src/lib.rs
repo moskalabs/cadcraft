@@ -2068,6 +2068,31 @@ mod tests {
     }
 
     #[test]
+    fn 고른_것을_복사한다() {
+        // 끌면서 Ctrl 을 누르면 옮기는 게 아니라 복사다. 원본이 **그대로 있는
+        // 것**까지 봐야 한다 — 안 그러면 "복사" 가 사실은 옮기기다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[2000,0],[3000,0]]}"#));
+        run(&mut doc, "select", r#"{"at":[2500,0]}"#);
+        run(&mut doc, "copy", r#"{"delta":[0,500]}"#);
+
+        assert_eq!(doc.pick("", 2500.0, 0.0, 20.0).as_deref(), Some(h.as_str()), "원본이 사라졌다");
+        assert!(doc.pick("", 2500.0, 500.0, 20.0).is_some(), "사본이 없다");
+    }
+
+    #[test]
+    fn 복사를_되돌리면_사본만_없어진다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "pline", r#"{"vertices":[[2000,0],[3000,0]]}"#));
+        run(&mut doc, "select", r#"{"at":[2500,0]}"#);
+        run(&mut doc, "copy", r#"{"delta":[0,500]}"#);
+        run(&mut doc, "u", "{}");
+
+        assert_eq!(doc.pick("", 2500.0, 500.0, 20.0), None, "사본이 안 없어졌다");
+        assert_eq!(doc.pick("", 2500.0, 0.0, 20.0).as_deref(), Some(h.as_str()), "원본까지 없어졌다");
+    }
+
+    #[test]
     fn 고른_것의_범위를_읽는다() {
         // 화면에 "이게 골라졌다" 를 보여주려면 네모를 알아야 한다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
