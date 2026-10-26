@@ -304,6 +304,22 @@ export class BimoveDoc {
         return ret >>> 0;
     }
     /**
+     * 지금 도면을 DXF 글로. 저장할 때 이걸 올린다.
+     * @returns {string}
+     */
+    toDxf() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.bimovedoc_toDxf(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * 읽은 벽체 **도형** 수.
      * @returns {number}
      */

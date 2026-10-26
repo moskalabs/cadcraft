@@ -119,6 +119,10 @@ export class BimoveDoc {
      */
     textCount(): number;
     /**
+     * 지금 도면을 DXF 글로. 저장할 때 이걸 올린다.
+     */
+    toDxf(): string;
+    /**
      * 읽은 벽체 **도형** 수.
      */
     wallCount(): number;
@@ -238,6 +242,7 @@ export interface InitOutput {
     readonly bimovedoc_revision: (a: number) => number;
     readonly bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
     readonly bimovedoc_textCount: (a: number) => number;
+    readonly bimovedoc_toDxf: (a: number) => [number, number];
     readonly bimovedoc_wallCount: (a: number) => number;
     readonly bimovedoc_wallMlineCount: (a: number) => number;
     readonly bimovedoc_zoneCount: (a: number) => number;
