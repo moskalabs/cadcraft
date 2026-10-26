@@ -2116,6 +2116,139 @@ mod tests {
         assert_eq!(selected(&mut doc).len(), 0, "비웠는데 남아 있다");
     }
 
+    // ───────────────── 문·창 · 치수 · 공간을 엔진 명령으로 ─────────────────
+    //
+    // Bimove 가 실제로 쓰는 도형은 벽·선만이 아니다. 저장을 엔진으로 넘기려면
+    // 이 셋이 다 그려져야 한다. 셋의 길이 서로 다르다:
+    //
+    //   치수   엔진에 **네이티브로 있다** (DIMENSION) — 명령 하나
+    //   공간   닫힌 폴리라인 + 해치 + 글자 — 명령 셋을 엮는다
+    //   문·창  엔진에 그런 개념이 없다. 벽을 가리는 사각형 + 잼브 + 스윙 호를
+    //          손으로 엮는다 (opening.rs 가 읽을 때 하는 것과 같은 모양)
+    //
+    // 여기서 보는 건 **엮을 수 있나** 다. 명령이 있어도 돌려주는 모양이
+    // 다르면 UI 가 그 위에 설 수가 없다.
+
+    #[test]
+    fn 치수를_긋는다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let before = prim_count(&mut doc);
+        let v = run(&mut doc, "dimaligned", r#"{"p1":[2000,0],"p2":[3000,0],"at":[2500,400]}"#);
+        assert!(prim_count(&mut doc) > before, "치수를 그었는데 화면에 안 나온다");
+
+        let h = handle_of(&v);
+        let p = run(&mut doc, "properties", &format!(r#"{{"handles":["{h}"]}}"#));
+        let kind = p["objects"][0]["type"].as_str().unwrap_or("");
+        assert!(kind.contains("Dimension"), "치수가 아닌 걸로 들어갔다: {kind}");
+    }
+
+    #[test]
+    fn 치수는_잰_두_점을_들고_있다() {
+        // 숫자를 우리가 적어 넣지 않는다. 치수는 **두 점**을 들고 있고, 길이는
+        // 그릴 때 거기서 잰다 (crates/render/src/dim.rs 의 `g.measurement = meas`).
+        // 그래서 저장된 `measurement` 는 0 이다 — 그걸 보고 "길이를 모른다" 고
+        // 읽으면 안 된다. 점이 맞으면 옮겨도 숫자가 따라간다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let h = handle_of(&run(&mut doc, "dimaligned", r#"{"p1":[2000,0],"p2":[3000,0],"at":[2500,400]}"#));
+        let g = &run(&mut doc, "properties", &format!(r#"{{"handles":["{h}"]}}"#))["objects"][0]["geometry"];
+        assert_eq!(g["kind"], "aligned");
+        assert_eq!((g["p13"]["x"].as_f64(), g["p13"]["y"].as_f64()), (Some(2000.0), Some(0.0)));
+        assert_eq!((g["p14"]["x"].as_f64(), g["p14"]["y"].as_f64()), (Some(3000.0), Some(0.0)));
+    }
+
+    #[test]
+    fn 공간은_닫힌_폴리라인에_해치를_얹어_만든다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let before = prim_count(&mut doc);
+
+        let poly = handle_of(&run(
+            &mut doc,
+            "pline",
+            r#"{"vertices":[[2000,0],[3000,0],[3000,800],[2000,800]],"closed":true}"#,
+        ));
+        // 해치는 **그 도형을 가리켜** 건다. 내부 점으로 걸면 도면이 빽빽할 때
+        // 엉뚱한 칸을 채운다.
+        run(&mut doc, "hatch", &format!(r#"{{"handles":["{poly}"],"pattern":"SOLID"}}"#));
+        run(&mut doc, "text", r#"{"at":[2500,400],"text":"거실","height":120,"justify":"MC"}"#);
+
+        assert!(prim_count(&mut doc) > before, "공간을 만들었는데 화면에 안 나온다");
+
+        // 셋이 다 들어갔나
+        let all = run(&mut doc, "select", r#"{"window":[[1900,-100],[3100,900]]}"#);
+        let _ = all;
+        let kinds: Vec<String> = run(&mut doc, "properties", "{}")["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["type"].as_str().map(str::to_string))
+            .collect();
+        assert!(kinds.iter().any(|k| k.contains("Polyline")), "폴리라인이 없다: {kinds:?}");
+        assert!(kinds.iter().any(|k| k.contains("Hatch")), "해치가 없다: {kinds:?}");
+        assert!(kinds.iter().any(|k| k.contains("Text")), "글자가 없다: {kinds:?}");
+    }
+
+    #[test]
+    fn 문은_가림막과_잼브와_스윙호로_엮인다() {
+        // 엔진에 '문' 이 없으므로 손으로 엮는다. opening.rs 가 읽을 때 만드는
+        // 것과 같은 모양이라, 그려 넣은 문이 다시 읽혀도 같게 보인다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let before = prim_count(&mut doc);
+
+        // 벽을 가리는 사각형 (문이 뚫린 자리)
+        run(&mut doc, "rectang", r#"{"p1":[2400,-50],"p2":[2800,50]}"#);
+        // 잼브 둘
+        run(&mut doc, "line", r#"{"points":[[2400,-50],[2400,50]]}"#);
+        run(&mut doc, "line", r#"{"points":[[2800,-50],[2800,50]]}"#);
+        // 문짝 + 스윙 호
+        run(&mut doc, "line", r#"{"points":[[2400,0],[2400,400]]}"#);
+        let arc = handle_of(&run(
+            &mut doc,
+            "arc",
+            r#"{"center":[2400,0],"radius":400,"start":0,"end":90}"#,
+        ));
+
+        assert!(prim_count(&mut doc) > before, "문을 그렸는데 화면에 안 나온다");
+        let p = run(&mut doc, "properties", &format!(r#"{{"handles":["{arc}"]}}"#));
+        assert_eq!(p["objects"][0]["type"], "Arc", "스윙이 호가 아니다: {p}");
+    }
+
+    #[test]
+    fn 여러_명령을_한_번에_되돌릴_수_있다() {
+        // 공간 하나가 명령 셋(폴리라인·해치·글자), 문 하나가 다섯이다. 묶지
+        // 않으면 **되돌리기를 다섯 번** 눌러야 문 하나가 사라진다 — 쓸 수가 없다.
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let before = prim_count(&mut doc);
+
+        run(&mut doc, "undo", r#"{"mode":"begin"}"#);
+        run(&mut doc, "pline", r#"{"vertices":[[2000,0],[3000,0],[3000,800],[2000,800]],"closed":true}"#);
+        run(&mut doc, "text", r#"{"at":[2500,400],"text":"거실","height":120,"justify":"MC"}"#);
+        run(&mut doc, "line", r#"{"points":[[2000,0],[3000,800]]}"#);
+        run(&mut doc, "undo", r#"{"mode":"end"}"#);
+
+        let after = prim_count(&mut doc);
+        assert!(after > before, "그렸는데 화면에 안 나온다");
+
+        // **한 번**이면 셋이 다 사라져야 한다.
+        run(&mut doc, "u", "{}");
+        assert_eq!(prim_count(&mut doc), before, "한 번에 안 돌아갔다 ({before} → {after} → {})", prim_count(&mut doc));
+    }
+
+    #[test]
+    fn 묶음을_되돌린_뒤_다시_실행하면_통째로_돌아온다() {
+        let mut doc = Doc::open(&one_line_dxf()).unwrap();
+        let before = prim_count(&mut doc);
+        run(&mut doc, "undo", r#"{"mode":"begin"}"#);
+        run(&mut doc, "pline", r#"{"vertices":[[2000,0],[3000,0]]}"#);
+        run(&mut doc, "pline", r#"{"vertices":[[2000,400],[3000,400]]}"#);
+        run(&mut doc, "undo", r#"{"mode":"end"}"#);
+        let after = prim_count(&mut doc);
+
+        run(&mut doc, "u", "{}");
+        assert_eq!(prim_count(&mut doc), before);
+        run(&mut doc, "redo", "{}");
+        assert_eq!(prim_count(&mut doc), after, "다시 실행이 반만 돌아왔다");
+    }
+
     #[test]
     fn 레이어별로_몇_개인지_셀_수_있다() {
         // 패널이 레이어마다 옆에 붙이는 숫자. properties 로 센다.
