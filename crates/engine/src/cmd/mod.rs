@@ -41,7 +41,7 @@ mod tolerance;
 mod trimextend;
 mod utility;
 mod view;
-mod xdata;
+pub mod xdata;
 
 pub mod curves;
 pub mod helpers;

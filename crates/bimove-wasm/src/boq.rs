@@ -57,6 +57,8 @@ pub struct BoqRow {
 /// 물량표 하나. 좌표는 **캔버스** 것이다 — y 뒤집기는 이 안에서 한다.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoqTable {
+    /// 이 물량표를 만든 Bimove 도형의 id (`crate::identity`).
+    pub id: String,
     /// 캔버스에서의 **좌상단** (도형의 `x,y`).
     pub at: Vec2,
     pub title: String,
@@ -355,7 +357,9 @@ pub fn add_tables(drawing: &mut Drawing, tables: &[BoqTable]) -> usize {
         e.common.layer = t.layer.clone();
         // 괘선색이다. 셀 스타일의 테두리는 `ByBlock` 이라 이걸 따라간다.
         e.common.color = Color::True(RULE);
+        let from = drawing.model.len();
         drawing.model.push(e);
+        crate::identity::stamp_one(drawing, from, crate::identity::BOQ, &t.id);
         n += 1;
     }
     n
@@ -378,6 +382,7 @@ mod tests {
 
     fn table(rows: Vec<BoqRow>) -> BoqTable {
         BoqTable {
+            id: String::new(),
             at: Vec2::new(100.0, 50.0),
             title: "마감재 물량 산출표".into(),
             total_area_m2: 12.5,
@@ -690,5 +695,25 @@ mod tests {
         b.at = Vec2::new(800.0, 50.0);
         assert_eq!(add_tables(&mut d, &[table(vec![]), b]), 2);
         assert_eq!(d.model.iter().filter(|e| matches!(e.kind, EntityKind::Table(_))).count(), 2);
+    }
+
+    #[test]
+    fn 물량표에_정체성이_붙는다() {
+        let mut d = Drawing::new_metric();
+        let mut t = table(vec![]);
+        t.id = "shape:boq1".into();
+        add_tables(&mut d, &[t]);
+
+        let g = crate::identity::of(d.model.iter().next().expect("표가 없다"))
+            .expect("표에 정체성이 없다");
+        assert_eq!(g.kind, crate::identity::BOQ);
+        assert_eq!(g.ids, vec!["shape:boq1"]);
+    }
+
+    #[test]
+    fn 출처_없는_물량표에는_안_붙인다() {
+        let mut d = Drawing::new_metric();
+        add_tables(&mut d, &[table(vec![])]);
+        assert!(d.model.iter().all(|e| crate::identity::of(e).is_none()));
     }
 }

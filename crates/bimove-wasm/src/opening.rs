@@ -60,6 +60,9 @@ pub enum OpeningKind {
 /// 모여 있어야 거울 변환을 한 번만 따지면 되기 때문이다 (아래 `frame` 참고).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Opening {
+    /// 이 문·창을 만든 Bimove 도형의 id. 엔티티 다섯이 이걸로 **한 덩어리**가
+    /// 된다 (`crate::identity`). 빈 문자열이면 심지 않는다.
+    pub id: String,
     /// 캔버스에서의 가운데.
     pub center: Vec2,
     /// 캔버스에서의 회전 (라디안). 벽 방향이다.
@@ -237,10 +240,18 @@ pub fn add_openings(drawing: &mut Drawing, openings: &[Opening]) -> usize {
 
     let mut n = 0;
     for o in openings.iter().filter(|o| usable(o)) {
+        // 하나가 엔티티 다섯이 된다. 넣기 전의 길이를 재 두었다가 넣은 뒤에
+        // 그 범위를 한 번에 찍는다 — 그래야 다섯이 같은 문이 된다.
+        let from = drawing.model.len();
         match o.kind {
             OpeningKind::Door(sw) => door(drawing, o, sw),
             OpeningKind::Window => window(drawing, o),
         }
+        let kind = match o.kind {
+            OpeningKind::Door(_) => crate::identity::DOOR,
+            OpeningKind::Window => crate::identity::WINDOW,
+        };
+        crate::identity::stamp_one(drawing, from, kind, &o.id);
         n += 1;
     }
     n
@@ -252,6 +263,7 @@ mod tests {
 
     fn door_at(x: f64, y: f64, rot: f64, side: f64, flipped: bool) -> Opening {
         Opening {
+            id: String::new(),
             center: Vec2::new(x, y),
             rotation: rot,
             width: 80.0,
@@ -263,6 +275,7 @@ mod tests {
 
     fn win_at(x: f64, y: f64, rot: f64) -> Opening {
         Opening {
+            id: String::new(),
             center: Vec2::new(x, y),
             rotation: rot,
             width: 60.0,
@@ -532,5 +545,60 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(d.model.iter().filter(|e| matches!(e.kind, EntityKind::Wipeout(_))).count(), 3);
         assert_eq!(arcs(&d).len(), 2);
+    }
+
+    #[test]
+    fn 문_하나의_엔티티들이_한_덩어리가_된다() {
+        // 여기가 요점이다. 다섯 엔티티가 같은 id 를 들어야 "문짝 선 하나만
+        // 지워지는" 일이 없어진다.
+        let mut d = Drawing::new_metric();
+        let mut door = door_at(0.0, 0.0, 0.0, 1.0, false);
+        door.id = "shape:door1".into();
+        add_openings(&mut d, &[door]);
+
+        let got: Vec<_> = d.model.iter().map(|e| crate::identity::of(e)).collect();
+        assert!(got.len() >= 5, "엔티티가 {}개뿐이다", got.len());
+        for (i, g) in got.iter().enumerate() {
+            let g = g.as_ref().unwrap_or_else(|| panic!("{i}번째 엔티티에 정체성이 없다"));
+            assert_eq!(g.kind, crate::identity::DOOR);
+            assert_eq!(g.ids, vec!["shape:door1"]);
+        }
+    }
+
+    #[test]
+    fn 문과_창이_섞여도_서로_안_물린다() {
+        // 범위를 잘못 재면 창의 가림막이 앞 문의 것으로 찍힌다 — 창을
+        // 고르면 문이 같이 지워진다.
+        let mut d = Drawing::new_metric();
+        let mut door = door_at(0.0, 0.0, 0.0, 1.0, false);
+        door.id = "shape:d".into();
+        let mut win = win_at(200.0, 0.0, 0.0);
+        win.id = "shape:w".into();
+        add_openings(&mut d, &[door, win]);
+
+        let mut doors = 0;
+        let mut wins = 0;
+        for e in d.model.iter() {
+            match crate::identity::of(e).expect("정체성이 없다") {
+                g if g.ids == vec!["shape:d".to_string()] => {
+                    assert_eq!(g.kind, crate::identity::DOOR);
+                    doors += 1;
+                }
+                g => {
+                    assert_eq!(g.ids, vec!["shape:w".to_string()]);
+                    assert_eq!(g.kind, crate::identity::WINDOW);
+                    wins += 1;
+                }
+            }
+        }
+        assert_eq!(doors, 5, "문은 가림 + 잼브 둘 + 문짝 + 호 다섯이다");
+        assert_eq!(wins, 5, "창은 가림 + 잼브 둘 + 유리 둘 다섯이다");
+    }
+
+    #[test]
+    fn 출처_없는_문에는_안_붙인다() {
+        let mut d = Drawing::new_metric();
+        add_openings(&mut d, &[door_at(0.0, 0.0, 0.0, 1.0, false)]);
+        assert!(d.model.iter().all(|e| crate::identity::of(e).is_none()));
     }
 }

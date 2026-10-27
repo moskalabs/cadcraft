@@ -12,6 +12,7 @@
 pub mod bimove;
 pub mod boq;
 pub mod dim;
+pub mod identity;
 pub mod jsnum;
 pub mod opening;
 pub mod wall;
@@ -429,6 +430,37 @@ impl Doc {
         } else {
             Space::Paper(layout.to_string())
         }
+    }
+
+    /// 이 엔티티와 **같은 Bimove 객체**인 엔티티들의 손잡이 (그리는 차례로).
+    ///
+    /// 문 하나는 엔티티 다섯이다. 하나를 찍었을 때 나머지 넷을 찾는 길이
+    /// 이것이다 — 안 그러면 문짝 선 하나만 골라 지울 수 있다.
+    ///
+    /// **정체성이 없으면 빈 배열이다.** 찍은 것을 그대로 돌려주지 않는다.
+    /// 그러면 부르는 쪽이 "묶음이 있다" 와 "그냥 선 하나다" 를 구분할 수
+    /// 없고, 그 둘은 화면에서 다르게 다뤄야 한다 ([[identity]] 참고).
+    ///
+    /// 훑기를 여기서 하는 이유는 양이다. 3,500 개 엔티티의 xdata 를 JSON 으로
+    /// 경계 밖으로 내보내면 클릭마다 몇 MB 가 오간다.
+    fn group(&self, handle_hex: &str) -> Vec<String> {
+        let Some(h) = cadcraft_doc::Handle::parse_hex(handle_hex) else { return Vec::new() };
+        let d = self.drawing();
+        let Some(me) = d.model.get(h).and_then(|e| crate::identity::of(e)) else {
+            return Vec::new();
+        };
+        let mine: std::collections::BTreeSet<&str> = me.ids.iter().map(String::as_str).collect();
+        d.model
+            .iter()
+            // 종류까지 본다. 같은 Bimove 도형 id 를 다른 종류가 들 일은 없지만,
+            // 그 전제가 깨지는 날 벽과 문이 한 묶음이 되는 쪽보다 안 묶이는
+            // 쪽이 낫다.
+            .filter(|e| {
+                crate::identity::of(e)
+                    .is_some_and(|g| g.kind == me.kind && g.ids.iter().any(|i| mine.contains(i.as_str())))
+            })
+            .map(|e| e.handle.hex())
+            .collect()
     }
 
     /// 한 점을 찍어 엔티티를 고른다. 없으면 None.
@@ -867,6 +899,14 @@ impl BimoveDoc {
     /// 한 점을 찍어 엔티티를 고른다. `aperture` 는 **도면 단위** (픽셀 ÷ 줌).
     pub fn pick(&self, layout: &str, x: f64, y: f64, aperture: f64) -> Option<String> {
         self.0.pick(layout, x, y, aperture)
+    }
+
+    /// 이 엔티티와 같은 Bimove 객체(문·창·벽·공간…)인 손잡이들. 없으면 빈 배열.
+    ///
+    /// `pick` 으로 하나를 집은 다음 이걸로 묶음을 펼친다. 자세한 건
+    /// `Doc::group` 주석에.
+    pub fn group(&self, handle: &str) -> Vec<String> {
+        self.0.group(handle)
     }
 
     /// 사각형 선택. `crossing` = 걸치기만 해도 잡기 (오→왼 드래그).
@@ -2455,6 +2495,129 @@ mod tests {
             "DXF 를 건너니 칠해진 양이 {:.0}% → {:.0}% 로 늘었다 — 벽 두께가 면으로 칠해진 것이다",
             direct * 100.0, round * 100.0,
         );
+    }
+
+    /// 도면에 있는 모든 엔티티의 `BIMOVE` 정체성. `kind` 별로 id 를 모은다.
+    ///
+    /// 손잡이를 짚어 가며 읽지 않는 이유는, 문 하나가 엔티티 다섯이고 그 중
+    /// 어느 것이 몇 번째인지는 이 테스트가 알 바가 아니기 때문이다. **전부**
+    /// 훑어서 결과만 본다.
+    fn identities(doc: &mut Doc) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        run(doc, "selectall", "{}");
+        let v = run(doc, "xdata", "{}");
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+        for o in v["objects"].as_array().expect("objects 가 없다") {
+            let d = &o["data"];
+            let Some(kind) = d["kind"].as_str() else { continue };
+            let Some(ids) = d["ids"].as_array() else { continue };
+            let e = out.entry(kind.to_string()).or_default();
+            for id in ids.iter().filter_map(|x| x.as_str()) {
+                e.insert(id.to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bimove_도형의_정체성이_엔티티에_붙는다() {
+        // 여기가 "객체 정체성" 의 핵심이다. 문 하나는 엔티티 다섯, 공간
+        // 하나는 면·테두리·글자로 흩어지고 벽은 거꾸로 여럿이 하나로 묶인다.
+        // 그 조각들이 어느 Bimove 도형의 것인지가 **도면 안에** 있어야 한다 —
+        // 없으면 문짝 선 하나만 골라 지울 수 있고, 물량표가 "문 1개" 를
+        // 되짚을 길이 없다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let got = identities(&mut doc);
+
+        for (kind, id) in [("wall", "shape:w"), ("door", "shape:d"), ("dim", "shape:m"), ("zone", "shape:z"), ("boq", "shape:t")] {
+            let ids = got.get(kind).unwrap_or_else(|| panic!("{kind} 의 정체성이 아예 없다: {got:?}"));
+            assert!(ids.contains(id), "{kind} 에 {id} 가 없다: {ids:?}");
+        }
+    }
+
+    #[test]
+    fn 정체성이_dxf_를_건너도_살아남는다() {
+        // 메모리에서만 들고 있으면 저장하는 순간 문이 선 다섯으로 흩어진다.
+        // xdata 를 고른 이유가 이것이다 — 객체에 붙어 파일까지 나간다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let before = identities(&mut doc);
+        assert!(!before.is_empty(), "들어가기도 전에 비었다");
+
+        let dxf = doc.to_dxf();
+        let mut again = Doc::open(dxf.as_bytes()).expect("쓴 DXF 를 다시 못 읽었다");
+        let after = identities(&mut again);
+
+        assert_eq!(after, before, "DXF 를 건너며 정체성이 달라졌다");
+    }
+
+    #[test]
+    fn 문의_조각_다섯이_같은_덩어리다() {
+        // 조각 하나를 집으면 나머지 넷을 찾을 수 있어야 한다. 그 길이 이것이다:
+        // 정체성이 같은 엔티티를 모은다.
+        let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        run(&mut doc, "selectall", "{}");
+        let v = run(&mut doc, "xdata", "{}");
+
+        let door: Vec<&serde_json::Value> = v["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["data"]["kind"] == "door")
+            .collect();
+        assert_eq!(door.len(), 5, "문의 조각이 {}개다 — 가림 + 잼브 둘 + 문짝 + 호 다섯이어야 한다", door.len());
+        for o in &door {
+            assert_eq!(o["data"]["ids"], serde_json::json!(["shape:d"]));
+        }
+    }
+
+    /// `bimove_json()` 의 문에서 **문만 있는** 자리 (엔진 좌표).
+    ///
+    /// 문은 캔버스 (50,60) 에 폭 40 · 두께 20 으로 서 있다. y 가 뒤집히므로
+    /// 엔진에서 잼브는 x = 30 과 70, y = -70..-50 이다. 그 중 y = -65 를
+    /// 고른 이유는 **공간 테두리를 피하려는 것**이다 — 공간이 y = -60 을 따라
+    /// 지나가고 문보다 **나중에** 그려져서, y = -60 을 찍으면 공간이 잡힌다.
+    /// (그걸로 처음에 테스트가 떨어졌다. `group` 은 맞게 돌고 있었다.)
+    const DOOR_PIECE: (f64, f64) = (30.0, -65.0);
+
+    #[test]
+    fn 문의_한_조각을_찍으면_다섯이_다_잡힌다() {
+        // 화면이 하는 일 그대로다: `pick` 으로 하나 집고 `group` 으로 펼친다.
+        // 이게 "문짝 선 하나만 지워진다" 를 끝내는 길이다.
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+
+        let h = doc.pick("", DOOR_PIECE.0, DOOR_PIECE.1, 1.0).expect("문 조각을 못 집었다");
+        let g = doc.group(&h);
+        assert_eq!(g.len(), 5, "묶음이 {}개다 — 가림 + 잼브 둘 + 문짝 + 호 다섯이어야 한다: {g:?}", g.len());
+        assert!(g.contains(&h), "찍은 것이 묶음에 없다");
+    }
+
+    #[test]
+    fn 정체성_없는_선은_묶음이_없다() {
+        // DXF 에서 그냥 열은 도면이다. 빈 배열이어야 부르는 쪽이 "묶음 없음"
+        // 과 "혼자인 객체" 를 구분할 수 있다.
+        let doc = Doc::open(&one_line_dxf()).unwrap();
+        // 선은 (0,0)→(100,50) 이다. 가운데를 집는다.
+        let h = doc.pick("", 50.0, 25.0, 10.0).expect("선을 못 집었다");
+        assert!(doc.group(&h).is_empty(), "정체성 없는 선에 묶음이 생겼다");
+    }
+
+    #[test]
+    fn 없는_손잡이에는_빈_묶음() {
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        assert!(doc.group("ffffff").is_empty());
+        assert!(doc.group("zzz").is_empty(), "16진수가 아닌 것에 터지지 않아야 한다");
+    }
+
+    #[test]
+    fn 묶음이_dxf_를_건너도_그대로다() {
+        let doc = Doc::from_bimove(&bimove_json(), "").unwrap();
+        let before = doc.pick("", DOOR_PIECE.0, DOOR_PIECE.1, 1.0).map(|h| doc.group(&h).len());
+
+        let dxf = doc.to_dxf();
+        let again = Doc::open(dxf.as_bytes()).expect("쓴 DXF 를 다시 못 읽었다");
+        let h = again
+            .pick("", DOOR_PIECE.0, DOOR_PIECE.1, 1.0)
+            .expect("다시 읽은 도면에 문 조각이 없다");
+        assert_eq!(Some(again.group(&h).len()), before, "DXF 를 건너며 묶음 크기가 달라졌다");
     }
 
     #[test]

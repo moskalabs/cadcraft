@@ -19,7 +19,7 @@ use super::*;
 use crate::{Result, Session};
 
 /// Where Bimove (and anything else that does not name an application) puts its data.
-const DEFAULT_APP: &str = "BIMOVE";
+pub const DEFAULT_APP: &str = "BIMOVE";
 
 /// A `1000` group holds 255 bytes at most.
 const CHUNK: usize = 255;
@@ -62,7 +62,7 @@ fn read(tags: &[RawTag], app: &str) -> Option<String> {
 }
 
 /// `app`'s run replaced by `tags` (or removed, when empty). Other applications keep their place.
-fn splice(old: &[RawTag], app: &str, tags: Vec<RawTag>) -> Vec<RawTag> {
+pub fn splice(old: &[RawTag], app: &str, tags: Vec<RawTag>) -> Vec<RawTag> {
     let mut out = Vec::with_capacity(old.len() + tags.len());
     let mut i = 0;
     while i < old.len() {
@@ -104,6 +104,32 @@ fn chunks(text: &str) -> Vec<RawTag> {
     out
 }
 
+/// `data` as `app`'s whole run of groups, ready to [`splice`] in.
+///
+/// Public because not every producer goes through a command. Code that assembles a [`Drawing`]
+/// in one pass — a converter from another program's format — has no handles to name yet and so
+/// cannot call `xdata.set`. It still has to write the **same bytes**, or what it stores will not
+/// be what `xdata` reads back.
+///
+/// [`Drawing`]: cadcraft_doc::Drawing
+pub fn encode(app: &str, data: &Value) -> Vec<RawTag> {
+    if data.is_null() {
+        return Vec::new();
+    }
+    let mut v = vec![RawTag { code: APP_CODE, value: app.to_string() }];
+    // `to_string` on a `Value` cannot fail — the value is already parsed JSON.
+    v.extend(chunks(&data.to_string()));
+    v
+}
+
+/// `app`'s run read back as JSON, or `None` where the object has none.
+///
+/// Text that is not JSON is another application's, or ours from before a format change. It comes
+/// back as a string rather than being dropped.
+pub fn decode(tags: &[RawTag], app: &str) -> Option<Value> {
+    read(tags, app).map(|t| serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t)))
+}
+
 fn run_get(s: &mut Session, p: &Value) -> Result<Value> {
     let app = app_of(p)?;
     let hs = targets(s, p)?;
@@ -112,11 +138,7 @@ fn run_get(s: &mut Session, p: &Value) -> Result<Value> {
         .iter()
         .filter_map(|h| d.entity(*h).map(|e| (h, e)))
         .map(|(h, e)| {
-            // Text that is not JSON is another application's, or ours from before a format
-            // change. Hand it back as a string rather than dropping it.
-            let data = read(&e.common.xdata, &app)
-                .map(|t| serde_json::from_str::<Value>(&t).unwrap_or(Value::String(t)))
-                .unwrap_or(Value::Null);
+            let data = decode(&e.common.xdata, &app).unwrap_or(Value::Null);
             json!({ "handle": h.hex(), "data": data })
         })
         .collect();
@@ -135,14 +157,7 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("xdata.set: `data` is required (use null to remove)".into()));
     };
 
-    let tags = if data.is_null() {
-        Vec::new()
-    } else {
-        let text = serde_json::to_string(data).map_err(|e| EngineError::Other(format!("xdata.set: {e}")))?;
-        let mut v = vec![RawTag { code: APP_CODE, value: app.clone() }];
-        v.extend(chunks(&text));
-        v
-    };
+    let tags = encode(&app, data);
 
     let d = s.doc_mut()?;
     // `modify_entity` already refuses a handle that is not there, so its result is the count —

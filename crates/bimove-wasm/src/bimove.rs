@@ -501,6 +501,7 @@ fn wall_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<WallSeg> 
 
     let hex = |key: &str| meta.and_then(|m| s(m, key)).and_then(Rgb::parse_hex);
     Some(WallSeg {
+        id: s(sh, "id").unwrap_or("").to_string(),
         a: Vec2::new(gx, -gy),
         b: Vec2::new(ex, -ey),
         thickness,
@@ -532,6 +533,7 @@ fn opening_of(sh: &Value, props: &Value, meta: Option<&Value>, kind: &str) -> Op
     let thickness = f(props, "thickness", 0.0);
     let center = Vec2::new(f(sh, "x", 0.0), f(sh, "y", 0.0));
     let o = Opening {
+        id: s(sh, "id").unwrap_or("").to_string(),
         center,
         rotation: f(sh, "rotation", 0.0),
         width,
@@ -564,6 +566,7 @@ fn dim_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<DimSeg> {
     let (gx, gy) = (f(sh, "x", 0.0), f(sh, "y", 0.0));
     let (x2, y2) = (f(props, "x2", 0.0), f(props, "y2", 0.0));
     let d = DimSeg {
+        id: s(sh, "id").unwrap_or("").to_string(),
         a: Vec2::new(gx, gy),
         b: Vec2::new(gx + x2, gy + y2),
         offset: f(props, "offset", 0.0),
@@ -593,6 +596,7 @@ fn zone_of(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<Zone> {
         .collect();
 
     let z = Zone {
+        id: s(sh, "id").unwrap_or("").to_string(),
         points,
         label: s(props, "label").unwrap_or("").to_string(),
         area_m2: f(props, "areaM2", 0.0),
@@ -631,6 +635,7 @@ fn boq_table(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<BoqTable
         .collect();
 
     let t = BoqTable {
+        id: s(sh, "id").unwrap_or("").to_string(),
         at: Vec2::new(f(sh, "x", 0.0), f(sh, "y", 0.0)),
         title: s(props, "title").unwrap_or("마감재 물량 산출표").to_string(),
         rows,

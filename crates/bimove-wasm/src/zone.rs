@@ -48,6 +48,9 @@ use crate::jsnum::to_fixed;
 /// 공간 하나. 좌표는 **캔버스** 것이다 — y 뒤집기는 이 안에서 한다.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
+    /// 이 공간을 만든 Bimove 도형의 id. 면·테두리·이름·면적 글자가 이걸로
+    /// **한 덩어리**가 된다 (`crate::identity`). 빈 문자열이면 심지 않는다.
+    pub id: String,
     /// 닫힌 폴리곤. 첫 점을 끝에 되풀이하지 않는다.
     pub points: Vec<Vec2>,
     /// 공간 이름. 비어 있으면 "미지정" 으로 띄운다 (화면과 같다).
@@ -212,7 +215,11 @@ pub fn add_zones(drawing: &mut Drawing, zones: &[Zone]) -> usize {
 
     let mut n = 0;
     for z in zones.iter().filter(|z| usable(z)) {
+        // 하나가 면 + 테두리 + 글자 둘로 흩어진다. 넣은 범위를 한 번에 찍어
+        // 같은 공간으로 묶는다.
+        let from = drawing.model.len();
         one(drawing, z);
+        crate::identity::stamp_one(drawing, from, crate::identity::ZONE, &z.id);
         n += 1;
     }
     n
@@ -224,6 +231,7 @@ mod tests {
 
     fn square(label: &str, area: f64) -> Zone {
         Zone {
+            id: String::new(),
             points: vec![
                 Vec2::new(0.0, 0.0),
                 Vec2::new(100.0, 0.0),
@@ -437,5 +445,50 @@ mod tests {
         assert_eq!(add_zones(&mut d, &[square("거실", 8.0), b]), 2);
         assert_eq!(d.model.iter().filter(|e| matches!(e.kind, EntityKind::Hatch(_))).count(), 2);
         assert_eq!(texts(&d).len(), 4);
+    }
+
+    #[test]
+    fn 공간_하나의_조각들이_한_덩어리가_된다() {
+        // 면·테두리·이름·면적 글자가 같은 id 를 들어야 "공간" 이라는 것이
+        // 도면 안에 있는 것이다.
+        let mut d = Drawing::new_metric();
+        let mut z = square("거실", 8.0);
+        z.id = "shape:zone1".into();
+        add_zones(&mut d, &[z]);
+
+        assert!(d.model.len() >= 3, "엔티티가 {}개뿐이다", d.model.len());
+        for (i, e) in d.model.iter().enumerate() {
+            let g = crate::identity::of(e).unwrap_or_else(|| panic!("{i}번째에 정체성이 없다"));
+            assert_eq!(g.kind, crate::identity::ZONE);
+            assert_eq!(g.ids, vec!["shape:zone1"]);
+        }
+    }
+
+    #[test]
+    fn 두_공간이_서로_안_물린다() {
+        let mut d = Drawing::new_metric();
+        let mut a = square("거실", 8.0);
+        a.id = "shape:a".into();
+        let mut b = square("주방", 5.0);
+        b.id = "shape:b".into();
+        b.points = b.points.iter().map(|p| *p + Vec2::new(200.0, 0.0)).collect();
+        add_zones(&mut d, &[a, b]);
+
+        let ids: Vec<_> = d
+            .model
+            .iter()
+            .map(|e| crate::identity::of(e).expect("정체성이 없다").ids)
+            .collect();
+        let n_a = ids.iter().filter(|x| *x == &vec!["shape:a".to_string()]).count();
+        let n_b = ids.iter().filter(|x| *x == &vec!["shape:b".to_string()]).count();
+        assert_eq!(n_a, n_b, "조각 수가 다르다 — 범위가 어긋났다: {ids:?}");
+        assert_eq!(n_a + n_b, ids.len());
+    }
+
+    #[test]
+    fn 출처_없는_공간에는_안_붙인다() {
+        let mut d = Drawing::new_metric();
+        add_zones(&mut d, &[square("거실", 8.0)]);
+        assert!(d.model.iter().all(|e| crate::identity::of(e).is_none()));
     }
 }

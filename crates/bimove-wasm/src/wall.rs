@@ -35,6 +35,9 @@ use std::collections::HashMap;
 /// 벽 하나 (중심선 선분). 좌표는 **엔진** 것이다 — 페이지 변환과 y 뒤집기가 끝난 값.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WallSeg {
+    /// 이 벽을 만든 Bimove 도형의 id. `crate::identity` 가 엔티티에 심는다.
+    /// 빈 문자열이면 심지 않는다 — 그려 넣은 벽처럼 출처가 없는 경우다.
+    pub id: String,
     pub a: Vec2,
     pub b: Vec2,
     pub thickness: f64,
@@ -59,6 +62,11 @@ fn join_r(thickness: f64) -> f64 {
 /// 한 MLINE 이 될 벽 줄기.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WallChain {
+    /// 이 줄기로 묶인 벽들의 Bimove 도형 id — **묶인 차례대로**.
+    ///
+    /// 한 줄기가 MLINE 하나가 되므로 그 엔티티는 도형 여럿의 것이다. 하나만
+    /// 적으면 나머지는 물량에서 빠지고, 그 벽을 골라도 아무것도 안 잡힌다.
+    pub ids: Vec<String>,
     /// 중심선 꼭짓점. `closed` 면 마지막 점을 되풀이하지 않는다.
     pub pts: Vec<Vec2>,
     pub closed: bool,
@@ -162,6 +170,9 @@ fn chain_group(walls: &[WallSeg], idx: &[usize]) -> Vec<WallChain> {
 
         // 중심선을 양쪽으로 늘려 간다.
         let mut pts = vec![w0.a, w0.b];
+        // id 도 점과 같은 쪽으로 쌓는다 — 뒤로 뻗을 때는 앞에 끼워 넣는다.
+        // 그래야 `ids` 의 차례가 중심선을 따라간다.
+        let mut ids = vec![w0.id.clone()];
         let mut closed = false;
 
         // ── 앞으로 (pts 의 끝에서) ──
@@ -185,6 +196,7 @@ fn chain_group(walls: &[WallSeg], idx: &[usize]) -> Vec<WallChain> {
             used[slot[&j]] = true;
             // 붙은 쪽 **반대** 끝을 잇는다.
             pts.push(if same(nw.a, tip, r) { nw.b } else { nw.a });
+            ids.push(nw.id.clone());
         }
 
         // ── 뒤로 (pts 의 앞에서) ──
@@ -199,6 +211,7 @@ fn chain_group(walls: &[WallSeg], idx: &[usize]) -> Vec<WallChain> {
                 let nw = &walls[j];
                 used[slot[&j]] = true;
                 pts.insert(0, if same(nw.a, tip, r) { nw.b } else { nw.a });
+                ids.insert(0, nw.id.clone());
             }
         }
 
@@ -209,6 +222,8 @@ fn chain_group(walls: &[WallSeg], idx: &[usize]) -> Vec<WallChain> {
             closed || ends_everywhere(walls, *pts.last().expect("점이 있다"), r) == 1;
 
         out.push(WallChain {
+            // 출처 없는 벽(그려 넣은 것)은 빈 문자열이다 — 심을 게 없다.
+            ids: ids.into_iter().filter(|s| !s.is_empty()).collect(),
             pts,
             closed,
             free_start,
@@ -348,7 +363,9 @@ pub fn add_walls(drawing: &mut Drawing, walls: &[WallSeg]) -> usize {
         let mut e = Entity::new(h, EntityKind::MLine(mline_for(c)));
         e.common.layer = c.layer.clone();
         e.common.color = c.color;
+        let from = drawing.model.len();
         drawing.model.push(e);
+        crate::identity::stamp(drawing, from, crate::identity::WALL, &c.ids);
         n += 1;
     }
     n
@@ -359,7 +376,12 @@ mod tests {
     use super::*;
 
     fn seg(ax: f64, ay: f64, bx: f64, by: f64, t: f64) -> WallSeg {
+        seg_id("", ax, ay, bx, by, t)
+    }
+
+    fn seg_id(id: &str, ax: f64, ay: f64, bx: f64, by: f64, t: f64) -> WallSeg {
         WallSeg {
+            id: id.into(),
             a: Vec2::new(ax, ay),
             b: Vec2::new(bx, by),
             thickness: t,
@@ -565,5 +587,55 @@ mod tests {
         let c = chain_walls(&w);
         assert_eq!(c.len(), 1, "{c:?}");
         assert_eq!(c[0].pts.len(), 11);
+    }
+
+    #[test]
+    fn 묶인_줄기는_모든_도형의_id_를_든다() {
+        // 벽 셋이 MLINE 하나가 된다. 하나만 들고 가면 나머지 둘은 골라도
+        // 안 잡히고 물량에서도 빠진다.
+        let w = vec![
+            seg_id("shape:a", 0.0, 0.0, 100.0, 0.0, 10.0),
+            seg_id("shape:b", 100.0, 0.0, 100.0, 100.0, 10.0),
+            seg_id("shape:c", 100.0, 100.0, 200.0, 100.0, 10.0),
+        ];
+        let c = chain_walls(&w);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].ids, vec!["shape:a", "shape:b", "shape:c"]);
+    }
+
+    #[test]
+    fn 거꾸로_들어와도_id_가_중심선을_따라간다() {
+        // 뒤로 뻗는 쪽으로 묶이는 경우다. 끝에 붙이면 차례가 뒤집혀서
+        // "세 번째 벽" 이 가운데 것을 가리킨다.
+        let w = vec![
+            seg_id("shape:b", 100.0, 0.0, 100.0, 100.0, 10.0),
+            seg_id("shape:a", 0.0, 0.0, 100.0, 0.0, 10.0),
+        ];
+        let c = chain_walls(&w);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].ids, vec!["shape:a", "shape:b"], "중심선 차례가 아니다: {:?}", c[0].pts);
+    }
+
+    #[test]
+    fn 묶인_mline_에_정체성이_붙는다() {
+        let w = vec![
+            seg_id("shape:a", 0.0, 0.0, 100.0, 0.0, 10.0),
+            seg_id("shape:b", 100.0, 0.0, 100.0, 100.0, 10.0),
+        ];
+        let mut d = Drawing::default();
+        assert_eq!(add_walls(&mut d, &w), 1);
+        let got = crate::identity::of(d.model.iter().next().expect("MLINE 이 없다"))
+            .expect("MLINE 에 정체성이 없다");
+        assert_eq!(got.kind, crate::identity::WALL);
+        assert_eq!(got.ids, vec!["shape:a", "shape:b"]);
+    }
+
+    #[test]
+    fn 출처_없는_벽에는_안_붙인다() {
+        // 화면에서 그려 넣은 벽은 Bimove 도형이 아니다. 빈 id 를 심으면
+        // 읽는 쪽이 빈 묶음을 고른다.
+        let mut d = Drawing::default();
+        add_walls(&mut d, &[seg(0.0, 0.0, 100.0, 0.0, 10.0)]);
+        assert_eq!(crate::identity::of(d.model.iter().next().unwrap()), None);
     }
 }

@@ -43,6 +43,9 @@ use cadcraft_geom::{Vec2, Vec3};
 /// 치수 하나. 좌표는 **캔버스** 것이다 — y 뒤집기는 이 안에서 한다.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DimSeg {
+    /// 이 치수를 만든 Bimove 도형의 id (`crate::identity`). 치수는 엔티티
+    /// 하나지만, 글자를 옮겨도 그게 **이** 치수의 것이어야 한다.
+    pub id: String,
     /// 재는 두 점 (캔버스).
     pub a: Vec2,
     pub b: Vec2,
@@ -247,7 +250,9 @@ pub fn add_dims(drawing: &mut Drawing, dims: &[DimSeg], scale: &DimScale) -> usi
         e.common.layer = d.layer.clone();
         // 색은 스타일이 쥐고 있다 (DIMCLRD/E/T). 엔티티 색까지 박으면 둘이 싸운다
         e.common.color = Color::ByLayer;
+        let from = drawing.model.len();
         drawing.model.push(e);
+        crate::identity::stamp_one(drawing, from, crate::identity::DIM, &d.id);
         n += 1;
     }
     n
@@ -259,7 +264,7 @@ mod tests {
     use serde_json::json;
 
     fn seg(ax: f64, ay: f64, bx: f64, by: f64, offset: f64) -> DimSeg {
-        DimSeg { a: Vec2::new(ax, ay), b: Vec2::new(bx, by), offset, layer: "A-DIM".into() }
+        DimSeg { id: String::new(), a: Vec2::new(ax, ay), b: Vec2::new(bx, by), offset, layer: "A-DIM".into() }
     }
 
     fn dims(d: &Drawing) -> Vec<Dimension> {
@@ -473,5 +478,25 @@ mod tests {
         );
         assert_eq!(n, 2);
         assert_eq!(dims(&d).len(), 2);
+    }
+
+    #[test]
+    fn 치수에_정체성이_붙는다() {
+        let mut d = Drawing::new_metric();
+        let mut x = seg(0.0, 0.0, 200.0, 0.0, 60.0);
+        x.id = "shape:dim1".into();
+        add_dims(&mut d, &[x], &DimScale::default());
+
+        let g = crate::identity::of(d.model.iter().next().expect("치수가 없다"))
+            .expect("치수에 정체성이 없다");
+        assert_eq!(g.kind, crate::identity::DIM);
+        assert_eq!(g.ids, vec!["shape:dim1"]);
+    }
+
+    #[test]
+    fn 출처_없는_치수에는_안_붙인다() {
+        let mut d = Drawing::new_metric();
+        add_dims(&mut d, &[seg(0.0, 0.0, 200.0, 0.0, 60.0)], &DimScale::default());
+        assert!(d.model.iter().all(|e| crate::identity::of(e).is_none()));
     }
 }
