@@ -7,7 +7,11 @@
 //!
 //! 공간은 벽·가구 **위에** 깔린다 (`lib/zoneStyle.ts`). 진하게 칠하면 그 밑이
 //! 안 보여서 어디를 집었는지도, 그 안에 뭐가 있는지도 못 본다. 그래서 알파가
-//! 낮다 — 면 `0.16`, 테두리 `0.55`.
+//! 낮다 — 면 `0.10`, 테두리 `0.55`.
+//!
+//! 면은 0.16 에서 내렸다 (2026-10-27). **이게 바닥이다** — 엔진 투명도는 90%
+//! 까지만 받으므로 `0.10` 이 그대로 90% 로 떨어진다. 화면 쪽(`zoneStyle.ts`)을
+//! 더 내리면 여기가 못 따라가서 두 그림이 갈린다.
 //!
 //! 엔진에는 그 자리가 있다: `Common::transparency`. 다만 렌더 옵션
 //! `Options::transparency` 가 **꺼져 있으면 무시된다** (AutoCAD 의
@@ -81,7 +85,7 @@ const AREA_HEIGHT: f64 = 11.0;
 const LABEL_RISE: f64 = 6.0;
 const AREA_DROP: f64 = 12.0;
 
-/// 알파를 DXF 투명도(%)로. `0.16` → 84%.
+/// 알파를 DXF 투명도(%)로. `0.10` → 90%.
 ///
 /// 엔진은 90% 까지만 받는다 (그 위는 아예 안 보이는 것과 같아서 클램프된다).
 fn transparency_of(alpha: f64) -> Transparency {
@@ -171,7 +175,7 @@ fn one(drawing: &mut Drawing, z: &Zone) {
     );
     fill.common.layer = z.layer.clone();
     fill.common.color = Color::True(WASH);
-    fill.common.transparency = transparency_of(0.16);
+    fill.common.transparency = transparency_of(0.10);
     drawing.model.push(fill);
 
     // 2. 테두리 — 점선. 닫은 폴리라인이라 첫 점을 끝에 되풀이하지 않는다
@@ -291,7 +295,7 @@ mod tests {
         let mut d = Drawing::new_metric();
         add_zones(&mut d, &[square("거실", 8.0)]);
         let fill = d.model.iter().next().expect("엔티티가 없다");
-        assert_eq!(fill.common.transparency, Transparency::Percent(84));
+        assert_eq!(fill.common.transparency, Transparency::Percent(90));
         let edge = d.model.iter().nth(1).expect("테두리가 없다");
         assert_eq!(edge.common.transparency, Transparency::Percent(45));
     }
