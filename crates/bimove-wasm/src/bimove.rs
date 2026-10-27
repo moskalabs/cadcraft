@@ -47,7 +47,7 @@ use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::library::PatternLine;
 use cadcraft_doc::{Drawing, Entity, EntityKind, Hatch, HatchLoop, Line, LwPolyline, MText};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::boq::{self, BoqRow, BoqTable};
@@ -640,6 +640,74 @@ fn boq_table(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<BoqTable
     boq::usable(&t).then_some(t)
 }
 
+/// 도형 하나가 **어느 페이지의 어디에** 놓이나.
+///
+/// 전엔 `parentId == 페이지` 만 읽었다. 그러면 **그룹 안에 든 것이 통째로
+/// 사라진다** — 그룹 자체는 "미지원" 으로 집계되지만 그 안의 벽·DXF·공간은
+/// 세지도 않고 조용히 빠졌다. 한의 도면 11 개에는 그룹이 없어서 아직 드러나지
+/// 않았을 뿐이다 (`hideUi` 라 Ctrl+G 가 없고, `dxfgroup` 은 이름만 그룹이고
+/// 담는 그릇이 아니다). 그릴 수 있게 되는 날 조용히 빠지면 안 된다.
+struct Place {
+    /// 사슬을 따라 올라가 만난 페이지. 빈 문자열이면 옛 저장본이다
+    /// (`parentId` 가 없던 때 — 페이지가 하나뿐이었다).
+    page: String,
+    /// 조상들이 **밀린 만큼**. 그룹 안이 아니면 0 이다.
+    dx: f64,
+    dy: f64,
+    /// 조상 중에 **돌아간 것**이 있나.
+    ///
+    /// 돌아간 그룹은 아직 못 읽는다. 자리만 미는 것으로는 안 되고, 벽의
+    /// `props.x2,y2` 나 공간의 점들처럼 **상대 좌표도 같이 돌려야** 하는데
+    /// 그건 읽는 쪽 다섯 군데를 다 고치는 일이다. 실제 도면에 하나도 없는
+    /// 것을 짐작으로 맞추기보다, 못 읽는다고 **말하는** 쪽을 고른다.
+    rotated: bool,
+}
+
+/// 도형마다 [`Place`]. 부모를 못 찾으면 `None` — 끊긴 사슬이다.
+///
+/// 사슬이 자기를 물면(저장본이 상했을 때) 멈춘다. 안 그러면 여기서 영원히 돈다.
+fn placements(shapes: &[Value], pages: &[(String, String)]) -> Vec<Option<Place>> {
+    let by_id: BTreeMap<&str, &Value> =
+        shapes.iter().filter_map(|sh| s(sh, "id").map(|id| (id, sh))).collect();
+    let is_page = |id: &str| pages.iter().any(|(p, _)| p == id);
+
+    shapes
+        .iter()
+        .map(|sh| {
+            let mut place = Place { page: String::new(), dx: 0.0, dy: 0.0, rotated: false };
+            let mut at = s(sh, "parentId").unwrap_or("");
+            // 사슬 길이는 도형 수를 넘을 수 없다 — 넘으면 고리가 있는 것이다.
+            for _ in 0..=shapes.len() {
+                if at.is_empty() || is_page(at) {
+                    place.page = at.to_string();
+                    return Some(place);
+                }
+                let parent = by_id.get(at)?;
+                place.dx += f(parent, "x", 0.0);
+                place.dy += f(parent, "y", 0.0);
+                if f(parent, "rotation", 0.0) != 0.0 {
+                    place.rotated = true;
+                }
+                at = s(parent, "parentId").unwrap_or("");
+            }
+            None
+        })
+        .collect()
+}
+
+/// 도형을 `dx,dy` 만큼 밀어 놓은 사본.
+///
+/// `x,y` 만 고친다. 돌아간 조상은 [`placements`] 에서 이미 걸러졌으므로,
+/// `props.x2,y2` 같은 **상대 좌표는 건드릴 것이 없다.**
+fn shifted_shape(sh: &Value, dx: f64, dy: f64) -> Value {
+    let mut out = sh.clone();
+    if let Some(m) = out.as_object_mut() {
+        m.insert("x".into(), json!(f(sh, "x", 0.0) + dx));
+        m.insert("y".into(), json!(f(sh, "y", 0.0) + dy));
+    }
+    out
+}
+
 pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, String> {
     let doc: Value =
         serde_json::from_str(json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
@@ -693,12 +761,36 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut boqs: Vec<BoqTable> = Vec::new();
     let mut boq_seen = 0usize;
 
-    for sh in &shapes {
-        let parent = s(sh, "parentId").unwrap_or("");
-        // parentId 가 빈 도형은 옛 저장본이다 (페이지가 하나뿐이었다).
-        if !want.is_empty() && !parent.is_empty() && parent != want {
+    // 그룹 안에 든 도형의 **자리**. 부모를 따라 올라가야 어느 페이지인지, 또
+    // 그룹이 얼마나 밀려 있는지 알 수 있다 (아래 `placements` 주석).
+    let places = placements(&shapes, &pages);
+    let mut rotated_group = 0usize;
+    let mut orphan = 0usize;
+
+    for (sh, place) in shapes.iter().zip(&places) {
+        let Some(place) = place else {
+            // 부모를 못 찾았다 — 끊긴 사슬이다. 어느 페이지 것인지 모르니
+            // 그릴 수가 없고, 조용히 빼면 아무도 모른다.
+            orphan += 1;
+            continue;
+        };
+        if !want.is_empty() && !place.page.is_empty() && place.page != want {
             continue;
         }
+        if place.rotated {
+            // **돌아간 그룹은 아직 못 읽는다.** 조용히 빼면 도면에서 벽이
+            // 사라진 걸 아무도 모른다 — 세어서 화면에 올린다.
+            rotated_group += 1;
+            continue;
+        }
+        // 그룹 안이면 그룹이 밀린 만큼 더해서 **페이지 좌표로** 만든다.
+        let shifted;
+        let sh: &Value = if place.dx == 0.0 && place.dy == 0.0 {
+            sh
+        } else {
+            shifted = shifted_shape(sh, place.dx, place.dy);
+            &shifted
+        };
         let kind = s(sh, "type").unwrap_or("");
         let props = sh.get("props").cloned().unwrap_or(Value::Null);
         let meta = sh.get("meta");
@@ -863,6 +955,13 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     }
 
     let mut notes = Vec::new();
+    if rotated_group > 0 {
+        // **돌아간 그룹.** 조용히 빼면 도면에서 벽이 사라진 걸 아무도 모른다.
+        notes.push(format!("돌아간 그룹 안의 도형 {rotated_group}개를 못 그렸다"));
+    }
+    if orphan > 0 {
+        notes.push(format!("부모를 못 찾은 도형 {orphan}개를 못 그렸다 (저장본이 상했다)"));
+    }
     if unknown_cmds > 0 {
         notes.push(format!("path 명령 {unknown_cmds}개를 못 읽었다 (M/L/Z 만 다룬다)"));
     }
@@ -1137,6 +1236,99 @@ mod tests {
         assert!(!all.contains("dimension"), "{all}");
         assert!(!all.contains("zone"), "{all}");
         assert!(!all.contains("boqtable"), "{all}");
+    }
+
+    // ── 그룹 안의 도형 ──
+
+    /// 그룹 하나와 그 안의 벽 하나. 그룹은 `group` 타입이고 자기 `x,y` 를 든다.
+    fn grouped(gx: f64, gy: f64, rot: f64) -> String {
+        format!(
+            r#"{{"id":"shape:g1","type":"group","x":{gx},"y":{gy},"rotation":{rot},"index":"a1",
+                "parentId":"page:main","props":{{}}}},
+               {{"id":"shape:w1","type":"wall","x":0,"y":0,"rotation":0,"index":"a2",
+                "parentId":"shape:g1","props":{{"x2":1000,"y2":0,"thickness":200}}}}"#
+        )
+    }
+
+    #[test]
+    fn 그룹_안의_벽도_읽는다() {
+        // 전엔 `parentId == 페이지` 만 읽어서 **통째로 사라졌다.** 그룹 자체는
+        // "미지원" 으로 집계되지만 그 안의 벽은 세지도 않았다 — 숫자만 보면
+        // 다 나온 것처럼 보였다.
+        let r = drawing_from_bimove(&doc_json(&grouped(0.0, 0.0, 0.0)), "").unwrap();
+        assert_eq!(r.wall_count, 1, "그룹 안의 벽을 못 읽었다: {:?}", r.notes);
+        assert_eq!(r.wall_mline_count, 1);
+    }
+
+    #[test]
+    fn 그룹이_밀린_만큼_자리가_간다() {
+        let r = drawing_from_bimove(&doc_json(&grouped(500.0, 300.0, 0.0)), "").unwrap();
+        assert_eq!(r.wall_count, 1);
+        // 벽은 (500,300) 에서 시작해 x 로 1000 간다. y 는 뒤집힌다 (-300).
+        let m = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MLine(m) => Some(m),
+                _ => None,
+            })
+            .expect("벽이 없다");
+        let v: Vec<_> = m.vertices.iter().map(|v| (v.p.x, v.p.y)).collect();
+        assert_eq!(v.len(), 2, "줄기가 둘이 아니다: {v:?}");
+        assert!((v[0].0 - 500.0).abs() < 1e-6, "시작 x 가 안 밀렸다: {v:?}");
+        assert!((v[0].1 + 300.0).abs() < 1e-6, "시작 y 가 안 밀렸다: {v:?}");
+        assert!((v[1].0 - 1500.0).abs() < 1e-6, "끝 x 가 안 밀렸다: {v:?}");
+    }
+
+    #[test]
+    fn 돌아간_그룹은_못_읽는다고_말한다() {
+        // 자리만 미는 것으로는 안 된다 — 벽의 `x2,y2` 같은 상대 좌표도 같이
+        // 돌려야 한다. 아직 안 한다. **조용히 빼지 않는 것**이 여기서 지킬 선이다.
+        let r = drawing_from_bimove(&doc_json(&grouped(0.0, 0.0, 0.5)), "").unwrap();
+        assert_eq!(r.wall_count, 0);
+        assert!(
+            r.notes.iter().any(|n| n.contains("돌아간 그룹")),
+            "돌아간 그룹을 말하지 않는다: {:?}",
+            r.notes,
+        );
+    }
+
+    #[test]
+    fn 다른_페이지의_그룹_안은_안_읽는다() {
+        // 페이지 가름은 **사슬을 따라 올라가** 정한다. 그룹이 끼면 `parentId` 는
+        // 페이지가 아니므로, 그것만 보면 어느 페이지 것인지 알 수가 없다.
+        let j = format!(
+            r#"{{"version":1,"pages":[{{"id":"page:a","name":"가","index":"a1"}},
+                                     {{"id":"page:b","name":"나","index":"a2"}}],
+                 "shapes":[
+                   {{"id":"shape:g","type":"group","x":0,"y":0,"rotation":0,"index":"a1",
+                     "parentId":"page:b","props":{{}}}},
+                   {{"id":"shape:w","type":"wall","x":0,"y":0,"rotation":0,"index":"a2",
+                     "parentId":"shape:g","props":{{"x2":1000,"y2":0,"thickness":200}}}}],
+                 "records":{{}},"skipped":0,
+                 "source":{{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":2}}}}"#
+        );
+        assert_eq!(drawing_from_bimove(&j, "page:a").unwrap().wall_count, 0);
+        assert_eq!(drawing_from_bimove(&j, "page:b").unwrap().wall_count, 1);
+    }
+
+    #[test]
+    fn 사슬이_고리면_멈춘다() {
+        // 저장본이 상해서 서로를 부모로 가리키면 **영원히 돈다.** 멈추고,
+        // 조용히 빼지 않는다.
+        let j = doc_json(
+            r#"{"id":"shape:a","type":"group","x":0,"y":0,"rotation":0,"index":"a1",
+                "parentId":"shape:b","props":{}},
+               {"id":"shape:b","type":"group","x":0,"y":0,"rotation":0,"index":"a2",
+                "parentId":"shape:a","props":{}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(
+            r.notes.iter().any(|n| n.contains("부모를 못 찾은")),
+            "끊긴 사슬을 말하지 않는다: {:?}",
+            r.notes,
+        );
     }
 
     // ── 벽체 ──
