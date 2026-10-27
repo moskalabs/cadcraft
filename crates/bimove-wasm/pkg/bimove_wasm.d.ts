@@ -50,6 +50,13 @@ export class BimoveDoc {
      */
     static fromBimove(json: string, page_id: string): BimoveDoc;
     /**
+     * 이 엔티티와 같은 Bimove 객체(문·창·벽·공간…)인 손잡이들. 없으면 빈 배열.
+     *
+     * `pick` 으로 하나를 집은 다음 이걸로 묶음을 펼친다. 자세한 건
+     * `Doc::group` 주석에.
+     */
+    group(handle: string): string[];
+    /**
      * Bimove 문서에서 만든 해치 개수.
      */
     hatchCount(): number;
@@ -227,6 +234,7 @@ export interface InitOutput {
     readonly bimovedoc_dimCount: (a: number) => number;
     readonly bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly bimovedoc_group: (a: number, b: number, c: number) => [number, number];
     readonly bimovedoc_hatchCount: (a: number) => number;
     readonly bimovedoc_layoutNames: (a: number) => [number, number];
     readonly bimovedoc_lineCount: (a: number) => number;

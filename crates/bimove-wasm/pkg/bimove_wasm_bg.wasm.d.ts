@@ -10,6 +10,7 @@ export const bimovedoc_buildFrame: (a: number, b: number, c: number, d: number) 
 export const bimovedoc_dimCount: (a: number) => number;
 export const bimovedoc_exec: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) => [number, number, number];
+export const bimovedoc_group: (a: number, b: number, c: number) => [number, number];
 export const bimovedoc_hatchCount: (a: number) => number;
 export const bimovedoc_layoutNames: (a: number) => [number, number];
 export const bimovedoc_lineCount: (a: number) => number;

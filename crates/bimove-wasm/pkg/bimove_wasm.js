@@ -115,6 +115,22 @@ export class BimoveDoc {
         return BimoveDoc.__wrap(ret[0]);
     }
     /**
+     * 이 엔티티와 같은 Bimove 객체(문·창·벽·공간…)인 손잡이들. 없으면 빈 배열.
+     *
+     * `pick` 으로 하나를 집은 다음 이걸로 묶음을 펼친다. 자세한 건
+     * `Doc::group` 주석에.
+     * @param {string} handle
+     * @returns {string[]}
+     */
+    group(handle) {
+        const ptr0 = passStringToWasm0(handle, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.bimovedoc_group(this.__wbg_ptr, ptr0, len0);
+        var v2 = getArrayJsValueFromWasm0(ret[0], ret[1]);
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v2;
+    }
+    /**
      * Bimove 문서에서 만든 해치 개수.
      * @returns {number}
      */
