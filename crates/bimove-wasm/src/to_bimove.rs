@@ -1,0 +1,894 @@
+//! 엔진 `Drawing` 을 **Bimove 문서로 되돌린다** (`bimove.rs` 의 역방향).
+//!
+//! ── 왜 이게 없으면 안 되나 ──
+//!
+//! CadCraft 화면은 읽고·그리고·되돌리기까지 다 되는데 **저장이 없었다.** 그린
+//! 것이 저장본으로 돌아가지 못해서 페이지만 바꿔도 사라진다. 그래서 메인
+//! 캔버스를 tldraw 에서 넘겨받을 수가 없었다 — 넘기면 작업이 날아간다.
+//!
+//! ── 원본을 받아서 돌려준다 ──
+//!
+//! 엔진이 아는 것만으로 문서를 **새로 쓰지 않는다.** 저장본에는 엔진이 모르는
+//! 것이 섞여 있다 — 밑그림 `image` 와 그 asset, tldraw `geo`/`arrow`/`text`,
+//! 다른 페이지의 도형, 아직 없는 미래의 타입. 새로 쓰면 그게 전부 날아간다.
+//!
+//! 그래서 `bimove.rs` 가 `props` 를 통째로 싣는 것과 **같은 원리**로 간다:
+//! 원본 json 을 받아서, 우리가 책임지는 도형만 손보고 나머지는 **손 안 대고
+//! 통과시킨다.** 모르는 것을 지우지 않는 게 유실을 막는 길이다.
+//!
+//! ── 지울 수 있는 것은 "엔진에 들어갔던 것" 뿐이다 ──
+//!
+//! 비교를 `drawing` 에 있는 정체성만으로 하면 **안 된다.** 정방향은 도형을
+//! 조용히 빼는 자리가 여럿이다: 돌아간 그룹 안, 끊긴 부모 사슬, 두께 0 인 벽,
+//! 점이 셋 미만인 공간, 그리고 애초에 다른 페이지. 그 도형들은 도면에 정체성이
+//! 없으므로 "사용자가 지웠다" 와 구분이 안 된다 — 그대로 비교하면 **열지도
+//! 않은 도형이 저장할 때마다 사라진다.**
+//!
+//! 그래서 불러온 직후의 id 집합(`loaded`)을 들고 있다가 그것과만 견준다
+//! ([`ids_in`] 으로 뜬다, `Doc::from_bimove` 가 보관한다). 모르는 id 는
+//! **통과**다. 지우는 쪽으로 기울지 않는 게 이 파일의 유일한 안전장치다.
+//!
+//! ── 셋뿐이다 ──
+//!
+//! | 원본 | 도면 | 결과 |
+//! |---|---|---|
+//! | 있다 | 있다 | **그대로** — 원본 `props` 를 글자 하나 안 고치고 둔다 |
+//! | 있다 | 없다 | **없어짐** — 지웠다. 도형을 뺀다 |
+//! | 없다 | 있다 | **새로 생김** — 엔티티에서 되읽어 도형을 만든다 |
+//!
+//! "그대로" 가 **진짜 그대로**인 게 1차의 범위다. 엔진에서 공간을 옮기거나
+//! 꼭짓점을 끌어도 `props` 에 안 돌아온다. 되읽기가 손실 없이 되는지를 먼저
+//! 확인해야 하고, 그게 되기 전에 원본을 덮어쓰면 그 손실이 저장본에 남는다.
+//!
+//! ── 정체성 없는 선은 안 건드린다 ──
+//!
+//! `dxfgroup` 의 선들은 정체성이 없다 (`cadIdentity.ts` 의 `kindForTool` 이
+//! `line` 에 `null` 을 주는 것과 같은 결정 — 선 하나는 Bimove 객체가 아니다).
+//! 그 선을 엔진에서 지워도 여기서는 안 보이고, `pathData` 를 다시 쓰는 일은
+//! 유실 위험이 커서 따로 떼어야 한다. 지금은 `dxfgroup` 을 통째로 통과시킨다.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use cadcraft_color::Color;
+use cadcraft_doc::{Drawing, Entity, EntityKind};
+use serde_json::{Map, Value, json};
+
+use crate::dim::DimScale;
+use crate::identity;
+
+/// 되돌린 결과.
+pub struct SaveBack {
+    /// 저장본으로 그대로 쓸 JSON.
+    pub json: String,
+    /// 되읽지 못한 것. 사람이 읽는 문장이다 — 조용히 빼면 아무도 모른다.
+    pub notes: Vec<String>,
+    /// 원본 그대로 둔 도형 수 (엔진이 들고 있던 것 중).
+    pub kept: usize,
+    /// 지워져서 뺀 도형 수.
+    pub erased: usize,
+    /// 새로 만들어 넣은 도형 수.
+    pub added: usize,
+}
+
+/// `kind` → Bimove 도형 `type`. 대부분 같고 둘만 다르다.
+fn type_of(kind: &str) -> Option<&'static str> {
+    match kind {
+        identity::WALL => Some("wall"),
+        identity::DOOR => Some("door"),
+        identity::WINDOW => Some("window"),
+        identity::ZONE => Some("zone"),
+        identity::DIM => Some("dimension"),
+        identity::BOQ => Some("boqtable"),
+        _ => None,
+    }
+}
+
+/// 도면에 정체성이 박혀 있는 id 전부.
+///
+/// 불러온 직후에 한 번 떠서 들고 있는다 (모듈 주석의 `loaded`). 저장할 때
+/// 다시 뜬 것과 견주면 없어진 것이 나온다.
+pub fn ids_in(drawing: &Drawing) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for e in drawing.model.iter() {
+        if let Some(id) = identity::of(e) {
+            out.extend(id.ids);
+        }
+    }
+    out
+}
+
+/// id → (kind, 그 id 를 달고 있는 엔티티들).
+///
+/// 한 엔티티가 여러 id 의 것일 수 있다 (이어져 MLINE 하나로 묶인 벽). 그래서
+/// 엔티티를 id 마다 **되풀이해** 담는다 — 묶음을 쪼개면 되읽을 수가 없다.
+fn by_id(drawing: &Drawing) -> BTreeMap<String, (String, Vec<&Entity>)> {
+    let mut out: BTreeMap<String, (String, Vec<&Entity>)> = BTreeMap::new();
+    for e in drawing.model.iter() {
+        let Some(id) = identity::of(e) else { continue };
+        for one in &id.ids {
+            out.entry(one.clone())
+                .or_insert_with(|| (id.kind.clone(), Vec::new()))
+                .1
+                .push(e);
+        }
+    }
+    out
+}
+
+/// 엔진 `Drawing` 을 원본 문서에 되비친다.
+///
+/// `original_json` 은 **열 때 쓴 그 문서**다. `loaded` 는 그때 도면에 심긴
+/// id 집합 ([`ids_in`]). 둘 다 없으면 지워진 것과 안 열린 것을 못 가린다.
+pub fn drawing_to_bimove(
+    original_json: &str, page_id: &str, loaded: &BTreeSet<String>, drawing: &Drawing,
+) -> Result<SaveBack, String> {
+    let mut doc: Value =
+        serde_json::from_str(original_json).map_err(|e| format!("문서가 JSON 이 아니다: {e}"))?;
+    if !doc.is_object() {
+        return Err("문서가 객체가 아니다".into());
+    }
+
+    let live = by_id(drawing);
+    let mut notes = Vec::new();
+    let (mut kept, mut erased) = (0usize, 0usize);
+
+    // 축척은 **면적을 되재는 데** 쓴다 (`zone_props`). 문서에 없으면
+    // `1px = 1mm` 로 떨어지고 면적이 통째로 엉뚱해지므로 그걸 알려야 한다.
+    let doc_scale = DimScale::from_json(doc.get("scale"));
+    let scale = doc_scale.unwrap_or_default();
+
+    let shapes = doc.get("shapes").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut out: Vec<Value> = Vec::with_capacity(shapes.len());
+
+    for sh in &shapes {
+        let id = sh.get("id").and_then(Value::as_str).unwrap_or("");
+        // 엔진에 들어가지 않았던 도형은 **통과**다 (모듈 주석). id 가 없는
+        // 것도 여기로 온다 — 우리가 만든 것이 아니다.
+        if id.is_empty() || !loaded.contains(id) {
+            out.push(sh.clone());
+            continue;
+        }
+        if live.contains_key(id) {
+            // 그대로. `props` 를 손대지 않는다.
+            out.push(sh.clone());
+            kept += 1;
+        } else {
+            erased += 1;
+        }
+    }
+
+    // 새로 생긴 것 — 도면에만 있고 **열 때는 없었던** id.
+    let mut added = 0usize;
+    let mut unread: BTreeMap<String, usize> = BTreeMap::new();
+    for (id, (kind, ents)) in &live {
+        if loaded.contains(id) {
+            continue;
+        }
+        match rebuild(id, kind, ents, page_id, &scale) {
+            Some(sh) => {
+                out.push(sh);
+                added += 1;
+            }
+            None => *unread.entry(kind.clone()).or_insert(0) += 1,
+        }
+    }
+    for (kind, n) in &unread {
+        notes.push(format!("새로 그린 {kind} {n}개를 저장본으로 되읽지 못했다"));
+    }
+    // 축척을 못 찾았는데 공간을 되읽었으면 **면적이 px 단위로 재진 것이다.**
+    // 조용히 넘기면 발주 수량이 통째로 틀린 채 저장된다.
+    if doc_scale.is_none() && added > 0 && live.values().any(|(k, _)| k == identity::ZONE) {
+        notes.push(
+            "축척을 문서에서 못 찾아 1px = 1mm 로 면적을 쟀다 (실제와 다를 수 있다)".to_string(),
+        );
+    }
+
+    if let Some(m) = doc.as_object_mut() {
+        m.insert("shapes".into(), Value::Array(out));
+    }
+
+    Ok(SaveBack { json: doc.to_string(), notes, kept, erased, added })
+}
+
+/// 되읽은 도형 하나. `props` 바깥의 자리도 종류마다 달라서 같이 든다.
+struct Rebuilt {
+    /// 도형의 자리 (캔버스 좌표). 공간은 첫 꼭짓점, 벽·치수는 시작점,
+    /// 문·창은 가운데다.
+    x: f64,
+    y: f64,
+    rotation: f64,
+    props: Value,
+}
+
+/// 엔티티들에서 Bimove 도형을 되읽는다. 못 읽으면 `None` — 부르는 쪽이 센다.
+///
+/// 종류를 하나씩 연다. 짐작으로 만들어 넣으면 **틀린 도형이 저장본에 남고**,
+/// 그건 못 읽은 것보다 나쁘다.
+fn rebuild(
+    id: &str, kind: &str, ents: &[&Entity], page_id: &str, scale: &DimScale,
+) -> Option<Value> {
+    let r = match kind {
+        identity::ZONE => zone_props(ents, scale)?,
+        identity::WALL => wall_props(id, ents)?,
+        identity::DIM => dim_props(ents)?,
+        // 문·창과 물량표는 아직 안 연다.
+        //
+        // 문 하나는 엔티티 다섯이고(가림 + 잼브 둘 + 문짝 + 호) 폭·가운데·벽
+        // 방향·여는 쪽·뒤집힘을 그 다섯에서 되재야 한다. 호의 방향에서 여는
+        // 쪽을 읽는 자리가 특히 미끄럽다 — 거울에 뒤집히기 때문이다
+        // (`opening.rs`). 반쯤 맞는 문을 저장본에 남기는 것보다 못 읽었다고
+        // 세는 쪽이 낫다.
+        //
+        // 물량표는 엔진 TABLE 이라 칸 내용이 다 들어 있지만, 애초에 CadCraft
+        // 화면에 물량표 도구가 없다 (`cadDraw.ts` 의 `CadTool`). 그릴 수 없는
+        // 것을 되읽는 길부터 깔 이유가 없다.
+        _ => return None,
+    };
+    let mut m = Map::new();
+    m.insert("id".into(), json!(id));
+    m.insert("type".into(), json!(type_of(kind)?));
+    if !page_id.is_empty() {
+        m.insert("parentId".into(), json!(page_id));
+    }
+    m.insert("x".into(), json!(r.x));
+    m.insert("y".into(), json!(r.y));
+    m.insert("rotation".into(), json!(r.rotation));
+    m.insert("props".into(), r.props);
+    Some(Value::Object(m))
+}
+
+/// 엔진 좌표를 캔버스 좌표로. y 만 뒤집는다 (`bimove.rs` 의 역).
+fn canvas(x: f64, y: f64) -> (f64, f64) {
+    (x, -y)
+}
+
+/// 소수 둘째까지. 화면의 `measurePolygon` 과 같은 자리에서 끊는다 — 다르면
+/// 그려 넣은 공간과 불러온 공간의 숫자가 갈린다.
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// 글자 엔티티에서 (높이, 내용, 색). `Text` 와 `MText` 를 **둘 다** 본다.
+///
+/// 두 꼴이 다 나오는 게 요점이다. 저장본에서 온 공간은 `MText` 고
+/// (`zone.rs` 의 `text`), 화면에서 그려 넣은 공간은 엔진 `text` 명령이라
+/// `Text` 다 (`cadShapes.ts` 의 `zoneLabelCommand`). 한쪽만 보면 **방금 그린
+/// 공간의 이름이 저장할 때 사라진다.**
+fn text_bits(e: &Entity) -> Option<(f64, String, Color)> {
+    match &e.kind {
+        EntityKind::MText(t) => Some((t.height, strip_mtext(&t.contents), e.common.color)),
+        EntityKind::Text(t) => Some((t.height, t.value.clone(), e.common.color)),
+        _ => None,
+    }
+}
+
+/// 공간 하나를 되읽는다.
+///
+/// 엔티티는 면(해치) + 테두리(닫힌 폴리라인) + 이름 (+ 면적) 이다. 점은
+/// **테두리**에서 뜬다 — 해치 loop 에도 같은 점이 있지만 폴리라인이 양쪽
+/// 경로에 다 있는 유일한 것이다 (`zone.rs`, `cadShapes.ts`).
+///
+/// ── 면적을 다시 잰다 ──
+///
+/// `zone.rs` 는 불러온 공간의 면적을 **다시 재지 않는다** (화면이 띄우는 숫자와
+/// 갈리면 어느 게 맞는지 못 가린다). 여기는 사정이 다르다: 되읽는 것은 **방금
+/// 그린** 공간이고 거기엔 굳은 숫자가 없다 — 화면이 면적 글자를 안 만든다.
+/// 그래서 폴리곤에서 재되, 화면과 **같은 식**으로 잰다 (`areaMeasure.ts` 의
+/// `pxAreaToM2`/`pxLengthToM`, 소수 둘째까지).
+///
+/// 면적 글자가 있으면 그걸 쓴다 — 저장본에서 온 공간을 복사한 경우다.
+fn zone_props(ents: &[&Entity], scale: &DimScale) -> Option<Rebuilt> {
+    let border = ents.iter().find_map(|e| match &e.kind {
+        EntityKind::LwPolyline(p) if p.closed && p.vertices.len() >= 3 => Some(p),
+        _ => None,
+    })?;
+    let pts: Vec<(f64, f64)> = border.vertices.iter().map(|v| canvas(v.p.x, v.p.y)).collect();
+    let (ox, oy) = pts[0];
+    // `props.points` 는 **첫 점 기준 상대 좌표**다 (`zone_of` 주석). 절대
+    // 좌표로 적어도 읽히긴 하지만, 공간 도구가 만드는 꼴과 같아야 `points[0]`
+    // 이 원점이라고 보는 읽는 쪽이 어긋나지 않는다.
+    let points: Vec<Value> =
+        pts.iter().map(|(x, y)| json!({ "x": x - ox, "y": y - oy })).collect();
+
+    let mut texts: Vec<(f64, String, Color)> = ents.iter().filter_map(|e| text_bits(e)).collect();
+    // 큰 글자가 이름이다 (`zone.rs` 의 14 > 11, 화면은 이름 하나뿐).
+    texts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let (label, color) = match texts.first() {
+        // 화면이 빈 이름을 "미지정" 으로 **띄운다** — 그 글자를 이름으로 박으면
+        // 사용자가 적지도 않은 이름이 저장본에 남는다.
+        Some((_, text, ink)) => {
+            let name = if text == "미지정" { String::new() } else { text.clone() };
+            (name, hex_of(*ink))
+        }
+        None => (String::new(), "#1a73e8".to_string()),
+    };
+
+    let area_px2 = shoelace(&pts);
+    let ppm = scale.px_per_mm;
+    let area = texts
+        .iter()
+        .skip(1)
+        .find_map(|(_, t, _)| area_of(t))
+        .unwrap_or_else(|| round2(area_px2 / (ppm * ppm) / 1_000_000.0));
+    let perimeter = round2(perimeter(&pts) / ppm / 1000.0);
+
+    Some(Rebuilt {
+        x: ox,
+        y: oy,
+        rotation: 0.0,
+        props: json!({
+            "points": points,
+            "label": label,
+            // 층고는 엔티티에 안 들어 있다 — 그릴 것이 없다. 화면 기본값과 같은
+            // 수를 둔다 (`ZoneShape.getDefaultProps` 의 2400).
+            "wallHeightMm": 2400,
+            "areaM2": area,
+            "perimeterM": perimeter,
+            "color": color,
+        }),
+    })
+}
+
+/// 신발끈 넓이. **늘 양수** — 시계 방향으로 찍으면 부호가 뒤집히고, 음수
+/// 면적에 마감재를 곱하면 음수 자재가 나온다 (`cadShapes.ts` 와 같은 이유).
+fn shoelace(pts: &[(f64, f64)]) -> f64 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in 0..n {
+        let (ax, ay) = pts[i];
+        let (bx, by) = pts[(i + 1) % n];
+        sum += ax * by - bx * ay;
+    }
+    sum.abs() / 2.0
+}
+
+fn perimeter(pts: &[(f64, f64)]) -> f64 {
+    let n = pts.len();
+    if n < 2 {
+        return 0.0;
+    }
+    (0..n)
+        .map(|i| {
+            let (ax, ay) = pts[i];
+            let (bx, by) = pts[(i + 1) % n];
+            (bx - ax).hypot(by - ay)
+        })
+        .sum()
+}
+
+/// 벽 하나를 되읽는다.
+///
+/// ── 한 엔티티가 벽 여럿이다 ──
+///
+/// Bimove 의 벽 도형은 **선분 하나**인데, 엔진에서는 이어진 벽이 한 엔티티로
+/// 묶인다 — 저장본에서 온 것은 MLINE, 화면에서 그려 넣은 것은 **폭 있는
+/// 폴리라인**이다 (`cadDraw.ts` 의 `commitCommand` 가 `pline` + `width` 를
+/// 보낸다. 알려진 차이고, 모양만 닮았을 뿐 같은 엔티티가 아니다).
+///
+/// 그래서 꼭짓점 n+1 개가 벽 n 개가 되고, 정체성의 `ids` 가 **그 차례대로**
+/// n 개여야 한다 (`wall.rs` 의 `WallChain::ids`). `id` 가 몇 번째인지로 자기
+/// 구간을 집는다.
+///
+/// 수가 안 맞으면 `None` 이다. 첫 구간을 짐작으로 집으면 **나머지 벽이 조용히
+/// 사라진다** — 세어서 알리는 쪽이 낫다.
+fn wall_props(id: &str, ents: &[&Entity]) -> Option<Rebuilt> {
+    for e in ents {
+        let ids = identity::of(e)?.ids;
+        let idx = ids.iter().position(|x| x == id)?;
+        let (verts, thickness) = match &e.kind {
+            EntityKind::MLine(m) => (
+                m.vertices.iter().map(|v| canvas(v.p.x, v.p.y)).collect::<Vec<_>>(),
+                m.scale,
+            ),
+            EntityKind::LwPolyline(p) if p.const_width > 0.0 => (
+                p.vertices.iter().map(|v| canvas(v.p.x, v.p.y)).collect::<Vec<_>>(),
+                p.const_width,
+            ),
+            _ => continue,
+        };
+        // 열린 사슬이라야 구간과 id 가 하나씩 맞물린다. 닫힌 것은 꼭짓점 수가
+        // 곧 구간 수여서 여기 식이 틀린다 — 지금 그릴 길이 없으므로 안 연다.
+        if verts.len() != ids.len() + 1 || idx + 1 >= verts.len() {
+            continue;
+        }
+        let (ax, ay) = verts[idx];
+        let (bx, by) = verts[idx + 1];
+        return Some(Rebuilt {
+            x: ax,
+            y: ay,
+            rotation: 0.0,
+            props: json!({ "x2": bx - ax, "y2": by - ay, "thickness": thickness }),
+        });
+    }
+    None
+}
+
+/// 치수 하나를 되읽는다.
+///
+/// `p13`/`p14` 가 잰 두 점이고 `defpt` 는 **치수선 위의 점**이다 (`dim.rs`).
+/// `offset` 은 그 둘 사이의 거리를 캔버스 왼쪽 법선에 투영해 뜬다 — 부호까지
+/// 살려야 치수선이 반대쪽으로 넘어가지 않는다.
+fn dim_props(ents: &[&Entity]) -> Option<Rebuilt> {
+    let d = ents.iter().find_map(|e| match &e.kind {
+        EntityKind::Dimension(d) => Some(d),
+        _ => None,
+    })?;
+    let (ax, ay) = canvas(d.p13.x, d.p13.y);
+    let (bx, by) = canvas(d.p14.x, d.p14.y);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len = dx.hypot(dy);
+    if !(len > 1e-9) {
+        return None;
+    }
+    // 화면의 `nx = -y2/len, ny = x2/len`
+    let (nx, ny) = (-dy / len, dx / len);
+    let (px, py) = canvas(d.defpt.x, d.defpt.y);
+    let offset = (px - ax) * nx + (py - ay) * ny;
+
+    Some(Rebuilt {
+        x: ax,
+        y: ay,
+        rotation: 0.0,
+        props: json!({ "x2": dx, "y2": dy, "offset": offset }),
+    })
+}
+
+/// MTEXT 꾸밈을 벗긴다 (`bimove.rs` 의 `to_mtext` 의 역).
+fn strip_mtext(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            // `\P` 는 줄바꿈, `\\`·`\{`·`\}` 는 그 글자 자체.
+            Some('P') => out.push('\n'),
+            Some(e @ ('\\' | '{' | '}')) => out.push(e),
+            // 나머지 제어열은 `;` 까지 버린다 (`\W0.8;`, `\H1.2x;`).
+            Some(_) => {
+                for c in it.by_ref() {
+                    if c == ';' {
+                        break;
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    out.trim_matches(|c| c == '{' || c == '}').trim().to_string()
+}
+
+/// `12.3m²` 에서 숫자만. 꼴이 다르면 `None`.
+fn area_of(s: &str) -> Option<f64> {
+    s.trim().strip_suffix("m²")?.trim().parse().ok()
+}
+
+/// `Color::True` 를 `#rrggbb` 로. 다른 색 꼴이면 화면 기본값으로 떨어진다.
+fn hex_of(c: Color) -> String {
+    match c {
+        Color::True(rgb) => format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2),
+        _ => "#1a73e8".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zone::Zone;
+    use cadcraft_color::Rgb;
+    use cadcraft_geom::Vec2;
+
+    /// 캔버스 좌표로 2000×1000 px 사각형 공간 하나.
+    ///
+    /// 1px = 1mm 로 보면 2m × 1m = **2m²** 다. 되읽기가 면적을 다시 재므로
+    /// 눈으로 셈이 되는 크기를 쓴다.
+    fn zone(id: &str, label: &str, area: f64) -> Zone {
+        Zone {
+            id: id.to_string(),
+            points: vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(2000.0, 0.0),
+                Vec2::new(2000.0, 1000.0),
+                Vec2::new(0.0, 1000.0),
+            ],
+            label: label.to_string(),
+            area_m2: area,
+            color: Rgb(0x34, 0xa8, 0x53),
+            layer: "0".into(),
+        }
+    }
+
+    /// 축척이 든 빈 문서. 없으면 되읽기가 `1px = 1mm` 로 떨어지며 `notes` 를 올린다.
+    fn empty_doc() -> String {
+        json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "scale": { "pxPerMm": 1.0 },
+            "shapes": [],
+        })
+        .to_string()
+    }
+
+    /// 공간들을 넣은 도면.
+    fn drawn(zones: &[Zone]) -> Drawing {
+        let mut d = Drawing::new_metric();
+        crate::zone::add_zones(&mut d, zones);
+        d
+    }
+
+    fn loaded(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn shapes_of(json: &str) -> Vec<Value> {
+        serde_json::from_str::<Value>(json)
+            .unwrap()
+            .get("shapes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap()
+    }
+
+    fn ids_of(json: &str) -> Vec<String> {
+        shapes_of(json)
+            .iter()
+            .map(|s| s.get("id").and_then(Value::as_str).unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn 열지_않은_도형은_지우지_않는다() {
+        // **이 파일에서 제일 중요한 성질이다.** 정방향이 조용히 빼는 자리가
+        // 여럿이라 (돌아간 그룹, 두께 0 인 벽, 다른 페이지) 그 도형들은 도면에
+        // 정체성이 없다. `loaded` 를 안 보고 비교하면 저장할 때마다 사라진다.
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [
+                { "id": "shape:rotated", "type": "wall", "parentId": "page:1", "props": {} },
+                { "id": "shape:other", "type": "zone", "parentId": "page:2", "props": {} },
+            ],
+        })
+        .to_string();
+
+        // 아무것도 안 열렸다 — 심긴 id 가 없다.
+        let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &Drawing::new_metric())
+            .expect("되돌리기 실패");
+
+        assert_eq!(back.erased, 0, "열지도 않은 도형을 지웠다");
+        assert_eq!(ids_of(&back.json), vec!["shape:rotated", "shape:other"]);
+    }
+
+    #[test]
+    fn 지운_것은_뺀다() {
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [
+                { "id": "shape:a", "type": "zone", "parentId": "page:1", "props": { "label": "방" } },
+                { "id": "shape:b", "type": "zone", "parentId": "page:1", "props": { "label": "거실" } },
+            ],
+        })
+        .to_string();
+
+        // 둘 다 열렸는데 도면에는 a 만 남아 있다 — b 를 지운 것이다.
+        let d = drawn(&[zone("shape:a", "방", 5.0)]);
+        let back = drawing_to_bimove(&doc, "page:1", &loaded(&["shape:a", "shape:b"]), &d)
+            .expect("되돌리기 실패");
+
+        assert_eq!(back.kept, 1);
+        assert_eq!(back.erased, 1);
+        assert_eq!(ids_of(&back.json), vec!["shape:a"]);
+    }
+
+    #[test]
+    fn 그대로인_것은_props_를_안_고친다() {
+        // 1차의 범위다 — 엔진에서 옮겨도 원본이 정본이다. 되읽기가 손실
+        // 없이 되는지 확인되기 전에 덮어쓰면 그 손실이 저장본에 남는다.
+        let props = json!({ "label": "방", "wallHeightMm": 2700, "areaM2": 5.0, "남의것": [1, 2] });
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [
+                { "id": "shape:a", "type": "zone", "parentId": "page:1", "props": props },
+            ],
+        })
+        .to_string();
+
+        // 이름·면적을 **다르게** 그려 넣었는데도 원본이 남아야 한다.
+        let d = drawn(&[zone("shape:a", "딴이름", 99.0)]);
+        let back = drawing_to_bimove(&doc, "page:1", &loaded(&["shape:a"]), &d)
+            .expect("되돌리기 실패");
+
+        assert_eq!(shapes_of(&back.json)[0].get("props").unwrap(), &props);
+    }
+
+    #[test]
+    fn 엔진이_모르는_것은_통과한다() {
+        // 밑그림 image 와 그 asset, tldraw 도형, 문서 바깥의 키까지.
+        let doc = json!({
+            "schemaVersion": 3,
+            "scale": { "pxPerMm": 0.5 },
+            "assets": [{ "id": "asset:1", "type": "image" }],
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [
+                { "id": "shape:img", "type": "image", "parentId": "page:1", "props": { "assetId": "asset:1" } },
+                { "id": "shape:geo", "type": "geo", "parentId": "page:1", "props": {} },
+            ],
+        })
+        .to_string();
+
+        let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &Drawing::new_metric())
+            .expect("되돌리기 실패");
+
+        let got: Value = serde_json::from_str(&back.json).unwrap();
+        let want: Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(got, want, "원본이 그대로 돌아오지 않았다");
+    }
+
+    #[test]
+    fn 새로_그린_공간을_되읽는다() {
+        // 열 때는 없었던 id — 화면에서 그려 넣은 것이다 (`cadIdentity.newId`).
+        let d = drawn(&[zone("bimove:zone:xyz", "주방", 5.0)]);
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+
+        assert_eq!(back.added, 1);
+        assert!(back.notes.is_empty(), "되읽었는데 못 읽었다고 적혔다: {:?}", back.notes);
+
+        let sh = &shapes_of(&back.json)[0];
+        assert_eq!(sh.get("id").unwrap(), "bimove:zone:xyz");
+        assert_eq!(sh.get("type").unwrap(), "zone");
+        assert_eq!(sh.get("parentId").unwrap(), "page:1");
+        // 자리는 첫 꼭짓점이다 — `props.points` 가 거기 기준이라서 (`zone_of`).
+        assert_eq!(sh.get("x").unwrap(), 0.0);
+        assert_eq!(sh.get("y").unwrap(), 0.0);
+
+        let p = sh.get("props").unwrap();
+        assert_eq!(p.get("label").unwrap(), "주방");
+        // 면적 글자가 있으면 그걸 쓴다 (다시 재면 2.0 이 나오는 자리다).
+        assert_eq!(p.get("areaM2").unwrap(), 5.0);
+        // 글자 색이 공간 색이다 (면이 아니다 — `zoneStyle.ts`).
+        assert_eq!(p.get("color").unwrap(), "#34a853");
+        // 캔버스는 y 가 아래로 간다 — 엔진에서 뒤집힌 것이 되돌아와야 한다.
+        assert_eq!(
+            p.get("points").unwrap(),
+            &json!([
+                { "x": 0.0, "y": 0.0 },
+                { "x": 2000.0, "y": 0.0 },
+                { "x": 2000.0, "y": 1000.0 },
+                { "x": 0.0, "y": 1000.0 },
+            ]),
+        );
+    }
+
+    #[test]
+    fn 면적_글자가_없으면_폴리곤에서_다시_잰다() {
+        // 화면에서 그려 넣은 공간은 면적 글자를 안 만든다 (`cadShapes.ts` 는
+        // 이름표 하나뿐이다). 다시 재지 않으면 발주 수량이 0 으로 저장된다.
+        let d = drawn(&[zone("bimove:zone:xyz", "주방", 0.0)]);
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+
+        let p = shapes_of(&back.json)[0].get("props").unwrap().clone();
+        // 2000 × 1000 px, 1px = 1mm → 2m × 1m
+        assert_eq!(p.get("areaM2").unwrap(), 2.0);
+        assert_eq!(p.get("perimeterM").unwrap(), 6.0);
+    }
+
+    #[test]
+    fn 축척이_없으면_면적을_쟀다고_알린다() {
+        // 조용히 1px = 1mm 로 재면 발주 수량이 통째로 틀린 채 저장된다.
+        let doc = json!({ "pages": [{ "id": "page:1", "name": "1" }], "shapes": [] }).to_string();
+        let d = drawn(&[zone("bimove:zone:xyz", "주방", 0.0)]);
+
+        let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1);
+        assert_eq!(back.notes.len(), 1);
+        assert!(back.notes[0].contains("축척"), "축척 얘기가 없다: {:?}", back.notes);
+    }
+
+    #[test]
+    fn 미지정은_빈_이름으로_되읽는다() {
+        // 화면이 빈 이름을 "미지정" 으로 **띄운다.** 그 글자를 이름으로 박으면
+        // 사용자가 적지도 않은 이름이 저장본에 남는다.
+        let d = drawn(&[zone("bimove:zone:xyz", "", 0.0)]);
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+
+        let p = shapes_of(&back.json)[0].get("props").unwrap().clone();
+        assert_eq!(p.get("label").unwrap(), "");
+    }
+
+    #[test]
+    fn 그려_넣은_이름은_text_엔티티다() {
+        // 저장본에서 온 공간은 `MText` 고 화면에서 그려 넣은 것은 엔진 `text`
+        // 명령이라 `Text` 다 (`cadShapes.ts` 의 `zoneLabelCommand`). 한쪽만
+        // 보면 **방금 그린 공간의 이름이 저장할 때 사라진다.**
+        let mut d = Drawing::new_metric();
+        let from = d.model.len();
+        let h = d.new_handle();
+        d.model.push(Entity::new(
+            h,
+            EntityKind::LwPolyline(cadcraft_doc::LwPolyline {
+                vertices: vec![
+                    cadcraft_geom::PolyVertex::new(Vec2::new(0.0, 0.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(2000.0, 0.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(2000.0, -1000.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(0.0, -1000.0)),
+                ],
+                closed: true,
+                const_width: 0.0,
+                elevation: 0.0,
+                plinegen: false,
+            }),
+        ));
+        let h = d.new_handle();
+        d.model.push(Entity::new(
+            h,
+            EntityKind::Text(cadcraft_doc::Text {
+                insert: cadcraft_geom::Vec3::new(1000.0, -500.0, 0.0),
+                align_pt: None,
+                // 화면은 공간 크기에 맞춰 높이를 정한다 — 고정값이 아니다.
+                height: 5.37,
+                value: "주방".into(),
+                rotation: 0.0,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "Standard".into(),
+                halign: Default::default(),
+                valign: Default::default(),
+            }),
+        ));
+        crate::identity::stamp_one(&mut d, from, crate::identity::ZONE, "bimove:zone:xyz");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+        let p = shapes_of(&back.json)[0].get("props").unwrap().clone();
+        assert_eq!(p.get("label").unwrap(), "주방");
+        assert_eq!(p.get("areaM2").unwrap(), 2.0);
+    }
+
+    #[test]
+    fn 벽_사슬을_구간마다_되읽는다() {
+        // Bimove 의 벽 도형은 **선분 하나**인데 엔진에서는 이어진 벽이 한
+        // 엔티티다. 꼭짓점 셋 = 구간 둘 = 벽 도형 둘.
+        let mut d = Drawing::new_metric();
+        let from = d.model.len();
+        let h = d.new_handle();
+        d.model.push(Entity::new(
+            h,
+            EntityKind::LwPolyline(cadcraft_doc::LwPolyline {
+                vertices: vec![
+                    cadcraft_geom::PolyVertex::new(Vec2::new(0.0, 0.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(1000.0, 0.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(1000.0, -500.0)),
+                ],
+                closed: false,
+                // 그려 넣은 벽은 **폭 있는 폴리라인**이다 (`commitCommand`).
+                const_width: 150.0,
+                elevation: 0.0,
+                plinegen: false,
+            }),
+        ));
+        let ids = ["bimove:wall:a".to_string(), "bimove:wall:b".to_string()];
+        crate::identity::stamp(&mut d, from, crate::identity::WALL, &ids);
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 2, "notes: {:?}", back.notes);
+
+        let shapes = shapes_of(&back.json);
+        let a = shapes.iter().find(|s| s.get("id").unwrap() == "bimove:wall:a").unwrap();
+        assert_eq!(a.get("x").unwrap(), 0.0);
+        assert_eq!(a.get("y").unwrap(), 0.0);
+        assert_eq!(a.get("props").unwrap().get("x2").unwrap(), 1000.0);
+        assert_eq!(a.get("props").unwrap().get("y2").unwrap(), 0.0);
+        assert_eq!(a.get("props").unwrap().get("thickness").unwrap(), 150.0);
+
+        let b = shapes.iter().find(|s| s.get("id").unwrap() == "bimove:wall:b").unwrap();
+        // 캔버스는 y 가 아래로 간다 — 엔진 -500 이 캔버스 +500 이다.
+        assert_eq!(b.get("x").unwrap(), 1000.0);
+        assert_eq!(b.get("y").unwrap(), 0.0);
+        assert_eq!(b.get("props").unwrap().get("y2").unwrap(), 500.0);
+    }
+
+    #[test]
+    fn 벽_id_수가_구간과_안_맞으면_안_읽는다() {
+        // 첫 구간을 짐작으로 집으면 **나머지 벽이 조용히 사라진다.**
+        let mut d = Drawing::new_metric();
+        let from = d.model.len();
+        let h = d.new_handle();
+        d.model.push(Entity::new(
+            h,
+            EntityKind::LwPolyline(cadcraft_doc::LwPolyline {
+                vertices: vec![
+                    cadcraft_geom::PolyVertex::new(Vec2::new(0.0, 0.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(1000.0, 0.0)),
+                    cadcraft_geom::PolyVertex::new(Vec2::new(1000.0, -500.0)),
+                ],
+                closed: false,
+                const_width: 150.0,
+                elevation: 0.0,
+                plinegen: false,
+            }),
+        ));
+        // 구간은 둘인데 id 는 하나다.
+        crate::identity::stamp_one(&mut d, from, crate::identity::WALL, "bimove:wall:only");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 0);
+        assert!(back.notes.iter().any(|n| n.contains("wall")), "notes: {:?}", back.notes);
+    }
+
+    #[test]
+    fn 치수를_되읽는다() {
+        use crate::dim::DimSeg;
+        let mut d = Drawing::new_metric();
+        let seg = DimSeg {
+            id: "bimove:dim:a".into(),
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1000.0, 0.0),
+            offset: 200.0,
+            layer: "0".into(),
+        };
+        crate::dim::add_dims(&mut d, &[seg], &DimScale::default());
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+
+        let sh = &shapes_of(&back.json)[0];
+        assert_eq!(sh.get("type").unwrap(), "dimension");
+        assert_eq!(sh.get("x").unwrap(), 0.0);
+        assert_eq!(sh.get("y").unwrap(), 0.0);
+        let p = sh.get("props").unwrap();
+        assert_eq!(p.get("x2").unwrap(), 1000.0);
+        assert_eq!(p.get("y2").unwrap(), 0.0);
+        // 부호까지 살아야 치수선이 반대쪽으로 넘어가지 않는다.
+        assert_eq!(p.get("offset").unwrap(), 200.0);
+    }
+
+    #[test]
+    fn 못_읽은_것은_센다() {
+        // 문·창은 아직 안 연다. 조용히 빼면 그린 게 사라진 걸 아무도 모른다.
+        let mut d = Drawing::new_metric();
+        let h = d.new_handle();
+        d.model.push(Entity::new(
+            h,
+            EntityKind::Line(cadcraft_doc::Line {
+                a: cadcraft_geom::Vec3::new(0.0, 0.0, 0.0),
+                b: cadcraft_geom::Vec3::new(10.0, 0.0, 0.0),
+            }),
+        ));
+        crate::identity::stamp_one(&mut d, 0, crate::identity::DOOR, "bimove:door:xyz");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 0);
+        assert_eq!(back.notes.len(), 1);
+        assert!(back.notes[0].contains("door"), "무엇을 못 읽었는지 안 적혔다: {:?}", back.notes);
+        assert!(shapes_of(&back.json).is_empty(), "못 읽은 것을 넣었다");
+    }
+
+    #[test]
+    fn ids_in_은_심긴_것만_센다() {
+        // id 가 빈 공간은 정체성을 안 심는다 (`identity::stamp_one`).
+        let d = drawn(&[zone("shape:a", "방", 5.0), zone("", "이름없음", 3.0)]);
+        let got = ids_in(&d);
+        assert_eq!(got.len(), 1, "정체성 없는 공간까지 셌다: {got:?}");
+        assert!(got.contains("shape:a"));
+    }
+
+    #[test]
+    fn mtext_꾸밈을_벗긴다() {
+        assert_eq!(strip_mtext("방"), "방");
+        assert_eq!(strip_mtext("한\\P줄"), "한\n줄");
+        assert_eq!(area_of("12.3m²"), Some(12.3));
+        assert_eq!(area_of("방"), None);
+    }
+}

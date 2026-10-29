@@ -15,6 +15,7 @@ pub mod dim;
 pub mod identity;
 pub mod jsnum;
 pub mod opening;
+pub mod to_bimove;
 pub mod wall;
 pub mod zone;
 
@@ -557,6 +558,13 @@ pub struct Doc {
     counts: Counts,
     /// 실제로 옮긴 페이지 id. "" 를 넘겼을 때 **무엇이 골라졌는지** 알려준다.
     page_id: String,
+    /// **열 때** 도면에 심긴 Bimove 도형 id 집합.
+    ///
+    /// 저장할 때 지워진 것을 가리는 기준이다. 지금 도면에 있는 것만 보면
+    /// 정방향이 조용히 빼는 도형(돌아간 그룹 안, 두께 0 인 벽, 다른 페이지)이
+    /// "사용자가 지웠다" 와 구분되지 않아 **열지도 않은 도형이 사라진다**
+    /// (`to_bimove` 모듈 주석).
+    loaded_ids: std::collections::BTreeSet<String>,
     /// 마지막으로 만든 DisplayList 와 그때의 (공간, tolerance).
     ///
     /// **이게 성능의 전부다.** 매 프레임 build 하면 45MB 도면에서 한 장이
@@ -655,9 +663,12 @@ impl Doc {
         drawing: cadcraft_doc::Drawing, pages: Vec<(String, String)>, notes: Vec<String>,
         counts: Counts, page_id: String,
     ) -> Doc {
+        // 심긴 id 는 **세션에 넣기 전에** 뜬다 — 넣은 뒤에는 도면을 빌려야
+        // 하고, 그 사이에 편집이 끼면 기준이 "열 때" 가 아니게 된다.
+        let loaded_ids = to_bimove::ids_in(&drawing);
         let mut session = Session::empty();
         session.open_drawing(drawing, "bimove", None);
-        Doc { session, pages, notes, counts, page_id, cache: None }
+        Doc { session, pages, notes, counts, page_id, loaded_ids, cache: None }
     }
 
     fn drawing(&self) -> &cadcraft_doc::Drawing {
@@ -683,6 +694,20 @@ impl Doc {
     /// 쓸 수가 없다.
     fn to_dxf(&self) -> String {
         cadcraft_io::write_dxf(self.drawing())
+    }
+
+    /// 지금 도면을 **Bimove 저장본으로** 되돌린다.
+    ///
+    /// `original_json` 은 이 Doc 을 연 그 문서다. 엔진이 모르는 것을 통과시키려면
+    /// 원본이 있어야 한다 (`to_bimove` 모듈 주석) — 들고 있지 않고 받는 이유는
+    /// 큰 문서를 두 벌 쥐지 않기 위해서다. JS 쪽에 이미 있다.
+    fn to_bimove(&self, original_json: &str) -> Result<to_bimove::SaveBack, String> {
+        to_bimove::drawing_to_bimove(
+            original_json,
+            &self.page_id,
+            &self.loaded_ids,
+            self.drawing(),
+        )
     }
 
     fn exec(&mut self, id: &str, params_json: &str) -> Result<String, String> {
@@ -894,6 +919,28 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = toDxf)]
     pub fn to_dxf(&self) -> String {
         self.0.to_dxf()
+    }
+
+    /// 지금 도면을 **Bimove 저장본 JSON** 으로 되돌린다.
+    ///
+    /// `originalJson` 은 이 도면을 연 그 문서를 그대로 넘긴다. 엔진이 모르는
+    /// 것(밑그림 image, 다른 페이지, tldraw 도형)은 거기서 통과한다 — 안 넘기면
+    /// 새로 쓰는 셈이 되어 그게 다 날아간다.
+    ///
+    /// 돌려주는 것은 `{ json, notes, kept, erased, added }` 를 담은 JSON 글이다.
+    /// `notes` 가 비어 있지 않으면 **되읽지 못한 것이 있다** — 화면에 올려야
+    /// 한다. 조용히 넘기면 그린 게 사라진 걸 아무도 모른다.
+    #[wasm_bindgen(js_name = toBimove)]
+    pub fn to_bimove(&self, original_json: &str) -> Result<String, JsError> {
+        let back = self.0.to_bimove(original_json).map_err(|e| JsError::new(&e))?;
+        Ok(serde_json::json!({
+            "json": back.json,
+            "notes": back.notes,
+            "kept": back.kept,
+            "erased": back.erased,
+            "added": back.added,
+        })
+        .to_string())
     }
 
     /// 한 점을 찍어 엔티티를 고른다. `aperture` 는 **도면 단위** (픽셀 ÷ 줌).
