@@ -220,6 +220,17 @@ struct Rebuilt {
 fn rebuild(
     id: &str, kind: &str, ents: &[&Entity], page_id: &str, scale: &DimScale,
 ) -> Option<Value> {
+    // **tldraw 는 도형 레코드 id 에 규칙이 있다** — `shape:` 로 시작해야 한다
+    // (`@tldraw/tlschema` 의 `idValidator`). 어긴 id 를 문서에 넣으면 저장은
+    // 성공한 척하고, 그 도면을 **에디터가 통째로 못 연다** ("도면을 열지
+    // 못했습니다" 한 장만 뜬다).
+    //
+    // 한 번 그렇게 깨뜨렸다. 그리는 쪽(`cadIdentity.newId`)을 고쳤지만,
+    // 여기서도 막는다 — 저장본을 못 쓰게 만드는 것보다 "되읽지 못했다" 로
+    // 세는 쪽이 비교도 안 되게 낫다.
+    if !id.starts_with("shape:") {
+        return None;
+    }
     let r = match kind {
         identity::ZONE => zone_props(ents, scale)?,
         identity::WALL => wall_props(id, ents)?,
@@ -644,7 +655,7 @@ mod tests {
     #[test]
     fn 새로_그린_공간을_되읽는다() {
         // 열 때는 없었던 id — 화면에서 그려 넣은 것이다 (`cadIdentity.newId`).
-        let d = drawn(&[zone("bimove:zone:xyz", "주방", 5.0)]);
+        let d = drawn(&[zone("shape:bimove:zone:xyz", "주방", 5.0)]);
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
 
@@ -652,7 +663,7 @@ mod tests {
         assert!(back.notes.is_empty(), "되읽었는데 못 읽었다고 적혔다: {:?}", back.notes);
 
         let sh = &shapes_of(&back.json)[0];
-        assert_eq!(sh.get("id").unwrap(), "bimove:zone:xyz");
+        assert_eq!(sh.get("id").unwrap(), "shape:bimove:zone:xyz");
         assert_eq!(sh.get("type").unwrap(), "zone");
         assert_eq!(sh.get("parentId").unwrap(), "page:1");
         // 자리는 첫 꼭짓점이다 — `props.points` 가 거기 기준이라서 (`zone_of`).
@@ -678,22 +689,36 @@ mod tests {
     }
 
     #[test]
+    fn tldraw_가_못_읽는_id_는_안_넣는다() {
+        // tldraw 는 도형 레코드 id 가 `shape:` 로 시작해야 한다. 어긴 id 를
+        // 문서에 넣으면 저장은 성공한 척하고 **에디터가 그 도면을 통째로 못
+        // 연다** — 실제로 한 번 그렇게 깨뜨렸다.
+        let d = drawn(&[zone("bimove:zone:xyz", "주방", 5.0)]);
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+
+        assert_eq!(back.added, 0, "규칙을 어긴 id 를 넣었다");
+        assert!(shapes_of(&back.json).is_empty());
+        assert_eq!(back.notes.len(), 1, "조용히 뺐다: {:?}", back.notes);
+    }
+
+    #[test]
     fn 두_번_저장해도_도형이_안_늘어난다() {
         // 첫 저장이 넣은 도형은 문서에는 있지만 `loaded`(열 때의 집합)에는
         // 없다. `loaded` 만 보면 "통과" 로 한 번 실리고 "새로 생김" 으로 또
         // 실려서 **같은 id 가 두 벌**이 된다 — 다시 열면 공간이 겹쳐 그려진다.
-        let d = drawn(&[zone("bimove:zone:xyz", "주방", 5.0)]);
+        let d = drawn(&[zone("shape:bimove:zone:xyz", "주방", 5.0)]);
 
         let first = drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d)
             .expect("첫 저장 실패");
         assert_eq!(first.added, 1);
-        assert_eq!(ids_of(&first.json), vec!["bimove:zone:xyz"]);
+        assert_eq!(ids_of(&first.json), vec!["shape:bimove:zone:xyz"]);
 
         // 같은 도면을 **다시** 저장한다. 엔진은 그대로고 문서만 갱신됐다.
         let second = drawing_to_bimove(&first.json, "page:1", &BTreeSet::new(), &d)
             .expect("두 번째 저장 실패");
         assert_eq!(second.added, 0, "같은 도형을 또 넣었다");
-        assert_eq!(ids_of(&second.json), vec!["bimove:zone:xyz"]);
+        assert_eq!(ids_of(&second.json), vec!["shape:bimove:zone:xyz"]);
         assert!(second.notes.is_empty(), "notes: {:?}", second.notes);
     }
 
@@ -701,7 +726,7 @@ mod tests {
     fn 면적_글자가_없으면_폴리곤에서_다시_잰다() {
         // 화면에서 그려 넣은 공간은 면적 글자를 안 만든다 (`cadShapes.ts` 는
         // 이름표 하나뿐이다). 다시 재지 않으면 발주 수량이 0 으로 저장된다.
-        let d = drawn(&[zone("bimove:zone:xyz", "주방", 0.0)]);
+        let d = drawn(&[zone("shape:bimove:zone:xyz", "주방", 0.0)]);
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
 
@@ -715,7 +740,7 @@ mod tests {
     fn 축척이_없으면_면적을_쟀다고_알린다() {
         // 조용히 1px = 1mm 로 재면 발주 수량이 통째로 틀린 채 저장된다.
         let doc = json!({ "pages": [{ "id": "page:1", "name": "1" }], "shapes": [] }).to_string();
-        let d = drawn(&[zone("bimove:zone:xyz", "주방", 0.0)]);
+        let d = drawn(&[zone("shape:bimove:zone:xyz", "주방", 0.0)]);
 
         let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
         assert_eq!(back.added, 1);
@@ -727,7 +752,7 @@ mod tests {
     fn 미지정은_빈_이름으로_되읽는다() {
         // 화면이 빈 이름을 "미지정" 으로 **띄운다.** 그 글자를 이름으로 박으면
         // 사용자가 적지도 않은 이름이 저장본에 남는다.
-        let d = drawn(&[zone("bimove:zone:xyz", "", 0.0)]);
+        let d = drawn(&[zone("shape:bimove:zone:xyz", "", 0.0)]);
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
 
@@ -775,7 +800,7 @@ mod tests {
                 valign: Default::default(),
             }),
         ));
-        crate::identity::stamp_one(&mut d, from, crate::identity::ZONE, "bimove:zone:xyz");
+        crate::identity::stamp_one(&mut d, from, crate::identity::ZONE, "shape:bimove:zone:xyz");
 
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
@@ -807,7 +832,7 @@ mod tests {
                 plinegen: false,
             }),
         ));
-        let ids = ["bimove:wall:a".to_string(), "bimove:wall:b".to_string()];
+        let ids = ["shape:bimove:wall:a".to_string(), "shape:bimove:wall:b".to_string()];
         crate::identity::stamp(&mut d, from, crate::identity::WALL, &ids);
 
         let back =
@@ -815,14 +840,14 @@ mod tests {
         assert_eq!(back.added, 2, "notes: {:?}", back.notes);
 
         let shapes = shapes_of(&back.json);
-        let a = shapes.iter().find(|s| s.get("id").unwrap() == "bimove:wall:a").unwrap();
+        let a = shapes.iter().find(|s| s.get("id").unwrap() == "shape:bimove:wall:a").unwrap();
         assert_eq!(a.get("x").unwrap(), 0.0);
         assert_eq!(a.get("y").unwrap(), 0.0);
         assert_eq!(a.get("props").unwrap().get("x2").unwrap(), 1000.0);
         assert_eq!(a.get("props").unwrap().get("y2").unwrap(), 0.0);
         assert_eq!(a.get("props").unwrap().get("thickness").unwrap(), 150.0);
 
-        let b = shapes.iter().find(|s| s.get("id").unwrap() == "bimove:wall:b").unwrap();
+        let b = shapes.iter().find(|s| s.get("id").unwrap() == "shape:bimove:wall:b").unwrap();
         // 캔버스는 y 가 아래로 간다 — 엔진 -500 이 캔버스 +500 이다.
         assert_eq!(b.get("x").unwrap(), 1000.0);
         assert_eq!(b.get("y").unwrap(), 0.0);
@@ -850,7 +875,7 @@ mod tests {
             }),
         ));
         // 구간은 둘인데 id 는 하나다.
-        crate::identity::stamp_one(&mut d, from, crate::identity::WALL, "bimove:wall:only");
+        crate::identity::stamp_one(&mut d, from, crate::identity::WALL, "shape:bimove:wall:only");
 
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
@@ -863,7 +888,7 @@ mod tests {
         use crate::dim::DimSeg;
         let mut d = Drawing::new_metric();
         let seg = DimSeg {
-            id: "bimove:dim:a".into(),
+            id: "shape:bimove:dim:a".into(),
             a: Vec2::new(0.0, 0.0),
             b: Vec2::new(1000.0, 0.0),
             offset: 200.0,
@@ -898,7 +923,7 @@ mod tests {
                 b: cadcraft_geom::Vec3::new(10.0, 0.0, 0.0),
             }),
         ));
-        crate::identity::stamp_one(&mut d, 0, crate::identity::DOOR, "bimove:door:xyz");
+        crate::identity::stamp_one(&mut d, 0, crate::identity::DOOR, "shape:bimove:door:xyz");
 
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
