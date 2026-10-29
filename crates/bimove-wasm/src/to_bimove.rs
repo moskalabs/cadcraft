@@ -139,9 +139,14 @@ pub fn drawing_to_bimove(
 
     let shapes = doc.get("shapes").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut out: Vec<Value> = Vec::with_capacity(shapes.len());
+    // 원본에 **이미 있는** id. 두 번째 저장을 위한 것이다 — 아래 설명.
+    let mut in_doc: BTreeSet<&str> = BTreeSet::new();
 
     for sh in &shapes {
         let id = sh.get("id").and_then(Value::as_str).unwrap_or("");
+        if !id.is_empty() {
+            in_doc.insert(id);
+        }
         // 엔진에 들어가지 않았던 도형은 **통과**다 (모듈 주석). id 가 없는
         // 것도 여기로 온다 — 우리가 만든 것이 아니다.
         if id.is_empty() || !loaded.contains(id) {
@@ -157,11 +162,19 @@ pub fn drawing_to_bimove(
         }
     }
 
-    // 새로 생긴 것 — 도면에만 있고 **열 때는 없었던** id.
+    // 새로 생긴 것 — 도면에만 있고 **열 때도 없었고 문서에도 없는** id.
+    //
+    // `loaded` 만 보면 **두 번째 저장에서 도형이 둘로 늘어난다.** 첫 저장이
+    // 넣은 도형은 문서에는 있지만 `loaded`(열 때의 집합)에는 없다. 그래서
+    // 위 고리에서 "통과" 로 한 번 실리고, 여기서 "새로 생김" 으로 또 실린다 —
+    // 같은 id 가 두 벌이 되고, 다시 열면 공간이 겹쳐 그려진다.
+    //
+    // 열 때의 집합을 저장할 때마다 갱신하는 길도 있지만, 그러면 저장이
+    // 엔진 상태를 바꾼다. 문서를 보는 쪽이 간단하고 저장을 몇 번 눌러도 같다.
     let mut added = 0usize;
     let mut unread: BTreeMap<String, usize> = BTreeMap::new();
     for (id, (kind, ents)) in &live {
-        if loaded.contains(id) {
+        if loaded.contains(id) || in_doc.contains(id.as_str()) {
             continue;
         }
         match rebuild(id, kind, ents, page_id, &scale) {
@@ -662,6 +675,26 @@ mod tests {
                 { "x": 0.0, "y": 1000.0 },
             ]),
         );
+    }
+
+    #[test]
+    fn 두_번_저장해도_도형이_안_늘어난다() {
+        // 첫 저장이 넣은 도형은 문서에는 있지만 `loaded`(열 때의 집합)에는
+        // 없다. `loaded` 만 보면 "통과" 로 한 번 실리고 "새로 생김" 으로 또
+        // 실려서 **같은 id 가 두 벌**이 된다 — 다시 열면 공간이 겹쳐 그려진다.
+        let d = drawn(&[zone("bimove:zone:xyz", "주방", 5.0)]);
+
+        let first = drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d)
+            .expect("첫 저장 실패");
+        assert_eq!(first.added, 1);
+        assert_eq!(ids_of(&first.json), vec!["bimove:zone:xyz"]);
+
+        // 같은 도면을 **다시** 저장한다. 엔진은 그대로고 문서만 갱신됐다.
+        let second = drawing_to_bimove(&first.json, "page:1", &BTreeSet::new(), &d)
+            .expect("두 번째 저장 실패");
+        assert_eq!(second.added, 0, "같은 도형을 또 넣었다");
+        assert_eq!(ids_of(&second.json), vec!["bimove:zone:xyz"]);
+        assert!(second.notes.is_empty(), "notes: {:?}", second.notes);
     }
 
     #[test]
