@@ -51,6 +51,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cadcraft_color::Color;
 use cadcraft_doc::{Drawing, Entity, EntityKind};
+use cadcraft_geom::Vec2;
 use serde_json::{Map, Value, json};
 
 use crate::dim::DimScale;
@@ -235,17 +236,10 @@ fn rebuild(
         identity::ZONE => zone_props(ents, scale)?,
         identity::WALL => wall_props(id, ents)?,
         identity::DIM => dim_props(ents)?,
-        // 문·창과 물량표는 아직 안 연다.
-        //
-        // 문 하나는 엔티티 다섯이고(가림 + 잼브 둘 + 문짝 + 호) 폭·가운데·벽
-        // 방향·여는 쪽·뒤집힘을 그 다섯에서 되재야 한다. 호의 방향에서 여는
-        // 쪽을 읽는 자리가 특히 미끄럽다 — 거울에 뒤집히기 때문이다
-        // (`opening.rs`). 반쯤 맞는 문을 저장본에 남기는 것보다 못 읽었다고
-        // 세는 쪽이 낫다.
-        //
-        // 물량표는 엔진 TABLE 이라 칸 내용이 다 들어 있지만, 애초에 CadCraft
-        // 화면에 물량표 도구가 없다 (`cadDraw.ts` 의 `CadTool`). 그릴 수 없는
-        // 것을 되읽는 길부터 깔 이유가 없다.
+        identity::DOOR | identity::WINDOW => opening_props(kind, ents)?,
+        // 물량표는 안 연다. 엔진 TABLE 이라 칸 내용이 다 들어 있지만, 애초에
+        // CadCraft 화면에 물량표 도구가 없다 (`cadDraw.ts` 의 `CadTool`).
+        // 그릴 수 없는 것을 되읽는 길부터 깔 이유가 없다.
         _ => return None,
     };
     let mut m = Map::new();
@@ -429,6 +423,92 @@ fn wall_props(id: &str, ents: &[&Entity]) -> Option<Rebuilt> {
         });
     }
     None
+}
+
+/// 문·창 하나를 되읽는다.
+///
+/// ── 가림막 하나에 다 들어 있다 ──
+///
+/// 하나가 엔티티 다섯이지만(가림 + 잼브 둘 + 문짝 + 호) 자리와 크기는
+/// **WIPEOUT 네 꼭짓점**에서 다 나온다 (`opening.rs` 의 `gap_and_jambs`):
+///
+/// ```text
+///   p0 = at(-hw,-ht)   p1 = at( hw,-ht)   p2 = at( hw, ht)   p3 = at(-hw, ht)
+/// ```
+///
+/// 그래서 `p1-p0` 가 벽을 따라가는 축이고 그 길이가 **폭**, `p3-p0` 가 벽을
+/// 가로지르는 축이고 그 길이가 **두께**, 넷의 평균이 **가운데**다. 잼브와 호를
+/// 안 봐도 된다.
+///
+/// ── 여는 쪽은 문짝에서 ──
+///
+/// 문짝은 경첩에서 열린 쪽으로 제 폭만큼 뻗는 선분이다 — 제 좌표로 보면 한
+/// 끝이 `y = 0` 이고 다른 끝이 `y = ±폭` 이다. 잼브는 둘 다 `y = ±두께/2` 라
+/// 거기서 갈린다. 호는 **안 본다**: 거울 변환 때문에 도는 방향이
+/// `flipped`·`swing` 조합마다 뒤집혀서, 되짚으면 네 경우를 따로 써야 한다
+/// (`opening.rs` 의 `door` 주석). 문짝 선이 같은 것을 더 곧게 알려준다.
+fn opening_props(kind: &str, ents: &[&Entity]) -> Option<Rebuilt> {
+    let b = ents.iter().find_map(|e| match &e.kind {
+        EntityKind::Wipeout(w) if w.boundary.len() == 4 => Some(&w.boundary),
+        _ => None,
+    })?;
+    let (p0, p1, p3) = (b[0], b[1], b[3]);
+
+    let along = p1 - p0;
+    let across = p3 - p0;
+    let width = along.dist(Vec2::ZERO);
+    let thickness = across.dist(Vec2::ZERO);
+    if !(width > 0.0) || !(thickness > 0.0) {
+        return None;
+    }
+    let u = along / width;
+    let v = across / thickness;
+    let c = (b[0] + b[1] + b[2] + b[3]) / 4.0;
+
+    // `frame` 의 역: u = (cos r, -sin r) 이므로 r = atan2(-u.y, u.x).
+    let rotation = (-u.y).atan2(u.x);
+    let (cx, cy) = canvas(c.x, c.y);
+
+    let mut props = Map::new();
+    props.insert("width".into(), json!(width));
+    props.insert("thickness".into(), json!(thickness));
+
+    if kind == identity::DOOR {
+        // 제 좌표로 옮겨 문짝을 가린다 — 한 끝이 `y = 0` 인 선분이다.
+        let local = |p: Vec2| {
+            let d = p - c;
+            (d.x * u.x + d.y * u.y, d.x * v.x + d.y * v.y)
+        };
+        let leaf = ents.iter().find_map(|e| match &e.kind {
+            EntityKind::Line(l) => {
+                let (a, bb) = (local(Vec2::new(l.a.x, l.a.y)), local(Vec2::new(l.b.x, l.b.y)));
+                // 문짝: 한 끝이 가운데 선 위(y≈0), 다른 끝이 폭만큼 떨어져 있다.
+                let eps = thickness.max(1e-6) * 0.25;
+                if a.1.abs() <= eps && bb.1.abs() > eps {
+                    Some((a, bb))
+                } else if bb.1.abs() <= eps && a.1.abs() > eps {
+                    Some((bb, a))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+        // 문짝을 못 찾으면 화면 기본값으로 둔다 — 문은 살리는 게 낫다.
+        // `swing` 이 0 이면 문짝이 벽 위에 겹쳐 눕는다 (`opening_of` 주석).
+        let (side, flipped) = match leaf {
+            Some((hinge, tip)) => (
+                if tip.1 < 0.0 { -1.0 } else { 1.0 },
+                // 경첩은 `-hw * f` 에 있다 — 오른쪽이면 뒤집힌 것이다.
+                hinge.0 > 0.0,
+            ),
+            None => (1.0, false),
+        };
+        props.insert("swing".into(), json!(side));
+        props.insert("flipped".into(), json!(flipped));
+    }
+
+    Some(Rebuilt { x: cx, y: cy, rotation, props: Value::Object(props) })
 }
 
 /// 치수 하나를 되읽는다.
@@ -911,9 +991,102 @@ mod tests {
         assert_eq!(p.get("offset").unwrap(), 200.0);
     }
 
+    /// 문·창을 엔진에 넣었다가 **되읽어서** 원래 값이 나오는지 본다.
+    ///
+    /// 되읽기를 손으로 짠 식으로만 재면 그 식이 틀려도 통과한다. 정방향
+    /// (`opening::add_openings`)을 거쳐서 왕복시키면 두 쪽이 어긋나는 순간
+    /// 깨진다 — 거기가 이 변환에서 제일 미끄러운 자리다 (거울 변환).
+    fn opening_roundtrip(o: crate::opening::Opening) -> Value {
+        let mut d = Drawing::new_metric();
+        crate::opening::add_openings(&mut d, &[o]);
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "되읽지 못했다: {:?}", back.notes);
+        shapes_of(&back.json)[0].clone()
+    }
+
+    fn opening(kind: crate::opening::OpeningKind, rotation: f64) -> crate::opening::Opening {
+        crate::opening::Opening {
+            id: "shape:bimove:door:xyz".into(),
+            center: Vec2::new(1200.0, 800.0),
+            rotation,
+            width: 900.0,
+            thickness: 200.0,
+            layer: "0".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn 창을_되읽는다() {
+        use crate::opening::OpeningKind;
+        let sh = opening_roundtrip(crate::opening::Opening {
+            id: "shape:bimove:window:xyz".into(),
+            ..opening(OpeningKind::Window, 0.0)
+        });
+        assert_eq!(sh.get("type").unwrap(), "window");
+        // 문·창은 `x,y` 가 **가운데**다 (벽과 다르다 — `opening_of` 주석).
+        assert_eq!(sh.get("x").unwrap(), 1200.0);
+        assert_eq!(sh.get("y").unwrap(), 800.0);
+        let p = sh.get("props").unwrap();
+        assert_eq!(p.get("width").unwrap(), 900.0);
+        assert_eq!(p.get("thickness").unwrap(), 200.0);
+        // 창에는 여는 쪽이 없다.
+        assert!(p.get("swing").is_none());
+    }
+
+    #[test]
+    fn 문의_여는_쪽과_뒤집힘이_왕복한다() {
+        use crate::opening::{OpeningKind, Swing};
+        // 거울 변환 때문에 네 경우가 서로 다르게 돈다 (`opening.rs` 의 `door`).
+        for side in [1.0, -1.0] {
+            for flipped in [false, true] {
+                let sh = opening_roundtrip(opening(
+                    OpeningKind::Door(Swing { side, flipped }),
+                    0.0,
+                ));
+                let p = sh.get("props").unwrap();
+                assert_eq!(sh.get("type").unwrap(), "door");
+                assert_eq!(
+                    p.get("swing").unwrap().as_f64().unwrap(),
+                    side,
+                    "side {side} flipped {flipped} 에서 여는 쪽이 뒤집혔다",
+                );
+                assert_eq!(
+                    p.get("flipped").unwrap().as_bool().unwrap(),
+                    flipped,
+                    "side {side} flipped {flipped} 에서 경첩이 뒤집혔다",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 돌아간_문도_왕복한다() {
+        use crate::opening::{OpeningKind, Swing};
+        for deg in [0.0, 30.0, 90.0, 135.0, -60.0] {
+            let rot = (deg as f64).to_radians();
+            let sh = opening_roundtrip(opening(
+                OpeningKind::Door(Swing { side: 1.0, flipped: false }),
+                rot,
+            ));
+            let p = sh.get("props").unwrap();
+            let got = sh.get("rotation").unwrap().as_f64().unwrap();
+            // 각도는 ±π 로 감겨 돌아온다 — 같은 방향인지만 본다.
+            let diff = ((got - rot + std::f64::consts::PI).rem_euclid(
+                std::f64::consts::TAU,
+            )) - std::f64::consts::PI;
+            assert!(diff.abs() < 1e-9, "{deg}도 가 {got} 으로 돌아왔다");
+            assert!((p.get("width").unwrap().as_f64().unwrap() - 900.0).abs() < 1e-9);
+            assert!((p.get("thickness").unwrap().as_f64().unwrap() - 200.0).abs() < 1e-9);
+            assert!((sh.get("x").unwrap().as_f64().unwrap() - 1200.0).abs() < 1e-9);
+            assert!((sh.get("y").unwrap().as_f64().unwrap() - 800.0).abs() < 1e-9);
+        }
+    }
+
     #[test]
     fn 못_읽은_것은_센다() {
-        // 문·창은 아직 안 연다. 조용히 빼면 그린 게 사라진 걸 아무도 모른다.
+        // 물량표는 안 연다. 조용히 빼면 그린 게 사라진 걸 아무도 모른다.
         let mut d = Drawing::new_metric();
         let h = d.new_handle();
         d.model.push(Entity::new(
@@ -923,13 +1096,13 @@ mod tests {
                 b: cadcraft_geom::Vec3::new(10.0, 0.0, 0.0),
             }),
         ));
-        crate::identity::stamp_one(&mut d, 0, crate::identity::DOOR, "shape:bimove:door:xyz");
+        crate::identity::stamp_one(&mut d, 0, crate::identity::BOQ, "shape:bimove:boq:xyz");
 
         let back =
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
         assert_eq!(back.added, 0);
         assert_eq!(back.notes.len(), 1);
-        assert!(back.notes[0].contains("door"), "무엇을 못 읽었는지 안 적혔다: {:?}", back.notes);
+        assert!(back.notes[0].contains("boq"), "무엇을 못 읽었는지 안 적혔다: {:?}", back.notes);
         assert!(shapes_of(&back.json).is_empty(), "못 읽은 것을 넣었다");
     }
 
