@@ -320,6 +320,39 @@ export class BimoveDoc {
         return ret >>> 0;
     }
     /**
+     * 지금 도면을 **Bimove 저장본 JSON** 으로 되돌린다.
+     *
+     * `originalJson` 은 이 도면을 연 그 문서를 그대로 넘긴다. 엔진이 모르는
+     * 것(밑그림 image, 다른 페이지, tldraw 도형)은 거기서 통과한다 — 안 넘기면
+     * 새로 쓰는 셈이 되어 그게 다 날아간다.
+     *
+     * 돌려주는 것은 `{ json, notes, kept, erased, added }` 를 담은 JSON 글이다.
+     * `notes` 가 비어 있지 않으면 **되읽지 못한 것이 있다** — 화면에 올려야
+     * 한다. 조용히 넘기면 그린 게 사라진 걸 아무도 모른다.
+     * @param {string} original_json
+     * @returns {string}
+     */
+    toBimove(original_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passStringToWasm0(original_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.bimovedoc_toBimove(this.__wbg_ptr, ptr0, len0);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * 지금 도면을 DXF 글로. 저장할 때 이걸 올린다.
      * @returns {string}
      */

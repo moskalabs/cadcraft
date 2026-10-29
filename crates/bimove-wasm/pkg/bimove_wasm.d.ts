@@ -126,6 +126,18 @@ export class BimoveDoc {
      */
     textCount(): number;
     /**
+     * 지금 도면을 **Bimove 저장본 JSON** 으로 되돌린다.
+     *
+     * `originalJson` 은 이 도면을 연 그 문서를 그대로 넘긴다. 엔진이 모르는
+     * 것(밑그림 image, 다른 페이지, tldraw 도형)은 거기서 통과한다 — 안 넘기면
+     * 새로 쓰는 셈이 되어 그게 다 날아간다.
+     *
+     * 돌려주는 것은 `{ json, notes, kept, erased, added }` 를 담은 JSON 글이다.
+     * `notes` 가 비어 있지 않으면 **되읽지 못한 것이 있다** — 화면에 올려야
+     * 한다. 조용히 넘기면 그린 게 사라진 걸 아무도 모른다.
+     */
+    toBimove(original_json: string): string;
+    /**
      * 지금 도면을 DXF 글로. 저장할 때 이걸 올린다.
      */
     toDxf(): string;
@@ -250,6 +262,7 @@ export interface InitOutput {
     readonly bimovedoc_revision: (a: number) => number;
     readonly bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
     readonly bimovedoc_textCount: (a: number) => number;
+    readonly bimovedoc_toBimove: (a: number, b: number, c: number) => [number, number, number, number];
     readonly bimovedoc_toDxf: (a: number) => [number, number];
     readonly bimovedoc_wallCount: (a: number) => number;
     readonly bimovedoc_wallMlineCount: (a: number) => number;
