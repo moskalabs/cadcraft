@@ -2458,14 +2458,30 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     }
     crate::dxf_raw::finish(&mut w.t, d);
     crate::dxf_raw::data_store(&mut w.t, d, target >= Version::R2013);
-    add_class_instance_counts(&mut w.t);
+    add_class_instance_counts(&mut w.t, target >= Version::R2004);
     mark_xrefs(&mut w.t, d);
     w.t
 }
 
 /// Write DXF Reference group 91 on every CLASS record. Count records after `dxf_raw::finish`
 /// restores foreign classes and objects so every class gets its actual instance count.
-fn add_class_instance_counts(tags: &mut Vec<Tag>) {
+///
+/// **R2004 and later only.** Group 91 (`NumberOfInstances`) does not exist in the R2000 CLASS
+/// record, where 280 must follow 90 directly. Writing it into an AC1015 file makes AutoCAD stop
+/// at the first class:
+///
+/// ```text
+/// Group 280 (zombie flag) expected at line 194.
+/// Invalid or incomplete DXF input -- drawing discarded.
+/// ```
+///
+/// It refuses the whole file, so every R2000 DXF we wrote was unreadable in AutoCAD. Lenient
+/// readers (ezdxf, our own) accept it, which is why this survived: the file looks fine until
+/// AutoCAD opens it.
+fn add_class_instance_counts(tags: &mut Vec<Tag>, write_counts: bool) {
+    if !write_counts {
+        return;
+    }
     let mut counts: HashMap<String, i64> = HashMap::new();
     for t in tags.iter().filter(|t| t.code == 0) {
         let kind = t.str();

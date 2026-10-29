@@ -878,10 +878,23 @@ fn saving_twice_writes_the_same_records() {
     assert_eq!(a.counts(), b.counts());
 }
 
+/// Instance counts (group 91) are **R2004 and later**. The R2000 CLASS record has no such
+/// group — 280 must follow 90 directly, and AutoCAD throws the whole drawing away if it
+/// doesn't (`crates/io/tests/class_instance_counts.rs`). So this reads the R2004 output.
 #[test]
 fn class_records_have_instance_counts_for_generated_and_preserved_records() {
-    let (_, a, b) = saves(&fixture());
-    for out in [&a, &b] {
+    let d = read_dxf(fixture().as_bytes()).expect("read fixture");
+    let opts = cadcraft_io::SaveOptions {
+        version: Some(cadcraft_io::Version::R2004),
+        binary: false,
+    };
+    let first = String::from_utf8(cadcraft_io::write_with(&d, "a.dxf", &opts).expect("write"))
+        .expect("utf8");
+    let d2 = read_dxf(first.as_bytes()).expect("reopen");
+    let second = String::from_utf8(cadcraft_io::write_with(&d2, "b.dxf", &opts).expect("write"))
+        .expect("utf8");
+
+    for out in [Out::new(&first), Out::new(&second)] {
         let counts = out.counts();
         for class in out.in_section("CLASSES", "CLASS") {
             let name = s(class, 1);
