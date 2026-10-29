@@ -173,6 +173,8 @@ pub fn drawing_to_bimove(
     // 열 때의 집합을 저장할 때마다 갱신하는 길도 있지만, 그러면 저장이
     // 엔진 상태를 바꾼다. 문서를 보는 쪽이 간단하고 저장을 몇 번 눌러도 같다.
     let mut added = 0usize;
+    // 공간을 **이번에 실제로 되읽었나.** 축척 경고가 여기 매달린다.
+    let mut measured_zone = false;
     let mut unread: BTreeMap<String, usize> = BTreeMap::new();
     for (id, (kind, ents)) in &live {
         if loaded.contains(id) || in_doc.contains(id.as_str()) {
@@ -182,6 +184,9 @@ pub fn drawing_to_bimove(
             Some(sh) => {
                 out.push(sh);
                 added += 1;
+                if kind == identity::ZONE {
+                    measured_zone = true;
+                }
             }
             None => *unread.entry(kind.clone()).or_insert(0) += 1,
         }
@@ -191,7 +196,11 @@ pub fn drawing_to_bimove(
     }
     // 축척을 못 찾았는데 공간을 되읽었으면 **면적이 px 단위로 재진 것이다.**
     // 조용히 넘기면 발주 수량이 통째로 틀린 채 저장된다.
-    if doc_scale.is_none() && added > 0 && live.values().any(|(k, _)| k == identity::ZONE) {
+    //
+    // **이번에 되읽은 공간**이 있을 때만 말한다. 도면에 공간이 떠 있다는
+    // 것만 보면, 문 하나를 그려 저장해도 "면적을 쟀다" 가 떠서 재지도 않은
+    // 것을 경고한다 — 늘 뜨는 경고는 읽히지 않는다.
+    if doc_scale.is_none() && measured_zone {
         notes.push(
             "축척을 문서에서 못 찾아 1px = 1mm 로 면적을 쟀다 (실제와 다를 수 있다)".to_string(),
         );
@@ -814,6 +823,37 @@ mod tests {
         // 2000 × 1000 px, 1px = 1mm → 2m × 1m
         assert_eq!(p.get("areaM2").unwrap(), 2.0);
         assert_eq!(p.get("perimeterM").unwrap(), 6.0);
+    }
+
+    #[test]
+    fn 공간을_안_되읽었으면_축척_얘기를_안_한다() {
+        // 도면에 공간이 떠 있다는 것만 보고 말하면, 문 하나를 그려 저장해도
+        // "면적을 쟀다" 가 뜬다 — 재지도 않은 것을 경고하는 셈이고, 늘 뜨는
+        // 경고는 읽히지 않는다.
+        use crate::opening::{OpeningKind, Swing};
+        let mut d = Drawing::new_metric();
+        // 공간은 **열 때부터 있던 것**으로 둔다 (되읽지 않는다).
+        crate::zone::add_zones(&mut d, &[zone("shape:old:zone", "방", 5.0)]);
+        let loaded_ids = ids_in(&d);
+        crate::opening::add_openings(&mut d, &[opening(
+            OpeningKind::Door(Swing { side: 1.0, flipped: false }),
+            0.0,
+        )]);
+
+        // 축척이 없는 문서다.
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [{ "id": "shape:old:zone", "type": "zone", "parentId": "page:1", "props": {} }],
+        })
+        .to_string();
+
+        let back = drawing_to_bimove(&doc, "page:1", &loaded_ids, &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "문을 못 읽었다: {:?}", back.notes);
+        assert!(
+            !back.notes.iter().any(|n| n.contains("축척")),
+            "공간을 안 되읽었는데 축척 얘기를 했다: {:?}",
+            back.notes,
+        );
     }
 
     #[test]
