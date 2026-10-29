@@ -1905,7 +1905,11 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             w.i(420, i64::from(rgb.to_u32()));
         }
         w.s(6, &l.linetype);
-        if !l.plot {
+        // AutoCAD pins Defpoints as never-plotting: a record that claims otherwise is
+        // refused ("invalid AcDbLayerTableRecord plot flag") and the whole drawing is
+        // dropped. A writer that defaults a fresh layer to plottable can produce exactly
+        // that, so write the flag the reader will accept rather than the one we hold.
+        if !l.plot || l.name.eq_ignore_ascii_case("Defpoints") {
             w.i(290, 0);
         }
         w.i(370, i64::from(l.lineweight.to_dxf()));

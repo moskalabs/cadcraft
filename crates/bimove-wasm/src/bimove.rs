@@ -951,8 +951,16 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     boq::add_tables(&mut drawing, &boqs);
 
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
+    //
+    // **대소문자를 가리지 않고** 찾는다. DXF 레이어 이름은 대소문자를 안 가린다.
+    // `Drawing::new` 이 `Defpoints` 를 깔아 두는데, 저장본의 도형이 `DEFPOINTS`
+    // 를 쓰고 있으면 가려 보는 비교로는 "없다" 가 되어 **같은 레이어가 두 줄**
+    // 들어간다. 그러면 AutoCAD 가 파일을 통째로 거부한다 —
+    // "DEFPOINTS 도면층에 대한 유효하지 않은 플롯 플래그" (뒤에 들어간 쪽은
+    // 레이어 0 을 베껴 plot=true 인데, AutoCAD 는 DEFPOINTS 를 절대
+    // 플롯하지 않는 레이어로 못 박아 둔다).
     for name in layers.keys() {
-        if name != "0" && !drawing.layers.iter().any(|l| &l.name == name) {
+        if name != "0" && !drawing.layers.iter().any(|l| l.name.eq_ignore_ascii_case(name)) {
             if let Some(base) = drawing.layers.first().cloned() {
                 drawing.layers.push(cadcraft_doc::Layer { name: name.clone(), ..base });
             }
@@ -1447,6 +1455,24 @@ mod tests {
         );
         let r = drawing_from_bimove(&j, "").unwrap();
         assert!(r.drawing.layers.iter().any(|l| l.name == "벽체"), "레이어가 없다");
+    }
+
+    #[test]
+    fn 대소문자만_다른_레이어를_두_번_안_만든다() {
+        // `Drawing::new` 이 `Defpoints` 를 깔아 둔다. 저장본이 `DEFPOINTS` 를 쓰면
+        // 가려 보는 비교로는 "없다" 가 되어 같은 레이어가 두 줄 들어갔다 —
+        // AutoCAD 가 그 파일을 통째로 거부한다.
+        let j = doc_json(
+            r#"{"id":"shape:w1","type":"wall","x":0,"y":0,"rotation":0,"index":"a1",
+               "parentId":"page:main","props":{"x2":100,"y2":0,"thickness":20},
+               "meta":{"dxfLayer":"DEFPOINTS"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let n = r.drawing.layers.iter().filter(|l| l.name.eq_ignore_ascii_case("Defpoints")).count();
+        assert_eq!(n, 1, "레이어: {:?}", r.drawing.layers.iter().map(|l| &l.name).collect::<Vec<_>>());
+        // 남은 한 줄은 처음 깔린 것이어야 한다 — 그쪽이 plot=false 다.
+        let d = r.drawing.layers.iter().find(|l| l.name.eq_ignore_ascii_case("Defpoints")).unwrap();
+        assert!(!d.plot, "Defpoints 는 플롯하지 않는다");
     }
 
     #[test]
