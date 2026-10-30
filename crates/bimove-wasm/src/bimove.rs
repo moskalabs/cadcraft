@@ -396,6 +396,132 @@ fn asset_bytes(records: &Value, asset_id: &str) -> Option<Vec<u8>> {
 /// 의 `insert` 는 **왼쪽 아래**다. 그래서 아래 변으로 내려가서 y 를 뒤집는다.
 /// `size` 를 그림 크기(단위)로 두고 `u`/`v` 를 단위벡터로 두면 렌더가 재는
 /// `u * size.x` 가 곧 폭이 된다 — 픽셀 수를 몰라도 틀이 맞는다.
+/// tldraw 글자 크기 (`FONT_SIZES`, `tldraw/dist-cjs/lib/shapes/shared/
+/// default-shape-constants.js`). 화면이 쓰는 CSS 글자 크기라, **엔진 글자
+/// 높이로 그대로 쓴다** — DXF 의 `height` 는 대문자 높이라 엄밀히는 더
+/// 작지만, 둘을 정확히 맞출 길이 없다. 중요한 건 **왕복이 닫히는 것**이고
+/// 그러려면 양쪽이 같은 표를 봐야 한다 (역은 `to_bimove.rs` 의 `text_props`).
+fn font_px(size: &str) -> f64 {
+    match size {
+        "s" => 18.0,
+        "l" => 36.0,
+        "xl" => 44.0,
+        // 모르는 값은 'm'. tldraw 가 크기를 늘리는 날 조용히 점만 하게
+        // 그리는 것보다, 읽을 수 있는 크기로 그리고 틀린 게 보이는 쪽이 낫다.
+        _ => 24.0,
+    }
+}
+
+/// tldraw 색 이름 → RGB. 오른쪽 패널이 글자에 **네 가지만** 내준다
+/// (`RBar.tsx` 의 `TEXT_COLORS`) — 그 넷과 같은 값이다.
+///
+/// 모르는 이름은 `None` 이고, 그러면 레이어 색을 따른다. tldraw 팔레트에는
+/// 열세 가지가 있어서 (들여온 저장본에 `violet` 이 있을 수 있다) 넷으로
+/// 억지로 꺾지 않는다 — 가까운 색을 **골라 주면** 저장할 때 그 색으로
+/// 굳어서, 사용자가 고르지도 않은 색이 저장본에 남는다.
+fn text_rgb(name: &str) -> Option<Rgb> {
+    match name {
+        "black" => Some(Rgb(0x1d, 0x1d, 0x1d)),
+        "grey" => Some(Rgb(0x9a, 0x9a, 0x9a)),
+        "blue" => Some(Rgb(0x1a, 0x73, 0xe8)),
+        "red" => Some(Rgb(0xea, 0x43, 0x35)),
+        _ => None,
+    }
+}
+
+/// tldraw `textAlign` → MTEXT `attach` (**윗줄**: TL·TC·TR).
+///
+/// 윗줄만 쓰는 이유는 tldraw 글자 도형의 `y` 가 **상자의 위**라서다. 가운데
+/// 줄(ML..MR)을 쓰면 꽂는 점이 글자 가운데가 되어 적어 넣은 글이 반 칸
+/// 올라간다.
+fn text_attach(align: &str) -> u8 {
+    match align {
+        "middle" => 2, // TC
+        "end" => 3,    // TR
+        _ => 1,        // TL
+    }
+}
+
+/// MTEXT `contents` 로 쓸 꼴. `to_bimove.rs` 의 `strip_mtext` 의 역이다.
+///
+/// 중괄호와 역슬래시는 MTEXT 의 **제어 문자**다. 날로 넣으면 `{\H2x;` 같은
+/// 것이 서식 지시로 읽혀서 적은 글자가 통째로 사라지거나 크기가 뒤집힌다.
+pub fn mtext_escape(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    for c in t.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '{' => out.push_str(r"\{"),
+            '}' => out.push_str(r"\}"),
+            '\n' => out.push_str(r"\P"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// **글자 하나.** tldraw `text` 도형 → MTEXT.
+///
+/// 빈 글자는 **안 넣는다.** 보이지도 않는 것이 도면에 남아 스냅이 거기
+/// 붙는다 (`cadDraw.ts` 의 "길이 0 짜리 선분" 과 같은 이유).
+fn add_text(
+    drawing: &mut Drawing, sh: &Value, props: &Value, meta: Option<&Value>,
+) -> Option<String> {
+    let text = s(props, "text").unwrap_or("");
+    if text.trim().is_empty() {
+        return None;
+    }
+    // `scale` 에는 0 이 올 수 없다 (tldraw 가 `nonZeroNumber` 로 막는다).
+    // 그래도 0 이나 음수가 들어오면 글자 높이가 0 이 되어 안 보이므로 1 로
+    // 돌린다.
+    let scale = f(props, "scale", 1.0);
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let height = font_px(s(props, "size").unwrap_or("m")) * scale;
+    let attach = text_attach(s(props, "textAlign").unwrap_or("start"));
+    let w = f(props, "w", 0.0).max(0.0);
+    let gx = f(sh, "x", 0.0);
+    let gy = f(sh, "y", 0.0);
+    // 캔버스의 `x` 는 **상자의 왼쪽**이다. 꽂는 점은 정렬에 따라 옮긴다 —
+    // 안 옮기면 가운데 정렬한 글이 상자 너비의 반만큼 오른쪽으로 밀린다.
+    let ax = match attach {
+        2 => gx + w / 2.0,
+        3 => gx + w,
+        _ => gx,
+    };
+    let from = drawing.model.len();
+    let handle = drawing.new_handle();
+    let mut e = Entity::new(
+        handle,
+        EntityKind::MText(MText {
+            insert: Vec3::new(ax, -gy, 0.0),
+            height,
+            // **줄바꿈 너비.** `autoSize` 면 tldraw 가 한 줄로 늘이므로 0 (안
+            // 접는다). 끄고 상자를 끌어 놓은 글자는 그 너비에서 접힌다.
+            width: if props.get("autoSize").and_then(Value::as_bool).unwrap_or(true) { 0.0 } else { w },
+            attach,
+            // 캔버스는 y 가 아래로 가므로 **도는 쪽이 반대**다.
+            rotation: -f(sh, "rotation", 0.0),
+            style: "Standard".into(),
+            contents: mtext_escape(text),
+            line_spacing: 1.0,
+            line_spacing_exact: false,
+            columns: None,
+        }),
+    );
+    e.common.layer = layer_of(meta);
+    // 글자 색은 **도형 props** 에 있다 (tldraw 스타일 이름). 들여온 도면처럼
+    // `meta.dxfColor` 로 오지 않는다.
+    e.common.color = match s(props, "color").and_then(text_rgb) {
+        Some(rgb) => Color::True(rgb),
+        None => color_of(meta),
+    };
+    drawing.model.push(e);
+
+    let id = s(sh, "id")?;
+    crate::identity::stamp_one(drawing, from, crate::identity::TEXT, id);
+    Some(id.to_string())
+}
+
 fn add_image(
     drawing: &mut Drawing, sh: &Value, props: &Value, meta: Option<&Value>, records: &Value,
     images: &mut Vec<BimoveImage>,
@@ -869,6 +995,8 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut unknown_cmds = 0usize;
     let mut line_count = 0usize;
     let mut text_count = 0usize;
+    // 저장본의 글자 **도형** 중 못 넣은 수 (내용이 빈 것).
+    let mut text_dropped = 0usize;
     let mut segment_count = 0usize;
     // 벽은 **모아 두고 한꺼번에** 넣는다. 이어진 벽을 한 MLINE 으로 묶으려면
     // 이웃을 알아야 하고, 이웃은 도형을 다 읽은 뒤에야 다 보인다.
@@ -963,6 +1091,18 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(d) = dim_seg(sh, &props, meta) {
                 layers.entry(d.layer.clone()).or_insert(());
                 dims.push(d);
+            }
+            continue;
+        }
+
+        // **글자.** tldraw 의 `text` 도형이다 — 엔진에서 적어 넣은 것도
+        // 저장본에서는 이 타입이 된다 (`to_bimove.rs` 의 `text_props`).
+        if kind == "text" {
+            if add_text(&mut drawing, sh, &props, meta).is_some() {
+                layers.entry(layer_of(meta)).or_insert(());
+                text_count += 1;
+            } else {
+                text_dropped += 1;
             }
             continue;
         }
@@ -1164,6 +1304,11 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     }
     if image_seen > image_count {
         notes.push(format!("밑그림 {}개를 못 넣었다 (크기가 0)", image_seen - image_count));
+    }
+    // 빈 글자는 안 넣는다 (`add_text`). 적어 놓은 줄 알았는데 안 보이면
+    // "엔진이 글자를 못 그린다" 로 읽히므로 **몇 개를 뺐는지 말한다.**
+    if text_dropped > 0 {
+        notes.push(format!("글자 {text_dropped}개를 안 넣었다 (내용이 비었다)"));
     }
     // **픽셀을 못 구한 것은 말한다.** 틀만 서 있는데 아무 말도 없으면
     // "밑그림이 날아갔다" 로 읽힌다 (`add_image` 주석). 바이트를 다 구했으면
@@ -1379,6 +1524,99 @@ mod tests {
             "notes: {:?}",
             r.notes
         );
+    }
+
+    /// tldraw 글자 도형 하나. 캔버스 (400, 300), 'm' 크기, 왼쪽 정렬.
+    const TEXT_SHAPE: &str = r#"{"id":"shape:t1","type":"text","x":400,"y":300,"rotation":0,
+        "index":"a1","parentId":"page:main",
+        "props":{"text":"현관","size":"m","scale":1,"w":120,"textAlign":"start",
+                 "color":"black","font":"draw","autoSize":true}}"#;
+
+    #[test]
+    fn 글자_도형이_MTEXT_로_들어온다() {
+        // 전엔 `text` 를 건너뛰었다 — 적어 놓은 글이 엔진 화면에서 **안
+        // 보이고**, 그 상태로 저장하면 역변환이 못 봐서 사라졌다.
+        let r = drawing_from_bimove(&doc_json(TEXT_SHAPE), "").unwrap();
+        let t = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MText(t) => Some(t),
+                _ => None,
+            })
+            .expect("글자가 엔티티로 안 들어왔다");
+        assert_eq!(t.contents, "현관");
+        // 'm' 은 24 px (`font_px`), 배율 1.
+        assert_eq!(t.height, 24.0);
+        // 캔버스 y 는 아래로 간다. 왼쪽 **위**에 꽂으니 attach 는 1 (TL).
+        assert_eq!(t.insert.x, 400.0);
+        assert_eq!(t.insert.y, -300.0);
+        assert_eq!(t.attach, 1);
+        // `autoSize` 면 접지 않는다.
+        assert_eq!(t.width, 0.0);
+        // 정체성이 있어야 저장할 때 역변환이 본다.
+        assert_eq!(
+            crate::to_bimove::ids_in(&r.drawing),
+            ["shape:t1".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
+        );
+        assert!(!r.notes.iter().any(|n| n.starts_with("text ")), "notes: {:?}", r.notes);
+    }
+
+    #[test]
+    fn 글자_크기와_배율이_높이로_곱해진다() {
+        let j = doc_json(
+            r#"{"id":"shape:t1","type":"text","x":0,"y":0,"rotation":0,"index":"a1",
+                "parentId":"page:main",
+                "props":{"text":"크게","size":"xl","scale":2,"w":10,"textAlign":"end",
+                         "color":"red","font":"draw","autoSize":true}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let (t, e) = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MText(t) => Some((t, e)),
+                _ => None,
+            })
+            .unwrap();
+        // 'xl' 44 × 배율 2.
+        assert_eq!(t.height, 88.0);
+        // 오른쪽 정렬이면 꽂는 점이 상자의 **오른쪽**이다 — 안 옮기면 글이
+        // 상자 너비만큼 왼쪽에 적힌다.
+        assert_eq!(t.insert.x, 10.0);
+        assert_eq!(t.attach, 3);
+        // 색은 **props** 에 있다 (tldraw 스타일 이름). `meta.dxfColor` 가 아니다.
+        assert_eq!(e.common.color, Color::True(Rgb(0xea, 0x43, 0x35)));
+    }
+
+    #[test]
+    fn 빈_글자는_안_넣고_말한다() {
+        let j = doc_json(
+            r#"{"id":"shape:t1","type":"text","x":0,"y":0,"rotation":0,"index":"a1",
+                "parentId":"page:main",
+                "props":{"text":"  ","size":"m","scale":1,"w":10,"textAlign":"start",
+                         "color":"black","font":"draw","autoSize":true}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(
+            !r.drawing.model.iter().any(|e| matches!(e.kind, EntityKind::MText(_))),
+            "빈 글자가 도면에 들어갔다",
+        );
+        assert!(r.notes.iter().any(|n| n.contains("내용이 비었다")), "notes: {:?}", r.notes);
+    }
+
+    #[test]
+    fn 중괄호가_서식으로_읽히지_않는다() {
+        // MTEXT 는 `{`·`}`·역슬래시를 **제어 문자**로 본다. 날로 넣으면
+        // `{\H2x;` 같은 것이 서식 지시가 되어 적은 글자가 사라진다.
+        assert_eq!(mtext_escape("{a}"), r"\{a\}");
+        assert_eq!(mtext_escape("1\\2"), r"1\\2");
+        assert_eq!(mtext_escape("위\n아래"), r"위\P아래");
+        // 그리고 되읽으면 원래 글자로 돌아와야 한다.
+        assert_eq!(crate::to_bimove::strip_mtext(&mtext_escape("{a}")), "{a}");
+        assert_eq!(crate::to_bimove::strip_mtext(&mtext_escape("위\n아래")), "위\n아래");
     }
 
     /// 1×1 빨강 png 의 data URL. 진짜 png 라 디코더가 받는다.

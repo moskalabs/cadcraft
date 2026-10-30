@@ -49,9 +49,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cadcraft_color::Color;
+use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::{Drawing, Entity, EntityKind};
-use cadcraft_geom::Vec2;
+use cadcraft_geom::{Vec2, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::dim::DimScale;
@@ -83,6 +83,9 @@ fn type_of(kind: &str) -> Option<&'static str> {
         // 그냥 선은 **들여온 도면과 같은 자리**로 간다. `dxfgroup` 은 이름만
         // 그룹이고 속은 `pathData` 한 줄이라, 선 묶음을 담는 유일한 타입이다.
         identity::LINE => Some("dxfgroup"),
+        // 글자는 tldraw 의 `text` 도형이다 — 오른쪽 패널이 크기·정렬·색을
+        // 이미 그 타입으로 띄운다 (`RBar.tsx`).
+        identity::TEXT => Some("text"),
         _ => None,
     }
 }
@@ -183,7 +186,7 @@ pub fn drawing_to_bimove(
         if loaded.contains(id) || in_doc.contains(id.as_str()) {
             continue;
         }
-        match rebuild(id, kind, ents, page_id, &scale) {
+        match rebuild(id, kind, ents, page_id, &scale, drawing) {
             Some(sh) => {
                 out.push(sh);
                 added += 1;
@@ -231,7 +234,7 @@ struct Rebuilt {
 /// 종류를 하나씩 연다. 짐작으로 만들어 넣으면 **틀린 도형이 저장본에 남고**,
 /// 그건 못 읽은 것보다 나쁘다.
 fn rebuild(
-    id: &str, kind: &str, ents: &[&Entity], page_id: &str, scale: &DimScale,
+    id: &str, kind: &str, ents: &[&Entity], page_id: &str, scale: &DimScale, drawing: &Drawing,
 ) -> Option<Value> {
     // **tldraw 는 도형 레코드 id 에 규칙이 있다** — `shape:` 로 시작해야 한다
     // (`@tldraw/tlschema` 의 `idValidator`). 어긴 id 를 문서에 넣으면 저장은
@@ -250,6 +253,9 @@ fn rebuild(
         identity::DIM => dim_props(ents)?,
         identity::DOOR | identity::WINDOW => opening_props(kind, ents)?,
         identity::LINE => line_props(ents)?,
+        // 글자는 **도면을 받는다.** 상자를 엔진 레이아웃에서 떠야 한다
+        // (`text_props` 머리말).
+        identity::TEXT => text_props(drawing, ents)?,
         // 물량표는 안 연다. 엔진 TABLE 이라 칸 내용이 다 들어 있지만, 애초에
         // CadCraft 화면에 물량표 도구가 없다 (`cadDraw.ts` 의 `CadTool`).
         // 그릴 수 없는 것을 되읽는 길부터 깔 이유가 없다.
@@ -667,20 +673,115 @@ fn dim_props(ents: &[&Entity]) -> Option<Rebuilt> {
         props: json!({ "x2": dx, "y2": dy, "offset": offset }),
     })
 }
+/// **글자 하나를 되읽는다** → tldraw `text` 도형.
+///
+/// ── 상자를 왜 다시 재나 ──
+///
+/// tldraw 글자 도형의 `x`·`y` 는 **상자의 왼쪽 위**고, 돌릴 때도 그 점이
+/// 축이다. 엔진 MTEXT 는 `insert` 에 꽂고 `attach` 가 그 점이 상자의 어디인지
+/// 말한다 (아홉 가지). `attach` 를 손으로 거꾸로 풀면 아홉 갈래를 다 맞춰야
+/// 하고, 한 칸 틀리면 적어 둔 글이 저장할 때마다 조금씩 움직인다.
+///
+/// 그래서 **엔진에게 묻는다.** 돌림을 0 으로, 꽂는 점을 원점으로 둔 사본의
+/// 레이아웃을 재면 꽂는 점에서 본 상자가 그대로 나온다. 거기서 왼쪽 위
+/// 구석을 집어 원래 돌림을 먹이면 tldraw 가 쓸 축이 된다.
+fn text_props(d: &Drawing, ents: &[&Entity]) -> Option<Rebuilt> {
+    let (e, t) = ents.iter().find_map(|e| match &e.kind {
+        EntityKind::MText(t) => Some((*e, t)),
+        _ => None,
+    })?;
+    let text = strip_mtext(&t.contents);
+    if text.is_empty() {
+        return None;
+    }
+    // 꽂는 점에서 본 상자.
+    let local = cadcraft_render::layout_mtext_entity(
+        d,
+        &cadcraft_doc::MText { insert: Vec3::ZERO, rotation: 0.0, ..t.clone() },
+    )
+    .bounds;
+    // `w` 는 **0 이면 안 된다** — tldraw 가 `nonZeroNumber` 로 막고, 어기면
+    // 저장은 성공한 척하고 그 도면을 통째로 못 연다 (`rebuild` 머리말의
+    // `shape:` 와 같은 종류의 사고다). 레이아웃이 비면 글자 높이로 어림한다.
+    let (bw, dx0, dy1) = if local.is_empty() || !(local.width() > 0.0) {
+        (t.height.max(1e-6) * 0.6 * text.chars().count().max(1) as f64, 0.0, 0.0)
+    } else {
+        (local.width(), local.min.x, local.max.y)
+    };
+    // 상자의 왼쪽 위 — 엔진 좌표. 돌림은 꽂는 점을 축으로 돈다.
+    let (c, s) = (t.rotation.cos(), t.rotation.sin());
+    let tl = Vec2::new(
+        t.insert.x + dx0 * c - dy1 * s,
+        t.insert.y + dx0 * s + dy1 * c,
+    );
+    let (x, y) = canvas(tl.x, tl.y);
+    // `attach` 의 **열**이 정렬이다 (1·4·7 왼쪽, 2·5·8 가운데, 3·6·9 오른쪽).
+    let align = match (t.attach.max(1) - 1) % 3 {
+        1 => "middle",
+        2 => "end",
+        _ => "start",
+    };
+    Some(Rebuilt {
+        x: round2(x),
+        y: round2(y),
+        // 캔버스는 y 가 아래로 가므로 **도는 쪽이 반대**다 (`add_text` 의 역).
+        rotation: -t.rotation,
+        props: json!({
+            // 크기는 **늘 'm' + 배율**로 적는다. 24 로 나눠 떨어지는 높이만
+            // 's'·'l'·'xl' 로 되돌릴 수 있는데, 엔진에서 높이를 고치면 거기
+            // 안 맞는 값이 나온다 — 한 길만 두면 어긋날 자리가 없다
+            // (`bimove.rs` 의 `font_px`).
+            "size": "m",
+            "scale": round2((t.height / 24.0).max(1e-3)),
+            "text": text,
+            "w": round2(bw.max(1.0)),
+            "textAlign": align,
+            "color": text_color_name(e.common.color),
+            // tldraw 가 글자 길이대로 너비를 다시 잡는다. `false` 로 두면
+            // 위에서 어림한 `w` 가 **상자 너비로 굳어** 글이 잘린다.
+            "autoSize": true,
+            "font": "draw",
+        }),
+    })
+}
 
-/// MTEXT 꾸밈을 벗긴다 (`bimove.rs` 의 `to_mtext` 의 역).
-fn strip_mtext(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// 글자 색 → tldraw 색 이름. `bimove.rs` 의 `text_rgb` 의 역이다.
+///
+/// 모르는 색은 `black` 이다. 넷 중에 없는 색을 적으면 tldraw 가 그 도형을
+/// 거부하고, 그건 저장본을 못 쓰게 만든다 (`DefaultColorStyle`).
+fn text_color_name(c: Color) -> &'static str {
+    match c {
+        Color::True(Rgb(0x9a, 0x9a, 0x9a)) => "grey",
+        Color::True(Rgb(0x1a, 0x73, 0xe8)) => "blue",
+        Color::True(Rgb(0xea, 0x43, 0x35)) => "red",
+        _ => "black",
+    }
+}
+
+/// MTEXT 꾸밈을 벗긴다 (`bimove.rs` 의 `mtext_escape` 의 역).
+///
+/// ── 바깥 중괄호를 왜 버리나 ──
+///
+/// MTEXT 는 서식을 중괄호 묶음으로 적는다 (`{\H0.4x;가나다}`). 제어열을
+/// 버리고 나면 묶음의 괄호만 남아서, 안 버리면 공간 이름이 `{가나다}` 로
+/// 읽힌다.
+///
+/// 그런데 `\{` 로 **적어 넣은** 괄호는 글자다. 둘을 안 가리면 사람이
+/// `{거실}` 이라고 적은 것이 저장했다 다시 열면 `거실` 이 된다 — 그래서
+/// 글자를 모을 때 "이게 제어열에서 나왔나" 를 같이 들고 다닌다.
+pub(crate) fn strip_mtext(s: &str) -> String {
+    // (글자, 제 자리에 적힌 글자인가). `false` 면 서식 묶음의 괄호다.
+    let mut out: Vec<(char, bool)> = Vec::with_capacity(s.len());
     let mut it = s.chars();
     while let Some(c) = it.next() {
         if c != '\\' {
-            out.push(c);
+            out.push((c, false));
             continue;
         }
         match it.next() {
             // `\P` 는 줄바꿈, `\\`·`\{`·`\}` 는 그 글자 자체.
-            Some('P') => out.push('\n'),
-            Some(e @ ('\\' | '{' | '}')) => out.push(e),
+            Some('P') => out.push(('\n', true)),
+            Some(e @ ('\\' | '{' | '}')) => out.push((e, true)),
             // 나머지 제어열은 `;` 까지 버린다 (`\W0.8;`, `\H1.2x;`).
             Some(_) => {
                 for c in it.by_ref() {
@@ -692,7 +793,10 @@ fn strip_mtext(s: &str) -> String {
             None => break,
         }
     }
-    out.trim_matches(|c| c == '{' || c == '}').trim().to_string()
+    let brace = |(c, escaped): &(char, bool)| !escaped && (*c == '{' || *c == '}');
+    let from = out.iter().position(|p| !brace(p)).unwrap_or(out.len());
+    let to = out.iter().rposition(|p| !brace(p)).map_or(from, |i| i + 1);
+    out[from..to].iter().map(|(c, _)| *c).collect::<String>().trim().to_string()
 }
 
 /// `12.3m²` 에서 숫자만. 꼴이 다르면 `None`.
@@ -1119,6 +1223,107 @@ mod tests {
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
         assert_eq!(back.added, 0);
         assert!(back.notes.iter().any(|n| n.contains("wall")), "notes: {:?}", back.notes);
+    }
+
+    /// 글자 하나를 꽂고 정체성을 찍는다. `attach` 는 윗줄 코드다 (1 TL · 2 TC · 3 TR).
+    fn mtext_at(d: &mut Drawing, at: Vec2, height: f64, attach: u8, contents: &str) -> usize {
+        let from = d.model.len();
+        let h = d.new_handle();
+        let mut e = Entity::new(
+            h,
+            EntityKind::MText(cadcraft_doc::MText {
+                insert: Vec3::new(at.x, at.y, 0.0),
+                height,
+                width: 0.0,
+                attach,
+                rotation: 0.0,
+                style: "Standard".into(),
+                contents: contents.to_string(),
+                line_spacing: 1.0,
+                line_spacing_exact: false,
+                columns: None,
+            }),
+        );
+        e.common.color = Color::True(Rgb(0x1d, 0x1d, 0x1d));
+        d.model.push(e);
+        from
+    }
+
+    #[test]
+    fn 적어_넣은_글자가_저장본으로_돌아온다() {
+        let mut d = Drawing::new_metric();
+        // 왼쪽 위에 꽂았으니 (attach 1) 캔버스 x·y 가 꽂은 자리 그대로여야 한다.
+        let from = mtext_at(&mut d, Vec2::new(300.0, -200.0), 24.0, 1, "현관");
+        crate::identity::stamp_one(&mut d, from, crate::identity::TEXT, "shape:bimove:text:a");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+
+        let shapes = shapes_of(&back.json);
+        let t = shapes.iter().find(|s| s.get("id").unwrap() == "shape:bimove:text:a").unwrap();
+        assert_eq!(t.get("type").unwrap(), "text");
+        assert_eq!(t.get("x").unwrap(), 300.0);
+        // 캔버스는 y 가 아래로 간다 — 엔진 -200 이 캔버스 +200 이다.
+        assert_eq!(t.get("y").unwrap(), 200.0);
+        let p = t.get("props").unwrap();
+        assert_eq!(p.get("text").unwrap(), "현관");
+        assert_eq!(p.get("size").unwrap(), "m");
+        // 24 가 'm' 의 기준 크기다 (`bimove.rs` 의 `font_px`).
+        assert_eq!(p.get("scale").unwrap(), 1.0);
+        assert_eq!(p.get("textAlign").unwrap(), "start");
+        assert_eq!(p.get("color").unwrap(), "black");
+        assert_eq!(p.get("autoSize").unwrap(), true);
+        // **0 이면 tldraw 가 그 도면을 통째로 거부한다** (`nonZeroNumber`).
+        assert!(p.get("w").unwrap().as_f64().unwrap() > 0.0, "w: {:?}", p.get("w"));
+    }
+
+    #[test]
+    fn 글자_높이가_배율로_돌아온다() {
+        let mut d = Drawing::new_metric();
+        let from = mtext_at(&mut d, Vec2::ZERO, 48.0, 1, "크게");
+        crate::identity::stamp_one(&mut d, from, crate::identity::TEXT, "shape:bimove:text:b");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        let shapes = shapes_of(&back.json);
+        let p = shapes[0].get("props").unwrap();
+        // 크기는 늘 'm' + 배율이다 — 48 / 24 = 2.
+        assert_eq!(p.get("size").unwrap(), "m");
+        assert_eq!(p.get("scale").unwrap(), 2.0);
+    }
+
+    #[test]
+    fn 가운데_정렬이면_상자_왼쪽이_꽂은_자리보다_왼쪽이다() {
+        // `attach` 를 안 풀면 가운데 정렬한 글이 상자 너비의 반만큼 오른쪽으로
+        // 밀린 자리에 저장된다 (`text_props` 머리말).
+        let mut d = Drawing::new_metric();
+        let from = mtext_at(&mut d, Vec2::new(1000.0, 0.0), 24.0, 2, "가운데");
+        crate::identity::stamp_one(&mut d, from, crate::identity::TEXT, "shape:bimove:text:c");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        let shapes = shapes_of(&back.json);
+        let t = &shapes[0];
+        let p = t.get("props").unwrap();
+        assert_eq!(p.get("textAlign").unwrap(), "middle");
+        let w = p.get("w").unwrap().as_f64().unwrap();
+        let x = t.get("x").unwrap().as_f64().unwrap();
+        // 꽂은 점이 상자의 **가운데**다.
+        assert!((x + w / 2.0 - 1000.0).abs() < 2.0, "x {x} w {w}");
+    }
+
+    #[test]
+    fn 글자가_비면_안_읽고_말한다() {
+        // 안 보이는 것이 저장본에 남으면 아무도 못 지운다.
+        let mut d = Drawing::new_metric();
+        let from = mtext_at(&mut d, Vec2::ZERO, 24.0, 1, "   ");
+        crate::identity::stamp_one(&mut d, from, crate::identity::TEXT, "shape:bimove:text:d");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 0);
+        assert!(back.notes.iter().any(|n| n.contains("text")), "notes: {:?}", back.notes);
     }
 
     /// 손잡이 하나짜리 엔티티를 넣고 `line` 정체성을 찍는다.
