@@ -1203,6 +1203,54 @@ mod tests {
     }
 
     #[test]
+    fn 그린_선의_정체성이_저장본을_건너_살아남는다() {
+        // **왕복에서 제일 중요한 성질이다.** 선이 같은 자리에 서는 것만으로는
+        // 모자란다 — 다시 읽은 선에 정체성이 없으면 고를 수는 있어도
+        // ("Polyline 3개") 패널이 "어느 Bimove 도형인가" 를 몰라서 못 본다.
+        //
+        // 정렬을 한 번 하면 선택이 **영영 안 돌아오던** 자리가 거기였다:
+        // 고치기는 저장본을 쓰고 엔진을 다시 읽는 길이라, 다시 읽은 순간
+        // 정체성이 사라져 다음 단추를 누를 수가 없었다
+        // (하네스 `.browser/enginealign.mjs` 가 잡았다).
+        let id = "shape:bimove:line:p";
+        let d = drawn_line(pline(&[(0.0, 0.0), (500.0, 0.0), (500.0, -300.0)], false), id);
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        let again = crate::bimove::drawing_from_bimove(&back.json, "page:1").expect("다시 읽기 실패");
+
+        assert_eq!(
+            ids_in(&again.drawing),
+            [id.to_string()].into_iter().collect::<BTreeSet<_>>(),
+            "다시 읽은 선에 같은 id 가 박혀 있어야 한다"
+        );
+        // 두 번째 저장에서도 **도형이 안 늘어난다** — 정체성이 살아 있으면
+        // `in_doc` 이 걸러 준다.
+        let twice = drawing_to_bimove(&back.json, "page:1", &ids_in(&again.drawing), &again.drawing)
+            .expect("두 번째 되돌리기 실패");
+        assert_eq!(shapes_of(&twice.json).len(), 1, "같은 선이 두 벌이 되면 안 된다");
+        assert_eq!(twice.added, 0);
+    }
+
+    #[test]
+    fn 들여온_도면에는_정체성을_안_심는다() {
+        // 심으면 선 하나를 찍어도 **수백 선짜리 덩이가 통째로** 잡힌다 —
+        // 지우기 한 번에 도면이 날아가는 자리다. 들여온 것은 id 가
+        // `shape:bimove:line:` 꼴이 아니라서 갈린다.
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "scale": { "pxPerMm": 1.0 },
+            "shapes": [{
+                "id": "shape:imported", "type": "dxfgroup",
+                "x": 0, "y": 0, "rotation": 0, "index": "a1", "parentId": "page:1",
+                "props": { "pathData": "M0,0L100,0M200,0L300,0" },
+            }],
+        })
+        .to_string();
+        let load = crate::bimove::drawing_from_bimove(&doc, "page:1").expect("읽기 실패");
+        assert!(ids_in(&load.drawing).is_empty(), "들여온 선에는 정체성이 없어야 한다");
+    }
+
+    #[test]
     fn 원을_선분으로_쪼갠다() {
         // `pathData` 는 `M`·`L`·`Z` 뿐이다. `A` 로 적으면 읽는 쪽이 "모르는
         // 명령" 으로 세고 그 선을 버린다 — 저장은 됐다 하고 원이 없는 꼴이다.

@@ -221,6 +221,13 @@ fn parse_path(d: &str) -> (Vec<[f64; 4]>, usize) {
     (segs, unknown)
 }
 
+/// 화면에서 **그려 넣은** 선 묶음의 id 머리.
+///
+/// `cadIdentity.newId` 가 내는 꼴이 `shape:bimove:<종류>:<난수>` 다. 가운데
+/// `bimove:` 는 저장본에서 온 것과 그려 넣은 것을 섞지 않으려고 둔 표식이고,
+/// 여기서는 그걸 **되읽는 잣대**로 쓴다.
+const DRAWN_LINE_PREFIX: &str = "shape:bimove:line:";
+
 /// 끝점이 같다고 볼 오차. 들여올 때 좌표를 소수 첫째 자리로 반올림했으므로
 /// (`toFixed(1)`) 그보다 작게 잡으면 붙어 있던 것도 안 붙는다.
 const JOIN_EPS: f64 = 0.05;
@@ -855,6 +862,31 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         let layer = layer_of(meta);
         let color = color_of(meta);
         layers.entry(layer.clone()).or_insert(());
+        // **화면에서 그려 넣은 선 묶음인가.**
+        //
+        // 그린 사각형·원형·폴리라인은 저장본에서 `dxfgroup` 이 된다 —
+        // 들여온 도면과 같은 타입이다 (`to_bimove.rs` 의 `line_props`).
+        // 그래서 여기까지는 둘이 한 길로 온다.
+        //
+        // 그런데 **정체성을 안 심으면 왕복이 안 닫힌다.** 그린 사각형을
+        // 저장하고 다시 읽으면 선은 그대로 서는데 "어느 Bimove 도형인가" 를
+        // 알 길이 없어서, 고를 수는 있어도 (`Polyline 3개`) 패널이 못 본다 —
+        // 정렬을 한 번 하면 선택이 영영 안 돌아오던 자리가 거기였다
+        // (하네스 `enginealign.mjs` 가 잡았다).
+        //
+        // 가르는 잣대는 **id** 다. 화면에서 그린 것만 `shape:bimove:line:`
+        // 으로 시작한다 (`cadIdentity.newId` — 두 출처를 섞지 않으려고 둔
+        // 표식이다). 들여온 도면은 이 꼴이 아니므로 안 심는다. 심으면 선
+        // 하나를 찍어도 수백 선짜리 덩이가 통째로 잡혀서, 지우기 한 번에
+        // 도면이 날아간다.
+        let drawn_line = sh
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with(DRAWN_LINE_PREFIX))
+            .map(str::to_string);
+        // 이 덩이의 엔티티가 어디서 시작하나 — 정체성은 **자리 범위**로
+        // 찍는다 (`identity::stamp`).
+        let group_from = drawing.model.len();
 
         if let Some(d) = s(&props, "pathData") {
             let (segs, unknown) = parse_path(d);
@@ -918,6 +950,11 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
 
         hatch_count +=
             add_hatches(&mut drawing, s(&props, "hatchesJson").unwrap_or(""), gx, gy, &layer, color);
+
+        // 그려 넣은 선 묶음이면 **한 덩이로 묶는다** (위 주석).
+        if let Some(id) = drawn_line {
+            crate::identity::stamp_one(&mut drawing, group_from, crate::identity::LINE, &id);
+        }
     }
 
     // 벽은 맨 마지막에 넣는다 — 이웃을 다 본 뒤에야 줄기로 묶을 수 있다.
