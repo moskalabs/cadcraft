@@ -179,7 +179,7 @@ impl Doc {
             // 그려지는데, 다음 줌에서 맞춰진다.
             let opts = render_opts(tol, f64::from(h) / scale.max(1e-12));
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
-            make_readable(&mut dl, bg_rgb);
+            make_readable(&mut dl, bg_rgb, self.drawing());
             // **틀과 대각선을 걷어낸다.** `render` 크레이트는 `Image` 를 "그림을
             // 못 찾았다" 는 꼴로 그린다 (네모 + 대각선 둘). 우리는 그림을
             // 가졌으니 그 위에 대각선이 그어지면 안 된다 — 편집 화면도 밑그림을
@@ -410,6 +410,33 @@ fn readable_on(c: cadcraft_color::Rgb, bg: cadcraft_color::Rgb) -> cadcraft_colo
     }
 }
 
+/// 이 삼각형 덩이가 **잉크**인가 — 바닥이 아니라 읽혀야 하는 것인가.
+///
+/// 글자 글리프와 화살촉은 외곽선을 쪼갠 삼각형(`Kind::Tris`)으로 나온다.
+/// 그래서 면과 한 덩이로 묶어 건너뛰면 **어두운 배경에서 글자가 안 보인다** —
+/// 지시선은 밝아졌는데 그 끝에 붙은 글만 묻힌 화면이 된다 (실제로 그렇게
+/// 한 번 나왔다).
+///
+/// 반대로 물량표의 연한 띠나 공간의 비치는 바닥은 **면**이다. 그건 연한 게
+/// 목적이라 끌어내면 숯색 덩어리가 되고, 그 위의 글자까지 못 읽게 된다.
+/// 그래서 종류로 가린다 — 글자·치수·지시선에서 나온 삼각형만 잉크로 본다.
+///
+/// 블록 안에서 나온 것은 `model` 에 없어서 못 찾는다. 그때는 **안 밝힌다** —
+/// 모르는 것을 밝혀서 바닥을 망가뜨리는 쪽이 더 나쁘다.
+fn is_ink_tris(d: &cadcraft_doc::Drawing, h: cadcraft_doc::Handle) -> bool {
+    d.model.get(h).is_some_and(|e| {
+        matches!(
+            e.kind,
+            EntityKind::Text(_)
+                | EntityKind::MText(_)
+                | EntityKind::AttDef(_)
+                | EntityKind::Dimension(_)
+                | EntityKind::Leader(_)
+                | EntityKind::MLeader(_)
+        )
+    })
+}
+
 /// 배경에 묻히는 **잉크**를 끌어낸다. **DisplayList 를 제자리에서 고친다.**
 ///
 /// 채움(`Kind::Tris`)과 가림(`Kind::Mask`)은 건드리지 않는다. 면은 잉크가
@@ -420,9 +447,13 @@ fn readable_on(c: cadcraft_color::Rgb, bg: cadcraft_color::Rgb) -> cadcraft_colo
 ///
 /// 어두운 배경에서 어두운 면은 안 보이게 된다. 그건 받아들인다 — Bimove 의
 /// 캔버스는 흰색이고, 면을 밝히면 흰 배경에서 띠가 사라진다.
-fn make_readable(dl: &mut DisplayList, bg: cadcraft_color::Rgb) {
+fn make_readable(dl: &mut DisplayList, bg: cadcraft_color::Rgb, d: &cadcraft_doc::Drawing) {
     for p in &mut dl.prims {
-        if matches!(p.kind, Kind::Tris | Kind::Mask) {
+        if matches!(p.kind, Kind::Mask) {
+            continue;
+        }
+        // 면은 바닥이라 안 건드린다 — **글자에서 나온 삼각형만** 빼고.
+        if matches!(p.kind, Kind::Tris) && !is_ink_tris(d, p.handle) {
             continue;
         }
         // 색 7번은 display_rgb 가 이미 배경에 맞춰 흑백으로 뒤집는다. 그 결과를
@@ -1885,6 +1916,95 @@ mod tests {
         // 흰 배경 — 한이 쓰는 쪽 — 은 색상이 보존된다. 위 테스트 참고.
     }
 
+/// 삼각형 하나짜리 DisplayList. `h` 가 가리키는 엔티티 종류로 갈린다.
+    fn tris_of(h: cadcraft_doc::Handle, color: Rgb) -> DisplayList {
+        let mut dl = DisplayList::default();
+        dl.prims.push(cadcraft_render::DPrim {
+            handle: h,
+            color,
+            aci7: false,
+            lw: 0.0,
+            transparency: 0,
+            kind: Kind::Tris,
+            start: 0,
+            len: 0,
+        });
+        dl
+    }
+
+    #[test]
+    fn 어두운_바탕에서_글자_삼각형은_밝아진다() {
+        // 글자 글리프는 외곽선을 쪼갠 **삼각형**이다. 면과 한 덩이로
+        // 건너뛰면 어두운 캔버스에서 지시선은 밝아지는데 그 끝에 붙은
+        // 글만 묻힌다 — 실제로 그렇게 한 번 나왔다 (`darkgaps.mjs`).
+        let mut d = cadcraft_doc::Drawing::new_metric();
+        let h = d.new_handle();
+        d.model.push(cadcraft_doc::Entity::new(
+            h,
+            EntityKind::MText(cadcraft_doc::MText {
+                insert: cadcraft_geom::Vec3::ZERO,
+                height: 20.0,
+                width: 0.0,
+                attach: 1,
+                rotation: 0.0,
+                style: "Standard".into(),
+                contents: "여기".into(),
+                line_spacing: 1.0,
+                line_spacing_exact: false,
+                columns: None,
+            }),
+        ));
+        let dark = Rgb(0x1e, 0x1e, 0x22);
+        let mut dl = tris_of(h, Rgb(0x1d, 0x1d, 0x1d));
+        make_readable(&mut dl, dark, &d);
+        let c = dl.prims[0].color;
+        assert!(
+            u32::from(c.0) + u32::from(c.1) + u32::from(c.2) > 0x1d * 3,
+            "글자가 바탕에 묻힌 채다: {c:?}",
+        );
+    }
+
+    #[test]
+    fn 면은_어두운_바탕에서도_그대로_둔다() {
+        // 물량표의 연한 띠나 공간의 비치는 바닥이다. 끌어내면 숯색 덩어리가
+        // 되어 그 위의 글자까지 못 읽게 된다.
+        let mut d = cadcraft_doc::Drawing::new_metric();
+        let h = d.new_handle();
+        d.model.push(cadcraft_doc::Entity::new(
+            h,
+            EntityKind::Hatch(cadcraft_doc::Hatch {
+                pattern: "SOLID".into(),
+                solid: true,
+                loops: vec![],
+                scale: 1.0,
+                angle: 0.0,
+                associative: false,
+                style: 0,
+                elevation: 0.0,
+                gradient: None,
+                origin: cadcraft_geom::Vec2::ZERO,
+                background: None,
+                pattern_lines: vec![],
+            }),
+        ));
+        let dark = Rgb(0x1e, 0x1e, 0x22);
+        let band = Rgb(0x1d, 0x1d, 0x1d);
+        let mut dl = tris_of(h, band);
+        make_readable(&mut dl, dark, &d);
+        assert_eq!(dl.prims[0].color, band, "바닥을 밝혀 버렸다");
+    }
+
+    #[test]
+    fn 모르는_손잡이의_삼각형은_안_건드린다() {
+        // 블록 안에서 나온 것은 `model` 에 없다. 모르는 것을 밝혀서 바닥을
+        // 망가뜨리는 쪽이 더 나쁘다.
+        let d = cadcraft_doc::Drawing::new_metric();
+        let band = Rgb(0x1d, 0x1d, 0x1d);
+        let mut dl = tris_of(cadcraft_doc::Handle(0xDEAD), band);
+        make_readable(&mut dl, Rgb(0x1e, 0x1e, 0x22), &d);
+        assert_eq!(dl.prims[0].color, band);
+    }
+
     #[test]
     fn 색_7번은_이미_뒤집힌_뒤에_판단한다() {
         // aci7 은 흰 배경에서 검정이 된다. 그걸 모르고 원본 흰색을 보면
@@ -1900,7 +2020,7 @@ mod tests {
             start: 0,
             len: 0,
         });
-        make_readable(&mut dl, WHITE);
+        make_readable(&mut dl, WHITE, &cadcraft_doc::Drawing::new_metric());
         assert!(dl.prims[0].aci7, "aci7 을 꺼버렸다 — 배경을 바꾸면 안 뒤집힌다");
     }
 
