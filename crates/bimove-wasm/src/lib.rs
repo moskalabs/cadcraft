@@ -19,7 +19,7 @@ pub mod to_bimove;
 pub mod wall;
 pub mod zone;
 
-use cadcraft_doc::Space;
+use cadcraft_doc::{EntityKind, Handle, Space};
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec2;
 use cadcraft_render::{DisplayList, Kind, Options};
@@ -180,12 +180,23 @@ impl Doc {
             let opts = render_opts(tol, f64::from(h) / scale.max(1e-12));
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
             make_readable(&mut dl, bg_rgb);
+            // **틀과 대각선을 걷어낸다.** `render` 크레이트는 `Image` 를 "그림을
+            // 못 찾았다" 는 꼴로 그린다 (네모 + 대각선 둘). 우리는 그림을
+            // 가졌으니 그 위에 대각선이 그어지면 안 된다 — 편집 화면도 밑그림을
+            // 그냥 깔지 틀을 안 그린다.
+            //
+            // 프리미티브만 지운다. `verts`/`tris` 는 각 프리미티브가 start/len
+            // 으로 가리키므로 **건드리면 안 된다** — 줄이면 남은 것들의 번호가
+            // 어긋난다. 조금 남는 자리는 틀 세 줄뿐이다.
+            if !self.underlays.is_empty() {
+                let drawn: Vec<Handle> = self.underlays.iter().map(|u| u.handle).collect();
+                dl.prims.retain(|p| !drawn.contains(&p.handle));
+            }
             // 그릴 때 쓰는 tolerance 와 **같은 값**으로 덜어낸다. 그래야
             // 보이는 차이가 없다는 보장이 선다 (decimate 주석 참고).
             decimate(&mut dl, tol);
             self.cache = Some((layout.to_string(), tol, bg, rev, dl));
         }
-        let dl = &self.cache.as_ref()?.4;
         let view = cadcraft_render::raster::View {
             center: cadcraft_geom::Vec2 { x: cx, y: cy },
             scale,
@@ -197,7 +208,18 @@ impl Doc {
         // 97 → 230ms. tiny-skia 의 비-AA 경로가 얇은 선에서 더 비싸다.
         // 그 측정을 남겨 둔다; 다시 시도할 사람이 또 재지 않도록.
         let ro = cadcraft_render::raster::RasterOptions { background: bg_rgb, ..Default::default() };
-        let mut pm = cadcraft_render::raster::render(dl, &view, &ro)?;
+        // 밑그림은 **도면 밑에** 깐다. 바탕을 깔고 → 그림을 얹고 → 그 위에
+        // 도면을 그린다. 순서를 바꾸면 그림이 그 위에 그은 선을 덮어서,
+        // 밑그림을 따라 그리는 일 자체가 안 된다.
+        let mut pm = cadcraft_render::raster::canvas(&view, &ro)?;
+        if !self.underlays.is_empty() {
+            let d = self.drawing();
+            for u in &self.underlays {
+                blit_underlay(&mut pm, u, d, &view);
+            }
+        }
+        let dl = &self.cache.as_ref()?.4;
+        cadcraft_render::raster::render_into(&mut pm, dl, &view, &ro);
 
         // tiny-skia 는 **알파 곱해진(premultiplied)** 픽셀을 준다. 캔버스
         // ImageData 는 곱하지 않은 값을 원한다 — 그냥 넘기면 반투명한 것이
@@ -576,6 +598,22 @@ pub struct Doc {
     /// 때마다 올려주므로, 선 하나만 그어도 다음 렌더에서 자동으로 다시 만든다.
     /// 이걸 빼면 그린 게 화면에 안 나타난다.
     cache: Option<(String, f64, u32, u64, DisplayList)>,
+    /// 깔린 밑그림들 — **푼 픽셀**. 비어 있으면 틀만 그려진다 (옛 동작).
+    underlays: Vec<Underlay>,
+}
+
+/// 깔린 밑그림 한 장.
+///
+/// 네모(자리·크기)는 여기 안 둔다. 그건 도면 안의 엔티티가 들고 있고, 사람이
+/// 끌어 옮기거나 지울 수 있다 — 복사해 두면 그릴 때마다 **옛 자리**에 그린다.
+/// 그릴 때 `handle` 로 찾아서 지금 자리를 읽는다. 지워졌으면 못 찾으니 안
+/// 그려진다, 따로 치울 필요 없이.
+struct Underlay {
+    handle: Handle,
+    /// 알파가 **곱해진** RGBA (tiny-skia 규약).
+    pm: tiny_skia::Pixmap,
+    /// 도형의 불투명도. 밑그림은 흐리게 깔려서 그 위에 그은 선이 보인다.
+    opacity: f32,
 }
 
 /// Bimove 문서에서 **무엇이 몇 개 나왔는지.**
@@ -621,6 +659,90 @@ struct Counts {
 ///
 /// AutoCAD 는 PDSIZE 가 0 이면 **화면** 높이의 5% 로 그리고 화면을 다시 그릴
 /// 때마다 고쳐 잡는다. 화면 높이를 넘겨 주면 그와 같아진다 (늘 캔버스의 5%).
+/// 밑그림 바이트를 **푼다.** 못 푸는 것은 세어서 `notes` 로 말한다.
+///
+/// 한 번만 한다 — 열 때. 그릴 때 풀면 팬 한 번에 수 MB 짜리 jpeg 디코딩이
+/// 프레임마다 돈다.
+fn decode_underlays(images: Vec<bimove::BimoveImage>, notes: &mut Vec<String>) -> Vec<Underlay> {
+    let mut out = Vec::new();
+    let mut failed = 0usize;
+    for im in images {
+        match decode_rgba(&im.bytes) {
+            Some(pm) => out.push(Underlay { handle: im.handle, pm, opacity: im.opacity }),
+            // 조용히 빼면 "밑그림이 날아갔다" 로 보인다. 틀은 그대로 서 있고,
+            // 왜 그림이 안 나오는지는 끝말이 말해 준다.
+            None => failed += 1,
+        }
+    }
+    if failed > 0 {
+        notes.push(format!("밑그림 {failed}장은 그림을 못 풀어서 틀만 그린다"));
+    }
+    out
+}
+
+/// png·jpeg·gif·webp → tiny-skia 픽스맵.
+fn decode_rgba(bytes: &[u8]) -> Option<tiny_skia::Pixmap> {
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let mut data = img.into_raw();
+    // tiny-skia 는 **알파가 곱해진** 픽셀을 다룬다. 곱하지 않고 넣으면
+    // 반투명한 자리가 하얗게 뜬다 (`demultiply_in_place` 의 반대 방향이다).
+    for px in data.chunks_exact_mut(4) {
+        let a = u32::from(px[3]);
+        if a == 255 {
+            continue;
+        }
+        for c in &mut px[..3] {
+            *c = ((u32::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+    tiny_skia::Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h)?)
+}
+
+/// 밑그림 한 장을 화면에 얹는다. 지워졌거나 자리가 망가졌으면 아무것도 안 한다.
+///
+/// ── 셈 ──
+///
+/// 그림 픽셀 `(px, py)` (왼쪽 **위**가 0, y 는 아래로) → 세상 좌표:
+///
+/// ```text
+/// world = o + (px / W) * U + (1 - py / H) * V
+/// ```
+///
+/// `o` 는 엔티티의 `insert` (왼쪽 **아래**), `U`·`V` 는 가로·세로 변 벡터
+/// (`u * size.x`, `v * size.y` — `render` 크레이트가 틀을 그릴 때 쓰는 것과
+/// 같은 식이다). 거기에 화면 변환(배율 + y 뒤집기 + 밀기)을 먹이면 아핀 하나가
+/// 나온다. 돌아간 그림도 이 식 그대로 든다.
+fn blit_underlay(pm: &mut tiny_skia::Pixmap, u: &Underlay, d: &cadcraft_doc::Drawing, view: &cadcraft_render::raster::View) {
+    let Some(e) = d.model.iter().find(|e| e.handle == u.handle) else { return };
+    let EntityKind::Image(i) = &e.kind else { return };
+    let (w, h) = (u.pm.width() as f64, u.pm.height() as f64);
+    if w < 1.0 || h < 1.0 {
+        return;
+    }
+    let o = i.insert.xy();
+    let uu = i.u.xy() * i.size.x;
+    let vv = i.v.xy() * i.size.y;
+    // 화면 변환의 **선형 부분**. 밀기는 아래 `to_screen` 이 한 번에 먹인다.
+    let lin = |v: cadcraft_geom::Vec2| (v.x * view.scale, -v.y * view.scale);
+    let (ax, ay) = lin(uu / w);
+    let (bx, by) = lin(vv / -h);
+    let (tx, ty) = view.to_screen(o + vv);
+    let t = tiny_skia::Transform::from_row(ax as f32, ay as f32, bx as f32, by as f32, tx, ty);
+    if !t.is_finite() {
+        return;
+    }
+    let paint = tiny_skia::PixmapPaint {
+        opacity: u.opacity.clamp(0.0, 1.0),
+        // 밑그림은 거의 늘 줄여서 깔린다 (`placeImage` 가 화면에 맞춘다).
+        // 최근접으로 줄이면 가는 선이 통째로 사라져서 — 도면 밑그림에서는
+        // 그게 **그려야 할 벽**이다 — 쌍선형으로 둔다.
+        quality: tiny_skia::FilterQuality::Bilinear,
+        ..Default::default()
+    };
+    pm.draw_pixmap(0, 0, u.pm.as_ref(), &paint, t, None);
+}
+
 fn render_opts(tolerance: f64, view_height: f64) -> Options {
     Options { tolerance, transparency: true, view_height, ..Options::default() }
 }
@@ -635,7 +757,7 @@ const TOL_SLACK: f64 = 2.0;
 impl Doc {
     fn open(bytes: &[u8]) -> Result<Doc, String> {
         let drawing = cadcraft_io::read_dxf(bytes).map_err(|e| e.to_string())?;
-        Ok(Doc::of(drawing, Vec::new(), Vec::new(), Counts::default(), String::new()))
+        Ok(Doc::of(drawing, Vec::new(), Vec::new(), Counts::default(), String::new(), Vec::new()))
     }
 
     /// Bimove 문서(우리 포맷 JSON)를 읽는다.
@@ -656,19 +778,21 @@ impl Doc {
             zones: load.zone_count,
             boqs: load.boq_count,
         };
-        Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id))
+        Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id, load.images))
     }
 
     fn of(
         drawing: cadcraft_doc::Drawing, pages: Vec<(String, String)>, notes: Vec<String>,
-        counts: Counts, page_id: String,
+        counts: Counts, page_id: String, images: Vec<bimove::BimoveImage>,
     ) -> Doc {
+        let mut notes = notes;
+        let underlays = decode_underlays(images, &mut notes);
         // 심긴 id 는 **세션에 넣기 전에** 뜬다 — 넣은 뒤에는 도면을 빌려야
         // 하고, 그 사이에 편집이 끼면 기준이 "열 때" 가 아니게 된다.
         let loaded_ids = to_bimove::ids_in(&drawing);
         let mut session = Session::empty();
         session.open_drawing(drawing, "bimove", None);
-        Doc { session, pages, notes, counts, page_id, loaded_ids, cache: None }
+        Doc { session, pages, notes, counts, page_id, loaded_ids, cache: None, underlays }
     }
 
     fn drawing(&self) -> &cadcraft_doc::Drawing {
@@ -1135,6 +1259,127 @@ mod tests {
         let ink = (w as usize) * (h as usize) - bg;
         assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 선이 안 찍혔다");
         assert!(bg > 0, "전부 잉크다 — 배경색이 안 먹었다");
+    }
+
+    /// 2x2 불투명 png — **왼쪽 위부터** 빨강·초록 / 파랑·검정.
+    ///
+    /// 한 칸짜리로는 **위아래가 뒤집혔는지**를 못 본다. 저장본의 y 는 아래로
+    /// 가고 엔진의 y 는 위로 가서, 그 뒤집기가 이 블릿에서 가장 틀리기 쉬운
+    /// 자리다. 네 칸이면 어느 모서리가 어디로 갔는지가 그대로 보인다.
+    const QUAD_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR4nGP4z8DwHwyBNJgAAEDRBvrma+v4AAAAAElFTkSuQmCC";
+
+    /// 밑그림 한 장만 깔린 저장본. 캔버스 (100,200) 에 400x300.
+    /// 엔진 좌표로는 x 100..500, y -500..-200 이다.
+    fn underlay_json(opacity: f64) -> String {
+        underlay_with(opacity, "")
+    }
+
+    fn underlay_with(opacity: f64, extra: &str) -> String {
+        format!(
+            r#"{{"version":1,"pages":[{{"id":"page:main","name":"모형","index":"a1"}}],
+               "shapes":[{{"id":"shape:bg","type":"image","x":100,"y":200,"rotation":0,
+                 "index":"a1","parentId":"page:main","opacity":{opacity},
+                 "props":{{"w":400,"h":300,"assetId":"asset:a1"}}}}{extra}],
+               "records":{{"asset:a1":{{"id":"asset:a1","typeName":"asset","type":"image",
+                 "props":{{"src":"{QUAD_PNG}","w":2,"h":2}}}}}},"skipped":0,
+               "source":{{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":1}}}}"#
+        )
+    }
+
+    /// 화면 비율 자리 `(fx, fy)` 픽셀의 RGB. `fy` 는 **위에서부터**.
+    fn at(r: &Raster, fx: f64, fy: f64) -> (u8, u8, u8) {
+        let x = (f64::from(r.w) * fx) as usize;
+        let y = (f64::from(r.h) * fy) as usize;
+        let i = (y * r.w as usize + x) * 4;
+        (r.rgba[i], r.rgba[i + 1], r.rgba[i + 2])
+    }
+    fn mid_rgb(r: &Raster) -> (u8, u8, u8) {
+        at(r, 0.5, 0.5)
+    }
+
+    #[test]
+    fn 밑그림이_진짜_픽셀로_깔린다() {
+        // 전엔 네모 틀과 대각선 둘만 그렸다 (AutoCAD 가 그림을 못 찾았을 때의
+        // 모양). 자리는 맞지만 **그 위에 따라 그릴 수가 없다** — 벽이 어디
+        // 있는지 안 보이니까.
+        let mut doc = Doc::from_bimove(&underlay_json(1.0), "").unwrap();
+        // 그림이 화면을 꽉 채우게 둔다: 가운데 (300, -350), 1px = 1단위.
+        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false).expect("래스터 실패");
+        // **네 모서리가 제자리에 있어야 한다.** 위아래가 뒤집히면 여기서
+        // 빨강과 파랑이 자리를 바꾼다 — 밑그림에서 그건 도면이 거꾸로
+        // 깔렸다는 뜻이고, 그 위에 그린 벽이 전부 틀린 자리에 선다.
+        // 딱 떨어지는 값을 재지 않는다 — 쌍선형으로 늘리므로 이웃 칸이 한두
+        // 단계 배어 나온다. 뒤집힘은 빨강↔파랑처럼 **크게** 어긋나므로 이
+        // 느슨함으로도 다 잡힌다.
+        let near = |got: (u8, u8, u8), want: (u8, u8, u8), what: &str| {
+            let d = |a: u8, b: u8| i32::from(a) - i32::from(b);
+            assert!(
+                d(got.0, want.0).abs() < 24 && d(got.1, want.1).abs() < 24 && d(got.2, want.2).abs() < 24,
+                "{what}: {got:?} (바란 것 {want:?})",
+            );
+        };
+        near(at(&r, 0.25, 0.25), (255, 0, 0), "왼쪽 위가 빨강이 아니다");
+        near(at(&r, 0.75, 0.25), (0, 255, 0), "오른쪽 위가 초록이 아니다");
+        near(at(&r, 0.25, 0.75), (0, 0, 255), "왼쪽 아래가 파랑이 아니다");
+        near(at(&r, 0.75, 0.75), (0, 0, 0), "오른쪽 아래가 검정이 아니다");
+    }
+
+    #[test]
+    fn 그린_선이_밑그림_위에_보인다() {
+        // **순서가 전부다.** 그림을 나중에 얹으면 그 위에 그은 선을 덮어서,
+        // 밑그림을 따라 그리는 일 자체가 안 된다 — 그은 선이 안 보이니까.
+        //
+        // 불투명한 그림 **위 절반**(빨강·초록)에 자홍색 선을 긋는다. 네 칸
+        // 어디에도 자홍은 없고, 빨강과 초록을 섞어도 자홍이 안 나온다 —
+        // 그러니 자홍 픽셀이 보이면 선이 그림 위에 그어진 것이다.
+        //
+        // `r##` 다 — 색이 `"#ff00ff"` 라 `"#` 가 `r#"…"#` 를 거기서 닫는다.
+        let line = r##",{"id":"shape:l","type":"dxfgroup","x":150,"y":275,"rotation":0,
+            "index":"a2","parentId":"page:main",
+            "meta":{"dxfColor":"#ff00ff"},"props":{"pathData":"M0,0L300,0"}}"##;
+        let shot = |extra: &str| {
+            let mut doc = Doc::from_bimove(&underlay_with(1.0, extra), "").unwrap();
+            doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false).expect("래스터 실패").rgba
+        };
+        let (bare, drawn) = (shot(""), shot(line));
+        // 1px 짜리 선이라 **딱 그 색**은 안 나온다 (계단 다듬기가 섞는다).
+        // 그러니 "그림만" 과 견준다 — 선이 그림 위에 그어졌으면 그 줄의
+        // 픽셀이 달라지고, 밑에 깔렸으면 한 픽셀도 안 달라진다.
+        let moved = bare.chunks_exact(4).zip(drawn.chunks_exact(4)).filter(|(a, b)| a != b).count();
+        assert!(moved > 100, "달라진 픽셀이 {moved}개 — 그림이 그은 선을 덮었다");
+    }
+
+    #[test]
+    fn 밑그림은_흐리게_깔린다() {
+        //
+        // 흐리게 깐 밑그림(불투명도 0.4)은 흰 바탕과 섞인다. 왼쪽 위 칸은
+        // 빨강이니 **연한 빨강**이 나와야 한다 — 진한 빨강이면 불투명도를
+        // 안 받은 것이고, 흰색이면 아예 안 그려진 것이다.
+        let mut doc = Doc::from_bimove(&underlay_json(0.4), "").unwrap();
+        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false).expect("래스터 실패");
+        let (rr, gg, bb) = at(&r, 0.25, 0.25);
+        assert!(rr > 200, "빨강 기운이 없다: {rr},{gg},{bb}");
+        assert!(gg > 120 && gg < 200, "흰 바탕과 안 섞였다: {rr},{gg},{bb}");
+        assert_eq!(gg, bb, "초록과 파랑이 다르다 — 섞는 셈이 틀렸다: {rr},{gg},{bb}");
+    }
+
+    #[test]
+    fn 밑그림을_지우면_같이_사라진다() {
+        // 픽셀을 엔티티와 따로 들고 있으니, 엔티티가 없어졌는데 그림만 남는
+        // 일이 생길 수 있다. 자리도 엔티티에서 읽는다 — 그래서 지우면 찾을
+        // 것이 없어 안 그려진다.
+        let mut doc = Doc::from_bimove(&underlay_json(1.0), "").unwrap();
+        let h = doc
+            .drawing()
+            .model
+            .iter()
+            .find(|e| matches!(e.kind, EntityKind::Image(_)))
+            .map(|e| e.handle.hex())
+            .expect("밑그림이 없다");
+        doc.exec("erase", &format!(r#"{{"handles":["{h}"]}}"#)).unwrap();
+        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false).expect("래스터 실패");
+        let (rr, gg, bb) = mid_rgb(&r);
+        assert_eq!((rr, gg, bb), (255, 255, 255), "지웠는데 그림이 남았다: {rr},{gg},{bb}");
     }
 
     // ── 화면에서 구분되지 않는 점 덜어내기 ──

@@ -45,7 +45,7 @@
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::library::PatternLine;
-use cadcraft_doc::{Drawing, Entity, EntityKind, Hatch, HatchLoop, Line, LwPolyline, MText};
+use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Hatch, HatchLoop, Line, LwPolyline, MText};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -56,9 +56,26 @@ use crate::opening::{self, Opening, OpeningKind, Swing};
 use crate::wall::WallSeg;
 use crate::zone::{self, Zone};
 
+/// 밑그림 한 장의 **픽셀 바이트**. 틀을 그리는 엔티티와 짝이다.
+///
+/// 디코딩은 여기서 안 한다 — 이 모듈은 저장본을 엔티티로 옮기는 일만 하고,
+/// png/jpeg 를 푸는 건 연 뒤에 `lib.rs` 가 한 번만 한다. 여기서 풀면 왕복
+/// 시험마다 수 MB 를 디코딩하게 된다.
+pub struct BimoveImage {
+    /// 틀을 그리는 `EntityKind::Image` 의 손잡이. 픽셀을 그릴 수 있게 되면
+    /// **그 틀의 선을 걷어내야** 해서 (그림 위에 대각선이 그어진다) 필요하다.
+    pub handle: Handle,
+    /// png·jpeg 바이트.
+    pub bytes: Vec<u8>,
+    /// 도형의 불투명도 (밑그림은 흐리게 깐다). 0..=1.
+    pub opacity: f32,
+}
+
 /// 옮긴 결과.
 pub struct BimoveLoad {
     pub drawing: Drawing,
+    /// 밑그림 그림들의 픽셀. 틀만 그리던 때는 빈 배열이었다.
+    pub images: Vec<BimoveImage>,
     /// `(id, 이름)` — JS 가 탭을 그리는 데 쓴다.
     pub pages: Vec<(String, String)>,
     /// 옮긴 페이지의 id — 빈 문자열을 넘겼을 때 **무엇이 골라졌는지**.
@@ -335,6 +352,23 @@ fn hatch_loops(runs: Vec<Vec<(f64, f64)>>, at: impl Fn((f64, f64)) -> Vec2) -> V
 }
 
 /// `hatchesJson` 의 해치들을 도면에 넣는다. 넣은 개수를 돌려준다.
+/// asset 레코드의 data URL 에서 바이트를 꺼낸다.
+///
+/// `data:image/png;base64,iVBOR…` 꼴만 받는다. `,` 앞에 `base64` 가 없으면
+/// (퍼센트 인코딩된 data URL) `None` — 밑그림으로 그런 게 올 일은 없고,
+/// 억지로 풀어 봐야 틀린 그림을 그리게 된다.
+fn asset_bytes(records: &Value, asset_id: &str) -> Option<Vec<u8>> {
+    if asset_id.is_empty() {
+        return None;
+    }
+    let src = s(records.get(asset_id)?.get("props")?, "src")?;
+    let (head, body) = src.split_once(',')?;
+    if !head.starts_with("data:") || !head.contains("base64") {
+        return None;
+    }
+    cadcraft_engine::cmd::file::base64_decode(body).filter(|b| !b.is_empty())
+}
+
 /// 밑그림 **그림 하나**를 엔티티로 넣는다. 못 읽으면 `None`.
 ///
 /// ── 왜 넣나 ──
@@ -345,16 +379,16 @@ fn hatch_loops(runs: Vec<Vec<(f64, f64)>>, at: impl Fn((f64, f64)) -> Vec2) -> V
 /// 깔아 두고도 닿을 수가 없었다 (하네스 `.browser/enginedetect.mjs` 가
 /// 단계별로 끊어서 여기까지 짚었다).
 ///
-/// ── 픽셀은 아직 안 그린다 ──
+/// ── 픽셀 ──
 ///
-/// 그려지는 것은 **틀과 대각선 둘**이다 (`render` 크레이트가 `Image` 를
-/// 그렇게 그린다 — AutoCAD 가 그림을 못 찾았을 때와 같은 모양). 자리와
-/// 크기는 맞고, 고르기·지우기·전체보기도 다 든다.
+/// `props.assetId` 가 가리키는 asset 레코드의 `props.src` 가 data URL 이다.
+/// 거기서 base64 를 떼어 **바이트만** 꺼내 `images` 에 쌓는다. 푸는 것도
+/// 그리는 것도 여기 일이 아니다 (`lib.rs`).
 ///
-/// 진짜 픽셀을 그리려면 셋이 더 필요하다: 바이트가 엔진까지 들어오는 길
-/// (저장본에는 base64 로 asset 에 있다), 래스터에 그림을 얹는 자리
-/// (`tiny_skia` 에 png 디코더가 이미 있다), 그리고 변환 처리. 공유
-/// `render` 크레이트를 건드리는 일이라 따로 뗀다.
+/// 바이트를 못 구해도 **엔티티는 넣는다.** 틀만이라도 서 있어야 고르고
+/// 지울 수 있고, 밑그림이 어디 깔렸는지 보인다. src 가 data URL 이 아닌
+/// 경우(blob·http)가 실제로 있을 수 있는데, 거기서 네트워크를 타는 건
+/// 엔진이 할 일이 아니다.
 ///
 /// ── 자리 ──
 ///
@@ -363,7 +397,8 @@ fn hatch_loops(runs: Vec<Vec<(f64, f64)>>, at: impl Fn((f64, f64)) -> Vec2) -> V
 /// `size` 를 그림 크기(단위)로 두고 `u`/`v` 를 단위벡터로 두면 렌더가 재는
 /// `u * size.x` 가 곧 폭이 된다 — 픽셀 수를 몰라도 틀이 맞는다.
 fn add_image(
-    drawing: &mut Drawing, sh: &Value, props: &Value, meta: Option<&Value>,
+    drawing: &mut Drawing, sh: &Value, props: &Value, meta: Option<&Value>, records: &Value,
+    images: &mut Vec<BimoveImage>,
 ) -> Option<String> {
     let w = f(props, "w", 0.0);
     let h = f(props, "h", 0.0);
@@ -394,6 +429,15 @@ fn add_image(
     e.common.layer = layer_of(meta);
     e.common.color = color_of(meta);
     drawing.model.push(e);
+
+    // 픽셀. 못 구하면 틀만 선다 (위 주석).
+    if let Some(bytes) = asset_bytes(records, s(props, "assetId").unwrap_or("")) {
+        // tldraw 의 도형 불투명도. 밑그림은 흐리게 깔아서 그 위에 선을 긋는다
+        // (`DEFAULT_TRACE_OPACITY`). 안 받으면 원본이 진하게 깔려서 그 위에
+        // 그은 선이 안 보인다.
+        let opacity = f(sh, "opacity", 1.0).clamp(0.0, 1.0) as f32;
+        images.push(BimoveImage { handle, bytes, opacity });
+    }
     // **정체성을 심는다.** 안 심으면 그려지기는 해도 "어느 Bimove 도형인가"
     // 를 알 길이 없어서 패널이 못 본다 — 그린 선과 똑같은 병이다
     // (`to_bimove.rs` 의 `DRAWN_LINE_PREFIX` 주석).
@@ -818,6 +862,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut layers: BTreeMap<String, ()> = BTreeMap::new();
     let mut skipped_types: BTreeMap<String, usize> = BTreeMap::new();
     let (mut image_seen, mut image_count) = (0usize, 0usize);
+    // 밑그림 픽셀. `records` 에 base64 로 들어 있다 (`asset_bytes`).
+    let records = doc.get("records").cloned().unwrap_or(Value::Null);
+    let mut images: Vec<BimoveImage> = Vec::new();
     let mut hatch_count = 0usize;
     let mut unknown_cmds = 0usize;
     let mut line_count = 0usize;
@@ -920,10 +967,10 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             continue;
         }
 
-        // **밑그림 그림.** 틀만 그린다 — 픽셀은 아직 못 그린다 (아래).
+        // **밑그림 그림.** 틀(엔티티)과 픽셀(바이트)을 따로 낸다 (`add_image`).
         if kind == "image" {
             image_seen += 1;
-            if add_image(&mut drawing, sh, &props, meta).is_some() {
+            if add_image(&mut drawing, sh, &props, meta, &records, &mut images).is_some() {
                 layers.entry(layer_of(meta)).or_insert(());
                 image_count += 1;
             }
@@ -1118,11 +1165,13 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     if image_seen > image_count {
         notes.push(format!("밑그림 {}개를 못 넣었다 (크기가 0)", image_seen - image_count));
     }
-    // **픽셀을 안 그린다는 것을 말한다.** 틀만 서 있는데 아무 말도 없으면
-    // "밑그림이 날아갔다" 로 읽힌다 (`add_image` 주석).
-    if image_count > 0 {
+    // **픽셀을 못 구한 것은 말한다.** 틀만 서 있는데 아무 말도 없으면
+    // "밑그림이 날아갔다" 로 읽힌다 (`add_image` 주석). 바이트를 다 구했으면
+    // 아무 말도 안 한다 — 제대로 그려지는 것을 굳이 알릴 이유가 없다.
+    let framed = image_count - images.len().min(image_count);
+    if framed > 0 {
         notes.push(format!(
-            "밑그림 {image_count}개는 **틀만** 그렸다 — 그림 자체는 아직 엔진이 못 그린다"
+            "밑그림 {framed}개는 **틀만** 그렸다 — 그림 바이트를 저장본에서 못 찾았다"
         ));
     }
     for (k, n) in &skipped_types {
@@ -1131,6 +1180,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
 
     Ok(BimoveLoad {
         drawing,
+        images,
         pages,
         page_id: want,
         notes,
@@ -1319,8 +1369,9 @@ mod tests {
             crate::to_bimove::ids_in(&r.drawing),
             ["shape:bg".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
         );
-        // 픽셀을 안 그린다는 것을 **말해야** 한다 — 틀만 서 있는데 아무 말도
-        // 없으면 "밑그림이 날아갔다" 로 읽힌다.
+        // asset 이 없으니 바이트를 못 구했다 — 틀만 선다. 그걸 **말해야**
+        // 한다. 틀만 서 있는데 아무 말도 없으면 "밑그림이 날아갔다" 로 읽힌다.
+        assert!(r.images.is_empty(), "asset 도 없는데 픽셀이 생겼다");
         assert!(r.notes.iter().any(|n| n.contains("틀만")), "notes: {:?}", r.notes);
         // 그리고 "안 그린다" 목록에는 안 들어가야 한다.
         assert!(
@@ -1328,6 +1379,55 @@ mod tests {
             "notes: {:?}",
             r.notes
         );
+    }
+
+    /// 1×1 빨강 png 의 data URL. 진짜 png 라 디코더가 받는다.
+    const RED_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn doc_with_asset(shapes: &str, src: &str) -> String {
+        format!(
+            r#"{{"version":1,"pages":[{{"id":"page:main","name":"모형","index":"a1"}}],
+                 "shapes":[{shapes}],
+                 "records":{{"asset:a1":{{"id":"asset:a1","typeName":"asset","type":"image",
+                   "props":{{"src":"{src}","w":1,"h":1}}}}}},"skipped":0,
+                 "source":{{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":1}}}}"#
+        )
+    }
+
+    const BG_SHAPE: &str = r#"{"id":"shape:bg","type":"image","x":100,"y":200,"rotation":0,
+        "index":"a1","parentId":"page:main","opacity":0.4,
+        "props":{"w":400,"h":300,"assetId":"asset:a1"}}"#;
+
+    #[test]
+    fn 밑그림_픽셀이_저장본에서_나온다() {
+        // 틀만 그리던 때의 구멍. 바이트는 저장본의 asset 레코드에 base64 로
+        // 있었는데 엔진까지 들어오는 길이 없었다 — 그래서 사람이 밑그림을
+        // 깔아도 엔진 화면에서는 **그 위에 그릴 수가 없었다.**
+        let r = drawing_from_bimove(&doc_with_asset(BG_SHAPE, RED_PNG), "").unwrap();
+        assert_eq!(r.images.len(), 1, "픽셀이 안 들어왔다 — notes: {:?}", r.notes);
+        let im = &r.images[0];
+        // png 머리 네 바이트.
+        assert_eq!(&im.bytes[..4], &[0x89, b'P', b'N', b'G'], "png 바이트가 아니다");
+        // **도형의 불투명도를 받아온다.** 안 받으면 원본이 진하게 깔려서 그
+        // 위에 그은 선이 안 보인다.
+        assert!((im.opacity - 0.4).abs() < 1e-6, "불투명도: {}", im.opacity);
+        // 틀을 걷어내려면 어느 엔티티인지 알아야 한다.
+        assert!(
+            r.drawing.model.iter().any(|e| e.handle == im.handle && matches!(e.kind, EntityKind::Image(_))),
+            "손잡이가 그 밑그림을 안 가리킨다",
+        );
+        // 제대로 그려질 것이니 "틀만" 소리를 하면 안 된다.
+        assert!(!r.notes.iter().any(|n| n.contains("틀만")), "notes: {:?}", r.notes);
+    }
+
+    #[test]
+    fn data_url_이_아니면_틀만_그리고_말한다() {
+        // blob:·http: 가 올 수 있다. 거기서 네트워크를 타는 건 엔진 일이
+        // 아니다 — 조용히 빈 그림을 그리는 쪽이 훨씬 나쁘다.
+        let r = drawing_from_bimove(&doc_with_asset(BG_SHAPE, "https://example.com/a.png"), "").unwrap();
+        assert!(r.images.is_empty(), "네트워크 주소에서 바이트가 나왔다");
+        assert!(r.drawing.model.iter().any(|e| matches!(e.kind, EntityKind::Image(_))), "틀도 안 섰다");
+        assert!(r.notes.iter().any(|n| n.contains("틀만")), "notes: {:?}", r.notes);
     }
 
     #[test]

@@ -70,13 +70,29 @@ impl Default for RasterOptions {
     }
 }
 
-/// Render to a pixmap. Returns `None` for zero or absurd sizes.
-pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixmap> {
+/// A pixmap of `view`'s size, filled with the background. `None` for zero or absurd sizes.
+///
+/// Callers that draw *under* the display list (a raster underlay, say) make the pixmap here,
+/// paint on it, then hand it to [`render_into`].
+pub fn canvas(view: &View, o: &RasterOptions) -> Option<Pixmap> {
     if view.width == 0 || view.height == 0 || view.width > 16384 || view.height > 16384 {
         return None;
     }
     let mut pm = Pixmap::new(view.width, view.height)?;
     pm.fill(tiny_skia::Color::from_rgba8(o.background.0, o.background.1, o.background.2, 255));
+    Some(pm)
+}
+
+/// Render to a pixmap. Returns `None` for zero or absurd sizes.
+pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixmap> {
+    let mut pm = canvas(view, o)?;
+    render_into(&mut pm, list, view, o);
+    Some(pm)
+}
+
+/// Draw the list **on top of** what `pm` already holds. The background is not laid down here —
+/// [`canvas`] does that, so anything painted in between stays under the drawing.
+pub fn render_into(pm: &mut Pixmap, list: &DisplayList, view: &View, o: &RasterOptions) {
     let vis = view.world_bounds();
     // 같은 붓으로 **잇달아** 오는 선들을 한 path 에 모아 한 번에 긋는다.
     //
@@ -109,7 +125,7 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
                 let want = Brush { rgb: c, alpha: p.alpha(), width: w };
                 // 붓이 바뀌면 쓰던 것을 먼저 긋는다
                 if brush != Some(want) {
-                    flush(&mut pm, &mut pb, &mut brush, o.antialias);
+                    flush(pm, &mut pb, &mut brush, o.antialias);
                     brush = Some(want);
                 }
                 for (i, q) in pts.iter().enumerate() {
@@ -122,11 +138,11 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
                 }
                 // 반투명은 모으지 않는다 — 겹치면 섞이는 횟수가 달라진다
                 if want.alpha != 255 {
-                    flush(&mut pm, &mut pb, &mut brush, o.antialias);
+                    flush(pm, &mut pb, &mut brush, o.antialias);
                 }
                 continue;
             }
-            _ => flush(&mut pm, &mut pb, &mut brush, o.antialias),
+            _ => flush(pm, &mut pb, &mut brush, o.antialias),
         }
         match p.kind {
             // 위에서 `continue` 했다
@@ -177,8 +193,7 @@ pub fn render(list: &DisplayList, view: &View, o: &RasterOptions) -> Option<Pixm
             }
         }
     }
-    flush(&mut pm, &mut pb, &mut brush, o.antialias);
-    Some(pm)
+    flush(pm, &mut pb, &mut brush, o.antialias);
 }
 
 /// 이 선이 화면에 걸치나 — **걸치는 걸 알자마자 그만둔다.**
