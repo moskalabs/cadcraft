@@ -65,6 +65,11 @@ pub const BOQ: &str = "boq";
 /// 그냥 "그려지지 않는 도구" 다). 저장본에서는 `dxfgroup` 한 덩이가 된다 —
 /// 들여온 도면이 가는 바로 그 자리다.
 pub const LINE: &str = "line";
+/// 밑그림 **그림** (밑에 깔고 위에 그리는 래스터).
+///
+/// 엔진에서 **만들 수는 없다** — 저장본에서만 온다. 그래도 정체성이 있어야
+/// 오른쪽 패널이 "밑그림을 골랐다" 를 알고 [벽 자동 인식] 을 띄운다.
+pub const IMAGE: &str = "image";
 
 /// 엔티티에서 읽어낸 정체성.
 #[derive(Clone, Debug, PartialEq, Eq)]

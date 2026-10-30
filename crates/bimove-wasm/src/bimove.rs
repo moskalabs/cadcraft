@@ -335,6 +335,73 @@ fn hatch_loops(runs: Vec<Vec<(f64, f64)>>, at: impl Fn((f64, f64)) -> Vec2) -> V
 }
 
 /// `hatchesJson` 의 해치들을 도면에 넣는다. 넣은 개수를 돌려준다.
+/// 밑그림 **그림 하나**를 엔티티로 넣는다. 못 읽으면 `None`.
+///
+/// ── 왜 넣나 ──
+///
+/// 전엔 `image` 를 통째로 건너뛰었다 (`skipped_types` 로만 셌다). 그래서
+/// 엔진 화면에서 밑그림이 **안 보이고, 고를 수도 없었다.** 고를 수 없으니
+/// 오른쪽 패널의 [벽 자동 인식] 단추가 아예 안 떴다 — Bimove 쪽에 통로를
+/// 깔아 두고도 닿을 수가 없었다 (하네스 `.browser/enginedetect.mjs` 가
+/// 단계별로 끊어서 여기까지 짚었다).
+///
+/// ── 픽셀은 아직 안 그린다 ──
+///
+/// 그려지는 것은 **틀과 대각선 둘**이다 (`render` 크레이트가 `Image` 를
+/// 그렇게 그린다 — AutoCAD 가 그림을 못 찾았을 때와 같은 모양). 자리와
+/// 크기는 맞고, 고르기·지우기·전체보기도 다 든다.
+///
+/// 진짜 픽셀을 그리려면 셋이 더 필요하다: 바이트가 엔진까지 들어오는 길
+/// (저장본에는 base64 로 asset 에 있다), 래스터에 그림을 얹는 자리
+/// (`tiny_skia` 에 png 디코더가 이미 있다), 그리고 변환 처리. 공유
+/// `render` 크레이트를 건드리는 일이라 따로 뗀다.
+///
+/// ── 자리 ──
+///
+/// 저장본의 `x, y` 는 **왼쪽 위**이고 캔버스 y 는 아래로 간다. DXF `IMAGE`
+/// 의 `insert` 는 **왼쪽 아래**다. 그래서 아래 변으로 내려가서 y 를 뒤집는다.
+/// `size` 를 그림 크기(단위)로 두고 `u`/`v` 를 단위벡터로 두면 렌더가 재는
+/// `u * size.x` 가 곧 폭이 된다 — 픽셀 수를 몰라도 틀이 맞는다.
+fn add_image(
+    drawing: &mut Drawing, sh: &Value, props: &Value, meta: Option<&Value>,
+) -> Option<String> {
+    let w = f(props, "w", 0.0);
+    let h = f(props, "h", 0.0);
+    // 크기가 없으면 **안 넣는다.** 0 짜리 틀은 점 하나로 보이는데, 그걸
+    // 고르면 "밑그림을 골랐다" 고 패널이 뜨면서 아무것도 못 한다.
+    if !(w > 0.0) || !(h > 0.0) {
+        return None;
+    }
+    let gx = f(sh, "x", 0.0);
+    let gy = f(sh, "y", 0.0);
+    let from = drawing.model.len();
+    let handle = drawing.new_handle();
+    let mut e = Entity::new(
+        handle,
+        EntityKind::Image(cadcraft_doc::Image {
+            // 캔버스 왼쪽 **위** (gx, gy) → 엔진 왼쪽 **아래**.
+            insert: Vec3::new(gx, -(gy + h), 0.0),
+            u: Vec3::new(1.0, 0.0, 0.0),
+            v: Vec3::new(0.0, 1.0, 0.0),
+            size: Vec2::new(w, h),
+            path: s(props, "assetId").unwrap_or("").to_string(),
+            name: meta.and_then(|m| s(m, "dxfLayer")).unwrap_or("").to_string(),
+            clip: Vec::new(),
+            clipping: false,
+            ..Default::default()
+        }),
+    );
+    e.common.layer = layer_of(meta);
+    e.common.color = color_of(meta);
+    drawing.model.push(e);
+    // **정체성을 심는다.** 안 심으면 그려지기는 해도 "어느 Bimove 도형인가"
+    // 를 알 길이 없어서 패널이 못 본다 — 그린 선과 똑같은 병이다
+    // (`to_bimove.rs` 의 `DRAWN_LINE_PREFIX` 주석).
+    let id = s(sh, "id")?;
+    crate::identity::stamp_one(drawing, from, crate::identity::IMAGE, id);
+    Some(id.to_string())
+}
+
 fn add_hatches(
     drawing: &mut Drawing, json: &str, gx: f64, gy: f64, layer: &str, group_color: Color,
 ) -> usize {
@@ -750,6 +817,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut drawing = Drawing::new_metric();
     let mut layers: BTreeMap<String, ()> = BTreeMap::new();
     let mut skipped_types: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut image_seen, mut image_count) = (0usize, 0usize);
     let mut hatch_count = 0usize;
     let mut unknown_cmds = 0usize;
     let mut line_count = 0usize;
@@ -848,6 +916,16 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(d) = dim_seg(sh, &props, meta) {
                 layers.entry(d.layer.clone()).or_insert(());
                 dims.push(d);
+            }
+            continue;
+        }
+
+        // **밑그림 그림.** 틀만 그린다 — 픽셀은 아직 못 그린다 (아래).
+        if kind == "image" {
+            image_seen += 1;
+            if add_image(&mut drawing, sh, &props, meta).is_some() {
+                layers.entry(layer_of(meta)).or_insert(());
+                image_count += 1;
             }
             continue;
         }
@@ -1037,6 +1115,16 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     if wall_dropped > 0 {
         notes.push(format!("벽체 {wall_dropped}개를 못 그렸다 (두께나 길이가 0)"));
     }
+    if image_seen > image_count {
+        notes.push(format!("밑그림 {}개를 못 넣었다 (크기가 0)", image_seen - image_count));
+    }
+    // **픽셀을 안 그린다는 것을 말한다.** 틀만 서 있는데 아무 말도 없으면
+    // "밑그림이 날아갔다" 로 읽힌다 (`add_image` 주석).
+    if image_count > 0 {
+        notes.push(format!(
+            "밑그림 {image_count}개는 **틀만** 그렸다 — 그림 자체는 아직 엔진이 못 그린다"
+        ));
+    }
     for (k, n) in &skipped_types {
         notes.push(format!("{k} {n}개 — 여기서 안 그린다 (Bimove overlay 몫)"));
     }
@@ -1197,6 +1285,62 @@ mod tests {
                  "shapes":[{shapes}],"records":{{}},"skipped":0,
                  "source":{{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":1}}}}"#
         )
+    }
+
+    #[test]
+    fn 밑그림_그림이_틀로_들어온다() {
+        // 전엔 `image` 를 통째로 건너뛰었다. 엔진 화면에서 밑그림이 **안
+        // 보이고 고를 수도 없어서**, 오른쪽 패널의 [벽 자동 인식] 단추가
+        // 아예 안 떴다 (하네스 `.browser/enginedetect.mjs` 가 짚었다).
+        let j = doc_json(
+            r#"{"id":"shape:bg","type":"image","x":100,"y":200,"rotation":0,"index":"a1",
+                "parentId":"page:main","opacity":0.4,
+                "props":{"w":400,"h":300,"assetId":"asset:a1"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let img = r
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("밑그림이 엔티티로 안 들어왔다");
+        // 저장본 `x, y` 는 **왼쪽 위**이고 캔버스 y 는 아래로 간다. DXF
+        // `IMAGE` 의 `insert` 는 **왼쪽 아래**다 — 아래 변으로 내려가서 뒤집는다.
+        assert_eq!(img.insert.x, 100.0);
+        assert_eq!(img.insert.y, -500.0, "y=200 아래로 300 → 엔진 -500");
+        // `u * size.x` 가 폭, `v * size.y` 가 높이다 (렌더가 그렇게 잰다).
+        assert_eq!(img.u.x * img.size.x, 400.0);
+        assert_eq!(img.v.y * img.size.y, 300.0);
+        // **정체성이 있어야** 패널이 "밑그림을 골랐다" 를 안다.
+        assert_eq!(
+            crate::to_bimove::ids_in(&r.drawing),
+            ["shape:bg".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
+        );
+        // 픽셀을 안 그린다는 것을 **말해야** 한다 — 틀만 서 있는데 아무 말도
+        // 없으면 "밑그림이 날아갔다" 로 읽힌다.
+        assert!(r.notes.iter().any(|n| n.contains("틀만")), "notes: {:?}", r.notes);
+        // 그리고 "안 그린다" 목록에는 안 들어가야 한다.
+        assert!(
+            !r.notes.iter().any(|n| n.starts_with("image ")),
+            "notes: {:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn 크기가_0_인_밑그림은_안_넣는다() {
+        // 0 짜리 틀은 점 하나로 보이는데, 그걸 고르면 "밑그림을 골랐다" 고
+        // 패널이 뜨면서 아무것도 못 한다.
+        let j = doc_json(
+            r#"{"id":"shape:bg","type":"image","x":0,"y":0,"rotation":0,"index":"a1",
+                "parentId":"page:main","props":{"w":0,"h":300,"assetId":"asset:a1"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(!r.drawing.model.iter().any(|e| matches!(e.kind, EntityKind::Image(_))));
+        assert!(r.notes.iter().any(|n| n.contains("못 넣었다")), "notes: {:?}", r.notes);
     }
 
     #[test]
