@@ -56,6 +56,15 @@ pub const WINDOW: &str = "window";
 pub const ZONE: &str = "zone";
 pub const DIM: &str = "dim";
 pub const BOQ: &str = "boq";
+/// 그냥 **선.** 벽도 공간도 아닌 기하 — 선·폴리라인·사각형·원형이 여기 온다.
+///
+/// 이것만 Bimove 객체가 아니다. `cadIdentity.ts` 는 "선 하나는 Bimove 객체가
+/// 아니다" 고 못 박아 두었고 그 말은 지금도 맞다 — 속성 패널도, 물량도 없다.
+/// 그래도 **정체성은 붙인다.** 안 붙이면 `to_bimove` 가 그 선을 못 봐서,
+/// 사각형을 그려 저장하면 조용히 사라진다 (엔진이 유일한 화면이 된 뒤로는
+/// 그냥 "그려지지 않는 도구" 다). 저장본에서는 `dxfgroup` 한 덩이가 된다 —
+/// 들여온 도면이 가는 바로 그 자리다.
+pub const LINE: &str = "line";
 
 /// 엔티티에서 읽어낸 정체성.
 #[derive(Clone, Debug, PartialEq, Eq)]

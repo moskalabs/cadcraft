@@ -80,6 +80,9 @@ fn type_of(kind: &str) -> Option<&'static str> {
         identity::ZONE => Some("zone"),
         identity::DIM => Some("dimension"),
         identity::BOQ => Some("boqtable"),
+        // 그냥 선은 **들여온 도면과 같은 자리**로 간다. `dxfgroup` 은 이름만
+        // 그룹이고 속은 `pathData` 한 줄이라, 선 묶음을 담는 유일한 타입이다.
+        identity::LINE => Some("dxfgroup"),
         _ => None,
     }
 }
@@ -246,6 +249,7 @@ fn rebuild(
         identity::WALL => wall_props(id, ents)?,
         identity::DIM => dim_props(ents)?,
         identity::DOOR | identity::WINDOW => opening_props(kind, ents)?,
+        identity::LINE => line_props(ents)?,
         // 물량표는 안 연다. 엔진 TABLE 이라 칸 내용이 다 들어 있지만, 애초에
         // CadCraft 화면에 물량표 도구가 없다 (`cadDraw.ts` 의 `CadTool`).
         // 그릴 수 없는 것을 되읽는 길부터 깔 이유가 없다.
@@ -518,6 +522,120 @@ fn opening_props(kind: &str, ents: &[&Entity]) -> Option<Rebuilt> {
     }
 
     Some(Rebuilt { x: cx, y: cy, rotation, props: Value::Object(props) })
+}
+
+/// 그냥 선 묶음을 **`dxfgroup` 한 덩이로** 되읽는다.
+///
+/// ── 왜 `dxfgroup` 인가 ──
+///
+/// 선·폴리라인·사각형·원형은 Bimove 객체가 아니다 (`identity::LINE` 주석).
+/// 그래서 전용 타입을 새로 낼 이유가 없고, 들여온 도면이 이미 가는 자리가
+/// 있다 — `pathData` 한 줄에 선분을 이어붙인 `dxfgroup` 이다. 엔진은 그걸
+/// 읽는 길을 이미 들고 있으므로 (`bimove.rs` 의 `parse_path`) 다시 열면
+/// 같은 선이 그대로 선다.
+///
+/// ── 원·호는 선분으로 쪼갠다 ──
+///
+/// `pathData` 는 `M`·`L`·`Z` 뿐이다 (`parse_path`). `A` 를 써 봐야 읽는 쪽이
+/// "모르는 명령" 으로 세고 그 선을 버린다 — 저장은 됐다고 하고 다시 열면
+/// 원이 없는 꼴이다. 들여올 때 호·원·스플라인을 이미 선분으로 쪼개는 것과
+/// 같은 결정이다. 반지름을 고치는 길은 이 쪼갬과 함께 사라진다 (지금 그
+/// 길이 없고, 생기면 전용 타입이 필요하다 — 여기 적어 둔다).
+///
+/// ── 하나라도 못 읽으면 덩이를 안 만든다 ──
+///
+/// 반만 담으면 다시 열 때 **모양이 달라진 채로** 선다. 그건 안 저장된 것보다
+/// 나쁘다 — 부르는 쪽이 `None` 을 "되읽지 못했다" 로 세어 사람에게 띄운다.
+fn line_props(ents: &[&Entity]) -> Option<Rebuilt> {
+    let mut runs: Vec<Vec<(f64, f64)>> = Vec::new();
+    // 선 굵기. 폴리라인 폭이 있으면 그걸 쓴다 (벽이 아닌 굵은 선).
+    let mut width = 0.0f64;
+    for e in ents {
+        match &e.kind {
+            EntityKind::Line(l) => {
+                runs.push(vec![canvas(l.a.x, l.a.y), canvas(l.b.x, l.b.y)]);
+            }
+            EntityKind::LwPolyline(p) if p.vertices.len() >= 2 => {
+                let mut run: Vec<(f64, f64)> =
+                    p.vertices.iter().map(|v| canvas(v.p.x, v.p.y)).collect();
+                // 닫힌 것은 **첫 점으로 돌아오게** 적는다. `Z` 로 적어도
+                // 읽히지만, 들여온 도면이 `M…L…` 만 쓰므로 꼴을 맞춘다.
+                if p.closed {
+                    run.push(run[0]);
+                }
+                runs.push(run);
+                width = width.max(p.const_width);
+            }
+            EntityKind::Circle(c) => {
+                runs.push(arc_run(c.center.x, c.center.y, c.radius, 0.0, std::f64::consts::TAU));
+            }
+            EntityKind::Arc(a) => {
+                runs.push(arc_run(a.center.x, a.center.y, a.radius, a.start, a.end));
+            }
+            // 모르는 엔티티. 위 주석 — 반만 담지 않는다.
+            _ => return None,
+        }
+    }
+    if runs.is_empty() {
+        return None;
+    }
+
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for r in &runs {
+        for &(x, y) in r {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    // 점은 **도형 자리 기준**으로 적는다 — 엔진이 읽을 때 `x,y` 를 더한다
+    // (`bimove.rs` 의 `at`). 절대 좌표로 적어도 엔진은 같이 읽지만, tldraw
+    // 쪽 `w`·`h` 가 도형 자리에서 재는 상자라서 선택이 엉뚱한 데 잡힌다.
+    let mut d = String::new();
+    let mut segs = 0usize;
+    for r in &runs {
+        for (i, &(x, y)) in r.iter().enumerate() {
+            d.push(if i == 0 { 'M' } else { 'L' });
+            d.push_str(&format!("{},{}", round2(x - x0), round2(y - y0)));
+            if i > 0 {
+                segs += 1;
+            }
+        }
+    }
+
+    Some(Rebuilt {
+        x: x0,
+        y: y0,
+        rotation: 0.0,
+        props: json!({
+            "w": round2(x1 - x0),
+            "h": round2(y1 - y0),
+            "pathData": d,
+            "thickness": if width > 0.0 { round2(width) } else { 1.0 },
+            "segCount": segs,
+            "textsJson": "",
+            "hatchesJson": "",
+        }),
+    })
+}
+
+/// 원·호를 선분 줄로 쪼갠다. 엔진 좌표를 받아 **캔버스 좌표**를 돌려준다.
+///
+/// 쪼갬 수는 한 바퀴에 64 다 — 화면의 미리보기가 48 각형인데
+/// (`cadDraw.ts` 의 `PREVIEW_ARC_STEPS`), 저장본에 굳는 쪽은 한 번 적으면
+/// 못 되돌리므로 더 촘촘하게 둔다. 지름 10m 짜리 원에서 꼭짓점 하나 사이가
+/// 0.5mm 쯤이라 눈에 안 띈다.
+fn arc_run(cx: f64, cy: f64, r: f64, start: f64, end: f64) -> Vec<(f64, f64)> {
+    const FULL_STEPS: f64 = 64.0;
+    let sweep = end - start;
+    let n = ((sweep.abs() / std::f64::consts::TAU) * FULL_STEPS).ceil().max(8.0) as usize;
+    (0..=n)
+        .map(|i| {
+            let t = start + sweep * (i as f64) / (n as f64);
+            canvas(cx + r * t.cos(), cy + r * t.sin())
+        })
+        .collect()
 }
 
 /// 치수 하나를 되읽는다.
@@ -1001,6 +1119,127 @@ mod tests {
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
         assert_eq!(back.added, 0);
         assert!(back.notes.iter().any(|n| n.contains("wall")), "notes: {:?}", back.notes);
+    }
+
+    /// 손잡이 하나짜리 엔티티를 넣고 `line` 정체성을 찍는다.
+    fn drawn_line(kind: EntityKind, id: &str) -> Drawing {
+        let mut d = Drawing::new_metric();
+        let from = d.model.len();
+        let h = d.new_handle();
+        d.model.push(Entity::new(h, kind));
+        crate::identity::stamp_one(&mut d, from, crate::identity::LINE, id);
+        d
+    }
+
+    fn pline(verts: &[(f64, f64)], closed: bool) -> EntityKind {
+        EntityKind::LwPolyline(cadcraft_doc::LwPolyline {
+            vertices: verts
+                .iter()
+                .map(|&(x, y)| cadcraft_geom::PolyVertex::new(Vec2::new(x, y)))
+                .collect(),
+            closed,
+            const_width: 0.0,
+            elevation: 0.0,
+            plinegen: false,
+        })
+    }
+
+    #[test]
+    fn 사각형을_dxfgroup_으로_되읽는다() {
+        // **엔진이 유일한 화면이 된 뒤의 핵심 성질이다.** 전엔 `line` 종류가
+        // 없어서 사각형을 그려 저장하면 `to_bimove` 가 못 보고 조용히 사라졌다
+        // — 그려지지 않는 도구와 같다 (하네스가 "저장본 도형 0개" 로 잡았다).
+        let d = drawn_line(
+            pline(&[(0.0, 0.0), (1000.0, 0.0), (1000.0, -500.0), (0.0, -500.0)], true),
+            "shape:bimove:line:r",
+        );
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+
+        let sh = &shapes_of(&back.json)[0];
+        assert_eq!(sh.get("type").unwrap(), "dxfgroup");
+        assert_eq!(sh.get("parentId").unwrap(), "page:1");
+        // 캔버스는 y 가 아래로 간다 — 엔진 -500 이 캔버스 +500 이고,
+        // 상자의 왼쪽 위가 (0, 0) 이다.
+        assert_eq!(sh.get("x").unwrap(), 0.0);
+        assert_eq!(sh.get("y").unwrap(), 0.0);
+        let props = sh.get("props").unwrap();
+        assert_eq!(props.get("w").unwrap(), 1000.0);
+        assert_eq!(props.get("h").unwrap(), 500.0);
+        // 닫힌 것은 첫 점으로 돌아온다 — 꼭짓점 넷 + 되돌아오기 = 선분 넷.
+        assert_eq!(props.get("segCount").unwrap(), 4);
+        assert_eq!(
+            props.get("pathData").unwrap().as_str().unwrap(),
+            "M0,0L1000,0L1000,500L0,500L0,0"
+        );
+    }
+
+    #[test]
+    fn 그린_선이_저장본을_건너_같은_자리에_선다() {
+        // 되읽기만 되고 **다시 읽히지 않으면** 아무 의미가 없다. 저장본을
+        // 건너 엔진으로 돌아오는 자리까지 한 번에 잰다.
+        let d = drawn_line(
+            pline(&[(100.0, -200.0), (400.0, -200.0), (400.0, -600.0)], false),
+            "shape:bimove:line:p",
+        );
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        let again = crate::bimove::drawing_from_bimove(&back.json, "page:1").expect("다시 읽기 실패");
+        let verts: Vec<Vec2> = again
+            .drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::LwPolyline(p) => Some(p.vertices.iter().map(|v| v.p).collect()),
+                _ => None,
+            })
+            .expect("폴리라인이 없다");
+        assert_eq!(
+            verts,
+            vec![Vec2::new(100.0, -200.0), Vec2::new(400.0, -200.0), Vec2::new(400.0, -600.0)],
+            "그린 자리로 돌아와야 한다"
+        );
+    }
+
+    #[test]
+    fn 원을_선분으로_쪼갠다() {
+        // `pathData` 는 `M`·`L`·`Z` 뿐이다. `A` 로 적으면 읽는 쪽이 "모르는
+        // 명령" 으로 세고 그 선을 버린다 — 저장은 됐다 하고 원이 없는 꼴이다.
+        let d = drawn_line(
+            EntityKind::Circle(cadcraft_doc::Circle {
+                center: cadcraft_geom::Vec3::new(500.0, -500.0, 0.0),
+                radius: 250.0,
+            }),
+            "shape:bimove:line:c",
+        );
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+        let props = shapes_of(&back.json)[0].get("props").unwrap().clone();
+        let path = props.get("pathData").unwrap().as_str().unwrap().to_string();
+        assert!(!path.contains('A'), "호 명령을 쓰면 안 된다: {path}");
+        assert_eq!(props.get("segCount").unwrap(), 64);
+        // 지름 500 짜리 원이니 상자가 500×500 이다 (쪼갬 오차는 round2 안).
+        assert!((props.get("w").unwrap().as_f64().unwrap() - 500.0).abs() < 1.0);
+        assert!((props.get("h").unwrap().as_f64().unwrap() - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn 모르는_엔티티는_반만_담지_않는다() {
+        // 반만 담으면 다시 열 때 **모양이 달라진 채로** 선다. 그건 안
+        // 저장된 것보다 나쁘다 — 못 읽었다고 세어 사람에게 띄운다.
+        let d = drawn_line(
+            EntityKind::Point(cadcraft_doc::Point {
+                p: cadcraft_geom::Vec3::new(0.0, 0.0, 0.0),
+                angle: 0.0,
+            }),
+            "shape:bimove:line:x",
+        );
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 0);
+        assert!(back.notes.iter().any(|n| n.contains("line")), "notes: {:?}", back.notes);
     }
 
     #[test]
