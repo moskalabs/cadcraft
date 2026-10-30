@@ -65,6 +65,10 @@ export class BimoveDoc {
      */
     layoutNames(): string[];
     /**
+     * 읽은 지시선 **도형** 수 (tldraw `arrow`).
+     */
+    leaderCount(): number;
+    /**
      * Bimove 문서에서 만든 선 개수.
      */
     lineCount(): number;
@@ -249,6 +253,7 @@ export interface InitOutput {
     readonly bimovedoc_group: (a: number, b: number, c: number) => [number, number];
     readonly bimovedoc_hatchCount: (a: number) => number;
     readonly bimovedoc_layoutNames: (a: number) => [number, number];
+    readonly bimovedoc_leaderCount: (a: number) => number;
     readonly bimovedoc_lineCount: (a: number) => number;
     readonly bimovedoc_notes: (a: number) => [number, number];
     readonly bimovedoc_openDxf: (a: number, b: number) => [number, number, number];

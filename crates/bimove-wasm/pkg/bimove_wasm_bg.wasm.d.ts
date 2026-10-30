@@ -13,6 +13,7 @@ export const bimovedoc_fromBimove: (a: number, b: number, c: number, d: number) 
 export const bimovedoc_group: (a: number, b: number, c: number) => [number, number];
 export const bimovedoc_hatchCount: (a: number) => number;
 export const bimovedoc_layoutNames: (a: number) => [number, number];
+export const bimovedoc_leaderCount: (a: number) => number;
 export const bimovedoc_lineCount: (a: number) => number;
 export const bimovedoc_notes: (a: number) => [number, number];
 export const bimovedoc_openDxf: (a: number, b: number) => [number, number, number];

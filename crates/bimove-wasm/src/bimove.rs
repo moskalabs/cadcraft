@@ -45,7 +45,10 @@
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::library::PatternLine;
-use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Hatch, HatchLoop, Line, LwPolyline, MText};
+use cadcraft_doc::{
+    Drawing, Entity, EntityKind, Handle, Hatch, HatchLoop, Line, LwPolyline, MLeader, MLeaderStyle,
+    MText,
+};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -100,6 +103,8 @@ pub struct BimoveLoad {
     pub dim_count: usize,
     /// 읽은 공간 **도형** 수.
     pub zone_count: usize,
+    /// 읽은 지시선 **도형** 수 (tldraw `arrow`).
+    pub leader_count: usize,
     /// 읽은 물량표 **도형** 수.
     pub boq_count: usize,
 }
@@ -519,6 +524,137 @@ fn add_text(
 
     let id = s(sh, "id")?;
     crate::identity::stamp_one(drawing, from, crate::identity::TEXT, id);
+    Some(id.to_string())
+}
+
+/// 지시선 치장 크기 (px = mm).
+///
+/// 글자 높이가 글자 도구의 24 가 아니라 **20** 인 이유는 tldraw 가 화살표
+/// 라벨만 따로 재기 때문이다 — `ARROW_LABEL_FONT_SIZES` 의 `m` 이 20 이다
+/// (글자 도형의 `FONT_SIZES.m` 은 24). 여기를 24 로 두면 tldraw 화면에서
+/// 같은 지시선이 조금 작게 뜬다.
+pub const LEADER_TEXT: f64 = 20.0;
+const LEADER_ARROW: f64 = 12.0;
+const LEADER_DOGLEG: f64 = 16.0;
+const LEADER_STYLE: &str = "BIMOVE_LEADER";
+
+/// 이 도면의 지시선 스타일.
+///
+/// 기본 `MLeaderStyle` 은 **inch 도면 값**이다 (화살표 0.18, 글자 0.18).
+/// mm 도면에서 그대로 쓰면 화살촉이 1px 도 안 되어 점으로도 안 보인다 —
+/// `dim.rs` 의 `style_for` 가 ISO-25 위에 화면 크기를 얹는 것과 같은 이유다.
+fn leader_style() -> MLeaderStyle {
+    MLeaderStyle {
+        name: LEADER_STYLE.into(),
+        arrow_size: LEADER_ARROW,
+        text_height: LEADER_TEXT,
+        landing_gap: LEADER_DOGLEG * 0.25,
+        dogleg: LEADER_DOGLEG,
+        text_style: "Standard".into(),
+        annotative: false,
+    }
+}
+
+/// 스타일을 깔고 **머리말도 그리로 돌린다.**
+///
+/// 머리말(`CMLEADERSTYLE`)을 안 돌리면 화면에서 그어 넣는 `mleader` 명령이
+/// 여전히 `Standard` 를 집어서 (annotate.rs 의 `mleader_kind`) 그은 지시선만
+/// 보이지 않는다 — 저장본에서 온 것은 멀쩡한데.
+fn register_leader_style(drawing: &mut Drawing) {
+    let def = leader_style();
+    match drawing.mleader_styles.iter_mut().find(|s| s.name == def.name) {
+        Some(old) => *old = def,
+        None => drawing.mleader_styles.push(def),
+    }
+    drawing.header.set_str("CMLEADERSTYLE", LEADER_STYLE);
+}
+
+/// tldraw `arrow` 도형의 두 끝을 **엔진 좌표**로.
+///
+/// `start`/`end` 는 도형 자리에서 잰 것이고, 도형의 `rotation` 은 그 자리를
+/// 축으로 돈다. 더하기만 하면 돌려 놓은 지시선이 제자리에서 어긋난다.
+fn arrow_ends(sh: &Value, props: &Value) -> Option<(Vec2, Vec2)> {
+    let pt = |k: &str| -> Option<Vec2> {
+        let v = props.get(k)?;
+        let p = Vec2::new(f(v, "x", f64::NAN), f(v, "y", f64::NAN));
+        p.is_finite().then_some(p)
+    };
+    let (a, b) = (pt("start")?, pt("end")?);
+    let r = f(sh, "rotation", 0.0);
+    let (c, s) = (r.cos(), r.sin());
+    let (gx, gy) = (f(sh, "x", 0.0), f(sh, "y", 0.0));
+    // 캔버스는 y 가 아래로 가므로 마지막에 한 번 뒤집는다.
+    let world = |p: Vec2| Vec2::new(gx + p.x * c - p.y * s, -(gy + p.x * s + p.y * c));
+    Some((world(a), world(b)))
+}
+
+/// **지시선 하나.** tldraw `arrow` 도형 → MLEADER.
+///
+/// ── 어느 쪽이 가리키는 끝인가 ──
+///
+/// CAD 지시선은 **화살촉이 가리키는 것**이고 글은 반대쪽 랜딩에 앉는다.
+/// tldraw 화살표는 기본이 `arrowheadEnd: 'arrow'` 라 끌어 놓은 **끝**에
+/// 촉이 선다. 그래서 촉이 붙은 쪽을 가리키는 자리로 읽는다 — 둘 다 없으면
+/// 끝 쪽으로 본다 (끌어 놓은 방향이 그쪽이다).
+///
+/// ── 안 가져오는 것 ──
+///
+/// `bend`. tldraw 화살표는 휠 수 있는데 MLEADER 의 지시선은 꺾은 직선이다.
+/// 휜 것을 그대로 펴서 긋는다 — 양 끝과 글은 맞고 가운데만 다르다.
+fn add_leader(
+    drawing: &mut Drawing, sh: &Value, props: &Value, meta: Option<&Value>,
+) -> Option<String> {
+    let (start, end) = arrow_ends(sh, props)?;
+    let head_start = s(props, "arrowheadStart").unwrap_or("none") != "none";
+    let head_end = s(props, "arrowheadEnd").unwrap_or("arrow") != "none";
+    let (arrow, land) = if head_end || !head_start { (end, start) } else { (start, end) };
+    // 길이 0 짜리는 안 긋는다 (`add_text` 의 빈 글자와 같은 이유).
+    if arrow.dist(land) < 1e-6 {
+        return None;
+    }
+    let text = s(props, "text").unwrap_or("").trim().to_string();
+    let scale = f(props, "scale", 1.0);
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    // 글은 랜딩에서 **멀어지는 쪽**으로 뻗는다 — 화살표 위로 겹치지 않게.
+    let dir = if arrow.x > land.x { -1.0 } else { 1.0 };
+    let gap = LEADER_DOGLEG + LEADER_DOGLEG * 0.25;
+    let from = drawing.model.len();
+    let handle = drawing.new_handle();
+    let mut e = Entity::new(
+        handle,
+        EntityKind::MLeader(MLeader {
+            leaders: vec![vec![Vec3::new(arrow.x, arrow.y, 0.0)]],
+            landing: Vec3::new(land.x, land.y, 0.0),
+            dogleg: LEADER_DOGLEG,
+            text: (!text.is_empty()).then(|| MText {
+                insert: Vec3::new(land.x + gap * dir, land.y, 0.0),
+                height: LEADER_TEXT * scale,
+                width: 0.0,
+                // 4 = ML, 6 = MR. 글이 랜딩의 **세로 가운데**에 서야 지시선
+                // 끝과 글줄이 나란하다.
+                attach: if dir > 0.0 { 4 } else { 6 },
+                rotation: 0.0,
+                style: "Standard".into(),
+                contents: mtext_escape(&text),
+                line_spacing: 1.0,
+                line_spacing_exact: false,
+                columns: None,
+            }),
+            style: LEADER_STYLE.into(),
+            arrow_size: LEADER_ARROW * scale,
+            spline: false,
+            block: None,
+        }),
+    );
+    e.common.layer = layer_of(meta);
+    e.common.color = match s(props, "color").and_then(text_rgb) {
+        Some(rgb) => Color::True(rgb),
+        None => color_of(meta),
+    };
+    drawing.model.push(e);
+
+    let id = s(sh, "id")?;
+    crate::identity::stamp_one(drawing, from, crate::identity::LEADER, id);
     Some(id.to_string())
 }
 
@@ -985,6 +1121,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let shapes = doc.get("shapes").and_then(Value::as_array).cloned().unwrap_or_default();
 
     let mut drawing = Drawing::new_metric();
+    register_leader_style(&mut drawing);
     let mut layers: BTreeMap<String, ()> = BTreeMap::new();
     let mut skipped_types: BTreeMap<String, usize> = BTreeMap::new();
     let (mut image_seen, mut image_count) = (0usize, 0usize);
@@ -997,6 +1134,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut text_count = 0usize;
     // 저장본의 글자 **도형** 중 못 넣은 수 (내용이 빈 것).
     let mut text_dropped = 0usize;
+    let mut leader_count = 0usize;
+    // 길이 0 짜리 화살표. 그으면 아무것도 안 나와서 "지시선이 안 그어진다" 로 읽힌다.
+    let mut leader_dropped = 0usize;
     let mut segment_count = 0usize;
     // 벽은 **모아 두고 한꺼번에** 넣는다. 이어진 벽을 한 MLINE 으로 묶으려면
     // 이웃을 알아야 하고, 이웃은 도형을 다 읽은 뒤에야 다 보인다.
@@ -1103,6 +1243,19 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
                 text_count += 1;
             } else {
                 text_dropped += 1;
+            }
+            continue;
+        }
+
+        // **지시선.** tldraw 의 `arrow` 도형이다 — 위 줄 [지시선] 단추가
+        // tldraw 쪽에서도 네이티브 화살표 도구를 든다 (`TopBar.tsx` 의
+        // `CANON_TOOL`). 라벨이 붙은 화살표가 곧 지시선이다.
+        if kind == "arrow" {
+            if add_leader(&mut drawing, sh, &props, meta).is_some() {
+                layers.entry(layer_of(meta)).or_insert(());
+                leader_count += 1;
+            } else {
+                leader_dropped += 1;
             }
             continue;
         }
@@ -1310,6 +1463,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     if text_dropped > 0 {
         notes.push(format!("글자 {text_dropped}개를 안 넣었다 (내용이 비었다)"));
     }
+    if leader_dropped > 0 {
+        notes.push(format!("지시선 {leader_dropped}개를 안 넣었다 (길이가 0)"));
+    }
     // **픽셀을 못 구한 것은 말한다.** 틀만 서 있는데 아무 말도 없으면
     // "밑그림이 날아갔다" 로 읽힌다 (`add_image` 주석). 바이트를 다 구했으면
     // 아무 말도 안 한다 — 제대로 그려지는 것을 굳이 알릴 이유가 없다.
@@ -1339,6 +1495,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         dim_count,
         zone_count,
         boq_count,
+        leader_count,
     })
 }
 
@@ -1527,13 +1684,116 @@ mod tests {
     }
 
     /// tldraw 글자 도형 하나. 캔버스 (400, 300), 'm' 크기, 왼쪽 정렬.
+const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"rotation":0,
+        "index":"a1","parentId":"page:main",
+        "props":{"start":{"x":0,"y":0},"end":{"x":-100,"y":60},"bend":0,"text":"여기",
+                 "labelPosition":0.5,"arrowheadStart":"none","arrowheadEnd":"arrow",
+                 "color":"black","labelColor":"black","fill":"none","dash":"draw",
+                 "size":"m","font":"draw","scale":1}}"#;
+
+    fn one_leader(r: &BimoveLoad) -> (&MLeader, &std::sync::Arc<Entity>) {
+        r.drawing
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MLeader(m) => Some((m, e)),
+                _ => None,
+            })
+            .expect("지시선이 엔티티로 안 들어왔다")
+    }
+
+    #[test]
+    fn 지시선_도형이_mleader_로_들어온다() {
+        // 전엔 `arrow` 를 건너뛰었다 — 그어 놓은 지시선이 엔진 화면에서
+        // **안 보이고**, 저장하면 역변환이 못 봐서 사라졌다.
+        let r = drawing_from_bimove(&doc_json(LEADER_SHAPE), "").unwrap();
+        let (m, _) = one_leader(&r);
+        // 촉이 `end` 에 선다 (`arrowheadEnd`). 그 끝이 **가리키는 자리**다.
+        let arrow = m.leaders[0][0];
+        assert_eq!((arrow.x, arrow.y), (400.0, -260.0));
+        // 글은 반대쪽 랜딩에 앉는다 — `start` 자리.
+        assert_eq!((m.landing.x, m.landing.y), (500.0, -200.0));
+        let t = m.text.as_ref().expect("라벨이 없다");
+        assert_eq!(t.contents, "여기");
+        assert_eq!(t.height, 20.0);
+        // 화살표가 랜딩의 **왼쪽**이니 글은 오른쪽으로 뻗는다 (attach 4 = ML).
+        assert_eq!(t.attach, 4);
+        assert!(t.insert.x > m.landing.x, "글이 화살표 쪽으로 붙었다");
+        assert_eq!(r.leader_count, 1);
+        assert_eq!(
+            crate::to_bimove::ids_in(&r.drawing),
+            ["shape:a1".to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn 촉이_시작쪽이면_가리키는_끝이_바뀐다() {
+        let j = doc_json(
+            r#"{"id":"shape:a1","type":"arrow","x":0,"y":0,"rotation":0,"index":"a1",
+                "parentId":"page:main",
+                "props":{"start":{"x":10,"y":0},"end":{"x":90,"y":0},"bend":0,"text":"",
+                         "arrowheadStart":"arrow","arrowheadEnd":"none","scale":1}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let (m, _) = one_leader(&r);
+        assert_eq!(m.leaders[0][0].x, 10.0, "촉이 붙은 끝이 가리키는 자리다");
+        assert_eq!(m.landing.x, 90.0);
+        // 라벨이 비면 글자를 안 단다 — 맨 화살표도 지시선이다.
+        assert!(m.text.is_none());
+        assert_eq!(r.leader_count, 1);
+    }
+
+    #[test]
+    fn 길이_0_짜리_지시선은_안_넣고_말한다() {
+        let j = doc_json(
+            r#"{"id":"shape:a1","type":"arrow","x":5,"y":5,"rotation":0,"index":"a1",
+                "parentId":"page:main",
+                "props":{"start":{"x":1,"y":1},"end":{"x":1,"y":1},"text":"x","scale":1}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.leader_count, 0);
+        assert!(
+            r.notes.iter().any(|n| n.contains("지시선") && n.contains("길이가 0")),
+            "notes: {:?}",
+            r.notes,
+        );
+    }
+
+    #[test]
+    fn 돌려_놓은_지시선은_도형_자리를_축으로_돈다() {
+        // `start`/`end` 는 도형 자리에서 잰 값이다. 그냥 더하면 돌려 놓은
+        // 지시선이 제자리에서 어긋난다.
+        let j = doc_json(
+            r#"{"id":"shape:a1","type":"arrow","x":100,"y":0,"rotation":1.5707963267948966,
+                "index":"a1","parentId":"page:main",
+                "props":{"start":{"x":0,"y":0},"end":{"x":50,"y":0},"text":"","scale":1}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        let (m, _) = one_leader(&r);
+        // 90° 돌면 (50,0) 이 (0,50) 이 되고, 캔버스 y 를 뒤집어 -50.
+        let a = m.leaders[0][0];
+        assert!((a.x - 100.0).abs() < 1e-9, "x={}", a.x);
+        assert!((a.y + 50.0).abs() < 1e-9, "y={}", a.y);
+    }
+
+    #[test]
+    fn 지시선_스타일이_mm_크기로_깔린다() {
+        // 기본 MLeaderStyle 은 inch 값이라 (화살촉 0.18) mm 도면에서 안 보인다.
+        // 머리말도 같이 돌려야 **그어 넣는** `mleader` 명령이 이 스타일을 쓴다.
+        let r = drawing_from_bimove(&doc_json(LEADER_SHAPE), "").unwrap();
+        let st = r.drawing.mleader_styles.iter().find(|s| s.name == "BIMOVE_LEADER").expect("스타일이 없다");
+        assert_eq!(st.arrow_size, 12.0);
+        assert_eq!(st.text_height, 20.0);
+        assert_eq!(r.drawing.header.str("CMLEADERSTYLE", ""), "BIMOVE_LEADER");
+    }
+
     const TEXT_SHAPE: &str = r#"{"id":"shape:t1","type":"text","x":400,"y":300,"rotation":0,
         "index":"a1","parentId":"page:main",
         "props":{"text":"현관","size":"m","scale":1,"w":120,"textAlign":"start",
                  "color":"black","font":"draw","autoSize":true}}"#;
 
     #[test]
-    fn 글자_도형이_MTEXT_로_들어온다() {
+    fn 글자_도형이_mtext_도형으로_들어온다() {
         // 전엔 `text` 를 건너뛰었다 — 적어 놓은 글이 엔진 화면에서 **안
         // 보이고**, 그 상태로 저장하면 역변환이 못 봐서 사라졌다.
         let r = drawing_from_bimove(&doc_json(TEXT_SHAPE), "").unwrap();

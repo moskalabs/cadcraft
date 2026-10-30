@@ -149,6 +149,14 @@ export class BimoveDoc {
         return v1;
     }
     /**
+     * 읽은 지시선 **도형** 수 (tldraw `arrow`).
+     * @returns {number}
+     */
+    leaderCount() {
+        const ret = wasm.bimovedoc_leaderCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * Bimove 문서에서 만든 선 개수.
      * @returns {number}
      */

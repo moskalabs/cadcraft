@@ -635,6 +635,8 @@ struct Counts {
     dims: usize,
     /// 읽은 공간 도형 수.
     zones: usize,
+    /// 읽은 지시선 도형 수.
+    leaders: usize,
     /// 읽은 물량표 도형 수.
     boqs: usize,
 }
@@ -777,6 +779,7 @@ impl Doc {
             dims: load.dim_count,
             zones: load.zone_count,
             boqs: load.boq_count,
+            leaders: load.leader_count,
         };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id, load.images))
     }
@@ -1000,6 +1003,12 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = boqCount)]
     pub fn boq_count(&self) -> usize {
         self.0.counts.boqs
+    }
+
+    /// 읽은 지시선 **도형** 수 (tldraw `arrow`).
+    #[wasm_bindgen(js_name = leaderCount)]
+    pub fn leader_count(&self) -> usize {
+        self.0.counts.leaders
     }
 
     /// 배치 탭 이름들.
@@ -2745,6 +2754,56 @@ mod tests {
           "records":{},"skipped":0,
           "source":{"from":"tldraw","at":0,"sourceHash":"x","shapeCount":2}}"##
             .to_string()
+    }
+
+#[test]
+    fn 그어_넣는_지시선도_mm_크기로_나온다() {
+        // 스타일을 테이블에 넣어 두는 것만으로는 모자란다. `mleader` 명령은
+        // 머리말의 `CMLEADERSTYLE` 을 보고 스타일을 고르므로 (annotate.rs 의
+        // `mleader_kind`), 머리말을 안 돌리면 **그어 넣은 것만** 화살촉 0.18 로
+        // 나와서 안 보인다 — 저장본에서 온 것은 멀쩡한 채로.
+        let mut doc = Doc::from_bimove(&walls_only_json(), "").unwrap();
+        doc.exec("mleader", r#"{"points":[[0,0],[500,500]],"text":"여기"}"#).unwrap();
+        let m = doc
+            .drawing()
+            .model
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::MLeader(m) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("지시선이 안 들어갔다");
+        assert_eq!(m.arrow_size, 12.0, "화살촉이 inch 크기다");
+        assert_eq!(m.text.as_ref().expect("라벨이 없다").height, 20.0);
+        assert!(m.dogleg > 1.0, "랜딩 꺾임이 inch 크기다: {}", m.dogleg);
+    }
+
+    #[test]
+    fn 그어_넣은_지시선이_정체성을_달고_저장본으로_돌아온다() {
+        // 명령으로 그은 것에는 정체성이 **안 붙는다** — 붙이는 것은 화면
+        // 쪽이다 (`cadIdentity.ts`). 여기서는 붙였을 때 역변환이 읽는지를 본다.
+        let mut doc = Doc::from_bimove(&walls_only_json(), "").unwrap();
+        doc.exec("mleader", r#"{"points":[[0,0],[500,500]],"text":"여기"}"#).unwrap();
+        let h = doc
+            .drawing()
+            .model
+            .iter()
+            .find(|e| matches!(e.kind, EntityKind::MLeader(_)))
+            .map(|e| e.handle.hex())
+            .unwrap();
+        doc.exec(
+            "xdata.set",
+            &format!(
+                r#"{{"handles":["{h}"],"data":{{"kind":"leader","ids":["shape:bimove:leader:x"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let back = doc.to_bimove(&walls_only_json()).expect("되돌리기 실패");
+        assert!(
+            back.json.contains("shape:bimove:leader:x"),
+            "그은 지시선이 저장본에 없다: {:?}",
+            back.notes,
+        );
     }
 
     #[test]

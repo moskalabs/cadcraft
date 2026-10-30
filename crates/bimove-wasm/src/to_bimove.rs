@@ -86,6 +86,9 @@ fn type_of(kind: &str) -> Option<&'static str> {
         // 글자는 tldraw 의 `text` 도형이다 — 오른쪽 패널이 크기·정렬·색을
         // 이미 그 타입으로 띄운다 (`RBar.tsx`).
         identity::TEXT => Some("text"),
+        // 지시선은 tldraw 의 `arrow` 다 — 위 줄 [지시선] 단추가 tldraw
+        // 쪽에서도 네이티브 화살표를 드는 그 자리다 (`TopBar.tsx`).
+        identity::LEADER => Some("arrow"),
         _ => None,
     }
 }
@@ -256,6 +259,7 @@ fn rebuild(
         // 글자는 **도면을 받는다.** 상자를 엔진 레이아웃에서 떠야 한다
         // (`text_props` 머리말).
         identity::TEXT => text_props(drawing, ents)?,
+        identity::LEADER => leader_props(ents)?,
         // 물량표는 안 연다. 엔진 TABLE 이라 칸 내용이 다 들어 있지만, 애초에
         // CadCraft 화면에 물량표 도구가 없다 (`cadDraw.ts` 의 `CadTool`).
         // 그릴 수 없는 것을 되읽는 길부터 깔 이유가 없다.
@@ -745,6 +749,59 @@ fn text_props(d: &Drawing, ents: &[&Entity]) -> Option<Rebuilt> {
     })
 }
 
+/// MLEADER → tldraw `arrow` 도형. `bimove.rs` 의 `add_leader` 의 역이다.
+///
+/// ── 자리를 랜딩에 둔다 ──
+///
+/// 도형의 `x`/`y` 를 **랜딩**(글이 앉는 끝)에 두고 `start` 를 원점으로
+/// 잡는다. 어느 끝이든 될 수 있지만 한쪽으로 못 박아야 왕복이 닫힌다 —
+/// 그리고 `arrowheadEnd: 'arrow'` 가 tldraw 기본값이라, 촉이 `end` 에
+/// 서는 쪽으로 맞추면 다시 열었을 때 화살표가 뒤집히지 않는다.
+///
+/// 돌림은 **늘 0** 이다. 두 끝을 자리에서 잰 값으로 적으므로 각도가 거기
+/// 다 들어 있다. `rotation` 에도 각도를 넣으면 두 번 돈다.
+fn leader_props(ents: &[&Entity]) -> Option<Rebuilt> {
+    let (e, m) = ents.iter().find_map(|e| match &e.kind {
+        EntityKind::MLeader(m) => Some((*e, m)),
+        _ => None,
+    })?;
+    // 화살촉은 지시선의 **첫 점**에 선다 (`render` 의 `MLeader` 가지).
+    let arrow = m.leaders.first().and_then(|l| l.first()).map(|v| v.xy())?;
+    let land = m.landing.xy();
+    if !arrow.is_finite() || !land.is_finite() {
+        return None;
+    }
+    let (ax, ay) = canvas(arrow.x, arrow.y);
+    let (lx, ly) = canvas(land.x, land.y);
+    let text = m.text.as_ref().map(|t| strip_mtext(&t.contents)).unwrap_or_default();
+    // 글자 크기는 **늘 'm' + 배율**이다 (`text_props` 와 같은 규칙). 화살표
+    // 라벨의 'm' 은 20 이다 — 글자 도형의 24 가 아니다.
+    let scale = m.text.as_ref().map_or(1.0, |t| (t.height / 20.0).max(1e-3));
+    Some(Rebuilt {
+        x: round2(lx),
+        y: round2(ly),
+        rotation: 0.0,
+        props: json!({
+            "start": { "x": 0.0, "y": 0.0 },
+            "end": { "x": round2(ax - lx), "y": round2(ay - ly) },
+            // 휜 것은 못 들고 온다 (`add_leader` 머리말). 늘 곧게 돌려준다.
+            "bend": 0.0,
+            "text": text,
+            "labelPosition": 0.5,
+            "arrowheadStart": "none",
+            "arrowheadEnd": "arrow",
+            "color": text_color_name(e.common.color),
+            "labelColor": text_color_name(e.common.color),
+            "fill": "none",
+            "dash": "draw",
+            "size": "m",
+            "font": "draw",
+            // `nonZeroNumber` 다 — 0 을 적으면 그 도면을 영영 못 연다.
+            "scale": round2(scale).max(0.01),
+        }),
+    })
+}
+
 /// 글자 색 → tldraw 색 이름. `bimove.rs` 의 `text_rgb` 의 역이다.
 ///
 /// 모르는 색은 `black` 이다. 넷 중에 없는 색을 적으면 tldraw 가 그 도형을
@@ -1223,6 +1280,110 @@ mod tests {
             drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
         assert_eq!(back.added, 0);
         assert!(back.notes.iter().any(|n| n.contains("wall")), "notes: {:?}", back.notes);
+    }
+
+/// 지시선 하나를 꽂고 정체성을 찍는다. `arrow` 가 가리키는 끝, `land` 가 글이 앉는 끝.
+    fn mleader_at(d: &mut Drawing, arrow: Vec2, land: Vec2, text: Option<&str>) -> usize {
+        let from = d.model.len();
+        let h = d.new_handle();
+        let dir = if arrow.x > land.x { -1.0 } else { 1.0 };
+        let mut e = Entity::new(
+            h,
+            EntityKind::MLeader(cadcraft_doc::MLeader {
+                leaders: vec![vec![Vec3::new(arrow.x, arrow.y, 0.0)]],
+                landing: Vec3::new(land.x, land.y, 0.0),
+                dogleg: 16.0,
+                text: text.map(|t| cadcraft_doc::MText {
+                    insert: Vec3::new(land.x + 20.0 * dir, land.y, 0.0),
+                    height: 20.0,
+                    width: 0.0,
+                    attach: if dir > 0.0 { 4 } else { 6 },
+                    rotation: 0.0,
+                    style: "Standard".into(),
+                    contents: t.to_string(),
+                    line_spacing: 1.0,
+                    line_spacing_exact: false,
+                    columns: None,
+                }),
+                style: "BIMOVE_LEADER".into(),
+                arrow_size: 12.0,
+                spline: false,
+                block: None,
+            }),
+        );
+        e.common.color = Color::True(Rgb(0x1d, 0x1d, 0x1d));
+        d.model.push(e);
+        from
+    }
+
+    #[test]
+    fn 그어_넣은_지시선이_저장본으로_돌아온다() {
+        let mut d = Drawing::new_metric();
+        // 엔진 좌표. 캔버스는 y 가 아래로 가므로 저장본에서 부호가 뒤집힌다.
+        let from = mleader_at(&mut d, Vec2::new(400.0, -260.0), Vec2::new(500.0, -200.0), Some("여기"));
+        crate::identity::stamp_one(&mut d, from, crate::identity::LEADER, "shape:bimove:leader:a");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+
+        let shapes = shapes_of(&back.json);
+        let a = shapes.iter().find(|s| s.get("id").unwrap() == "shape:bimove:leader:a").unwrap();
+        assert_eq!(a.get("type").unwrap(), "arrow");
+        // 도형 자리는 **랜딩**이다.
+        assert_eq!(a.get("x").unwrap(), 500.0);
+        assert_eq!(a.get("y").unwrap(), 200.0);
+        // 두 끝을 자리에서 잰 값으로 적으므로 각도가 거기 다 들어 있다.
+        assert_eq!(a.get("rotation").unwrap(), 0.0);
+        let p = a.get("props").unwrap();
+        assert_eq!(p.get("start").unwrap(), &json!({ "x": 0.0, "y": 0.0 }));
+        // 가리키는 끝이 `end` 다 — tldraw 기본 `arrowheadEnd: 'arrow'` 와 맞는다.
+        assert_eq!(p.get("end").unwrap(), &json!({ "x": -100.0, "y": 60.0 }));
+        assert_eq!(p.get("arrowheadEnd").unwrap(), "arrow");
+        assert_eq!(p.get("arrowheadStart").unwrap(), "none");
+        assert_eq!(p.get("text").unwrap(), "여기");
+        assert_eq!(p.get("color").unwrap(), "black");
+        // **0 이면 tldraw 가 그 도면을 통째로 거부한다** (`nonZeroNumber`).
+        assert!(p.get("scale").unwrap().as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn 라벨이_없는_지시선도_돌아온다() {
+        // 맨 화살표도 지시선이다. 글이 없다고 안 읽으면 그어 놓은 것이 사라진다.
+        let mut d = Drawing::new_metric();
+        let from = mleader_at(&mut d, Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), None);
+        crate::identity::stamp_one(&mut d, from, crate::identity::LEADER, "shape:bimove:leader:b");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        assert_eq!(back.added, 1, "notes: {:?}", back.notes);
+        let p = shapes_of(&back.json)[0].get("props").unwrap().clone();
+        assert_eq!(p.get("text").unwrap(), "");
+        assert_eq!(p.get("scale").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn 지시선_라벨_높이가_배율로_돌아온다() {
+        // 화살표 라벨의 'm' 은 **20** 이다 — 글자 도형의 24 가 아니다
+        // (`ARROW_LABEL_FONT_SIZES`).
+        let mut d = Drawing::new_metric();
+        let from = mleader_at(&mut d, Vec2::ZERO, Vec2::new(100.0, 0.0), Some("크게"));
+        let h = d.model.iter().last().unwrap().handle;
+        d.model.modify(h, |e| {
+            if let EntityKind::MLeader(m) = &mut e.kind {
+                if let Some(t) = &mut m.text {
+                    t.height = 40.0;
+                }
+            }
+        });
+        crate::identity::stamp_one(&mut d, from, crate::identity::LEADER, "shape:bimove:leader:c");
+
+        let back =
+            drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+        let shapes = shapes_of(&back.json);
+        let p = shapes[0].get("props").unwrap();
+        assert_eq!(p.get("size").unwrap(), "m");
+        assert_eq!(p.get("scale").unwrap(), 2.0);
     }
 
     /// 글자 하나를 꽂고 정체성을 찍는다. `attach` 는 윗줄 코드다 (1 TL · 2 TC · 3 TR).
