@@ -395,33 +395,63 @@ fn demultiply_in_place(data: &mut [u8]) {
 /// 글씨가 또렷하면서도 색은 남는다 — 하늘(0,255,255)이 (0,164,164) 이 되고
 /// 파랑(0,0,255)은 이미 충분히 어두워 손대지 않으므로 둘은 그대로 구분된다.
 /// 더 올리면 색이 전부 검정 쪽으로 몰려 레이어 구분이 흐려진다.
-const MIN_INK_CONTRAST: f64 = 0.55;
+/// ── 색 보정은 **기존 화면과 같은 규칙**을 쓴다 ──
+///
+/// 한: "이거 색깔 기반 기존 ux 색 기준으로 하자. 색깔 표현하는것만 일단"
+///
+/// 엔진과 tldraw 화면이 같은 DXF 를 **다른 색으로** 내놓고 있었다. 재 보니
+/// (`.browser/acicolor.mjs`) 색이 사라지는 게 아니라 **보정 규칙이 달랐다** —
+///
+///   기존  `DxfGroupShape.darkenForLightBg` · 루마 Rec.601 · 선 0.38 / 해치 0.45
+///         어두운 바탕에서는 **새까만 것만** 들어올린다 (`isNearBlack`)
+///   엔진  루마 Rec.709 · 바탕과의 차 0.55 (흰 바탕에서 상한 0.45)
+///         어두운 바탕에서는 **전부** 들어올린다
+///
+/// 같은 도면을 두 화면이 다른 농도로 그리면 어느 쪽이 맞는지 알 수 없다.
+/// 그래서 숫자도 식도 기존 쪽에 맞춘다.
+
+/// 선·글자가 흰 바탕에서 가질 수 있는 **가장 밝은 밝기**.
+const UNDERLAY_MAX_LUM: f64 = 0.38;
+// 기존 화면은 해치를 한 단 여리게 뒀다 (`HATCH_MAX_LUM` 0.45). **여기선 못
+// 옮긴다** — 엔진은 면을 아예 안 건드리고 (아래 `make_readable`), Bimove 가
+// 제 손으로 까는 바닥(공간·물량표 띠)도 같은 `EntityKind::Hatch` 라 DXF
+// 해치와 가려낼 수가 없다. 가리려다 연한 바닥을 숯색으로 만든 적이 있다.
+/// 어두운 바탕에서 "안 보인다" 로 볼 밝기.
+const NEAR_BLACK_LUM: f64 = 0.15;
+/// 어두운 바탕에서 새까만 선을 바꿔 끼울 색 (기존 화면의 `#ccc`).
+const DARK_BG_LINE: cadcraft_color::Rgb = cadcraft_color::Rgb(0xcc, 0xcc, 0xcc);
+
+/// 기존 화면과 **같은 루마 식** (Rec.601). `Rgb::luma` 는 Rec.709 라 값이 다르다 —
+/// 노랑·하늘처럼 초록이 센 색에서 두 식의 차가 그대로 농도 차로 나온다.
+fn luma601(c: cadcraft_color::Rgb) -> f64 {
+    (0.299 * f64::from(c.0) + 0.587 * f64::from(c.1) + 0.114 * f64::from(c.2)) / 255.0
+}
 
 fn scale_rgb(c: cadcraft_color::Rgb, f: f64) -> cadcraft_color::Rgb {
     let q = |v: u8| (f64::from(v) * f).round().clamp(0.0, 255.0) as u8;
     cadcraft_color::Rgb(q(c.0), q(c.1), q(c.2))
 }
 
-/// `bg` 위에서 읽히도록 밝기만 옮긴 색.
+/// `bg` 위에서 읽히도록 옮긴 색.
+///
+/// 흰 바탕에서는 **상한**이다 — 넘는 것만 끌어내린다. 성분을 같은 비율로
+/// 줄이므로 색상은 보존된다 (노랑이 회색이 되면 레이어를 색으로 구분하던
+/// 사람이 길을 잃는다).
+///
+/// 어두운 바탕에서는 **새까만 것만** 바꿔 낀다. 전엔 전부 들어올렸는데,
+/// 그러면 AutoCAD 의 검은 화면에서 보던 색과 달라진다 — 거기서는 빨강도
+/// 파랑도 제 색 그대로다.
 fn readable_on(c: cadcraft_color::Rgb, bg: cadcraft_color::Rgb) -> cadcraft_color::Rgb {
-    let (lb, lc) = (bg.luma(), c.luma());
-    if lb >= 0.5 {
-        // 밝은 배경 — 잉크를 어둡게. luma 가 성분의 선형 가중합이라 전부 같은
-        // 비율로 줄이면 목표 밝기에 정확히 떨어지고 색상은 보존된다.
-        let target = lb - MIN_INK_CONTRAST;
-        if lc <= target {
+    let lum = luma601(c);
+    if bg.luma() >= 0.5 {
+        if lum <= UNDERLAY_MAX_LUM {
             return c;
         }
-        scale_rgb(c, (target / lc.max(1e-9)).clamp(0.0, 1.0))
+        scale_rgb(c, (UNDERLAY_MAX_LUM / lum).clamp(0.0, 1.0))
+    } else if lum >= NEAR_BLACK_LUM {
+        c
     } else {
-        // 어두운 배경 — 흰색 쪽으로 섞어 밝힌다 (줄이는 걸론 밝아지지 않는다).
-        let target = lb + MIN_INK_CONTRAST;
-        if lc >= target {
-            return c;
-        }
-        let t = ((target - lc) / (1.0 - lc).max(1e-9)).clamp(0.0, 1.0);
-        let up = |v: u8| (f64::from(v) + (255.0 - f64::from(v)) * t).round() as u8;
-        cadcraft_color::Rgb(up(c.0), up(c.1), up(c.2))
+        DARK_BG_LINE
     }
 }
 
@@ -1399,6 +1429,48 @@ mod tests {
         out
     }
 
+    /// ACI 색을 단 선만 든 아주 작은 DXF.
+    fn aci_dxf(acis: &[i32]) -> Vec<u8> {
+        let mut t = String::new();
+        let mut g = |c: &str, v: &str| { t.push_str(c); t.push('\n'); t.push_str(v); t.push('\n'); };
+        g("  0", "SECTION"); g("  2", "HEADER");
+        g("  9", "$ACADVER"); g("  1", "AC1015");
+        g("  0", "ENDSEC");
+        g("  0", "SECTION"); g("  2", "ENTITIES");
+        for (i, aci) in acis.iter().enumerate() {
+            let y = 10.0 + (i as f64) * 20.0;
+            g("  0", "LINE"); g("  8", "0"); g(" 62", &aci.to_string());
+            g(" 10", "0.0"); g(" 20", &y.to_string()); g(" 30", "0.0");
+            g(" 11", "100.0"); g(" 21", &y.to_string()); g(" 31", "0.0");
+        }
+        g("  0", "ENDSEC"); g("  0", "EOF");
+        t.into_bytes()
+    }
+
+    /// **DXF 의 색이 화면까지 오나.**
+    ///
+    /// 한이 같은 도면의 두 장을 나란히 보냈다 — 한쪽은 색이 살아 있고 한쪽은
+    /// 먹뿐이었다. 브라우저에서 ACI 1·2·3·4·5·6·7·30 띠를 엔진에 넣어 재 보니
+    /// **여덟 칸이 전부 치우침 0** 이었다 (`.browser/acicolor.mjs`). 색이
+    /// 어디선가 통째로 떨어진다는 뜻이다.
+    ///
+    /// 여기서 그 자리를 좁힌다: 읽기(`read_dxf`) 는 62 를 본다
+    /// (`dxf_read::common`). 그러니 남는 건 **그리는 쪽**이다.
+    #[test]
+    fn dxf_의_aci_색이_화면까지_온다() {
+        // 참값은 ACI 표 (`crates/color`). `make_readable` 이 흰 바탕에서
+        // 밝은 색을 끌어내리므로 **색상만** 본다 — 어느 성분이 이기는가.
+        for (aci, want) in [(1, 'r'), (3, 'g'), (5, 'b'), (30, 'r')] {
+            let mut doc = Doc::open(&aci_dxf(&[aci])).unwrap();
+            let got = inks(&doc.raster("", -10.0, 30.0, 2.0, 240, 160, 0xFFFFFF, false, false, false).unwrap(), (255, 255, 255));
+            let hit = got.iter().any(|c| {
+                let (r, g, b) = (i32::from(c.0), i32::from(c.1), i32::from(c.2));
+                match want { 'r' => r > g + 30 && r > b + 30, 'g' => g > r + 30, _ => b > r + 30 }
+            });
+            assert!(hit, "ACI {aci} 가 먹으로 뭉개졌다 — 나온 색: {got:?}");
+        }
+    }
+
     #[test]
     fn 흑백_보기는_색을_먹으로_바꾼다() {
         // 한: "여기 gray on off 원래 기능 있었는데 없네. 그거 넣자"
@@ -2068,6 +2140,26 @@ mod tests {
     const WHITE: Rgb = Rgb(255, 255, 255);
     const DARK: Rgb = Rgb(33, 40, 48);   // CADCraft 기본 배경
 
+    /// 기존 화면(`DxfGroupShape.darkenForLightBg`)과 **같은 값이 나오나.**
+    ///
+    /// 두 화면이 같은 도면을 다른 농도로 그리면 어느 쪽이 맞는지 알 수 없다.
+    /// 그래서 참값을 저쪽 식으로 직접 셈해 맞댄다.
+    fn 기존_규칙(c: Rgb, max: f64) -> Rgb {
+        let lum = luma601(c);
+        if lum <= max { c } else { scale_rgb(c, max / lum) }
+    }
+
+    #[test]
+    fn 흰_배경_보정이_기존_화면과_같다() {
+        // 한: "이거 색깔 기반 기존 ux 색 기준으로 하자"
+        for c in [
+            Rgb(255, 0, 0), Rgb(255, 255, 0), Rgb(0, 255, 0), Rgb(0, 255, 255),
+            Rgb(0, 0, 255), Rgb(255, 0, 255), Rgb(255, 127, 0), Rgb(192, 192, 192),
+        ] {
+            assert_eq!(readable_on(c, WHITE), 기존_규칙(c, UNDERLAY_MAX_LUM), "{c:?}");
+        }
+    }
+
     #[test]
     fn 흰_배경에서_노랑과_하늘이_읽히게_어두워진다() {
         // 한이 보낸 화면에서 안 보이던 바로 그 두 색이다.
@@ -2075,8 +2167,8 @@ mod tests {
             let f = readable_on(c, WHITE);
             // u8 로 반올림하면서 목표에서 한 칸(≈1/255) 모자랄 수 있다.
             assert!(
-                WHITE.luma() - f.luma() >= MIN_INK_CONTRAST - 1.0 / 255.0,
-                "{c:?} → {f:?} 인데 밝기 차가 {:.3} 뿐이다", WHITE.luma() - f.luma()
+                luma601(f) <= UNDERLAY_MAX_LUM + 1.0 / 255.0,
+                "{c:?} → {f:?} 인데 밝기가 {:.3} 이다", luma601(f)
             );
         }
     }
@@ -2103,14 +2195,14 @@ mod tests {
     }
 
     #[test]
-    fn 어두운_배경에서는_반대로_밝아진다() {
-        // 같은 규칙이 검은 배경에도 서야 배경색을 바꿀 수 있다.
-        let f = readable_on(Rgb(0, 0, 90), DARK);
-        assert!(f.luma() - DARK.luma() >= MIN_INK_CONTRAST - 1.0 / 255.0, "{f:?}");
-        assert!(f.2 >= 90, "밝히랬더니 어두워졌다: {f:?}");
-        // 어두운 배경 쪽은 채도가 빠진다. 진한 파랑은 아무리 키워도 밝아지지
-        // 않으므로(루마에서 파랑이 0.07 밖에 안 된다) 흰색을 섞는 수밖에 없다.
-        // 흰 배경 — 한이 쓰는 쪽 — 은 색상이 보존된다. 위 테스트 참고.
+    fn 어두운_배경에서는_새까만_것만_들어올린다() {
+        // 기존 화면의 `isNearBlack` 규칙이다. 전엔 **전부** 밝혔는데, 그러면
+        // AutoCAD 의 검은 화면에서 보던 색과 달라진다 — 거기선 빨강은 빨강이다.
+        assert_eq!(readable_on(Rgb(0, 0, 0), DARK), DARK_BG_LINE);
+        assert_eq!(readable_on(Rgb(0, 0, 90), DARK), DARK_BG_LINE);
+        for c in [Rgb(255, 0, 0), Rgb(0, 255, 0), Rgb(255, 127, 0)] {
+            assert_eq!(readable_on(c, DARK), c, "{c:?} 를 건드렸다");
+        }
     }
 
 /// 삼각형 하나짜리 DisplayList. `h` 가 가리키는 엔티티 종류로 갈린다.
