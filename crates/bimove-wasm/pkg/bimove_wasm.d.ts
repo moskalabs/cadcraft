@@ -108,6 +108,12 @@ export class BimoveDoc {
      */
     pick(layout: string, x: number, y: number, aperture: number): string | undefined;
     /**
+     * 읽은 발주서 **도형** 수.
+     *
+     * 물량표와 마찬가지로 하나가 TABLE 엔티티 하나다 (`crate::po`).
+     */
+    poCount(): number;
+    /**
      * 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
      * `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
      * `draft` 면 **그릴 거리를 다시 만들지 않는다** — 쓰던 걸 그대로 쓴다.
@@ -266,6 +272,7 @@ export interface InitOutput {
     readonly bimovedoc_pageNames: (a: number) => [number, number];
     readonly bimovedoc_pick: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly bimovedoc_pickWindow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
+    readonly bimovedoc_poCount: (a: number) => number;
     readonly bimovedoc_renderPixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => number;
     readonly bimovedoc_revision: (a: number) => number;
     readonly bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;

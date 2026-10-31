@@ -16,6 +16,7 @@ pub mod grid;
 pub mod identity;
 pub mod jsnum;
 pub mod opening;
+pub mod po;
 pub mod to_bimove;
 pub mod wall;
 pub mod zone;
@@ -774,6 +775,7 @@ struct Counts {
     leaders: usize,
     /// 읽은 물량표 도형 수.
     boqs: usize,
+    pos: usize,
 }
 
 /// 그릴 거리를 만드는 옵션.
@@ -914,6 +916,7 @@ impl Doc {
             dims: load.dim_count,
             zones: load.zone_count,
             boqs: load.boq_count,
+            pos: load.po_count,
             leaders: load.leader_count,
         };
         Ok(Doc::of(load.drawing, load.pages, load.notes, counts, load.page_id, load.images))
@@ -1138,6 +1141,14 @@ impl BimoveDoc {
     #[wasm_bindgen(js_name = boqCount)]
     pub fn boq_count(&self) -> usize {
         self.0.counts.boqs
+    }
+
+    /// 읽은 발주서 **도형** 수.
+    ///
+    /// 물량표와 마찬가지로 하나가 TABLE 엔티티 하나다 (`crate::po`).
+    #[wasm_bindgen(js_name = poCount)]
+    pub fn po_count(&self) -> usize {
+        self.0.counts.pos
     }
 
     /// 읽은 지시선 **도형** 수 (tldraw `arrow`).

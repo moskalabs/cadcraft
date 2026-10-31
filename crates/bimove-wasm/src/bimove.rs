@@ -54,6 +54,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::boq::{self, BoqRow, BoqTable};
+use crate::po::{self, PoRow, PoTable};
 use crate::dim::{self, DimScale, DimSeg};
 use crate::opening::{self, Opening, OpeningKind, Swing};
 use crate::wall::WallSeg;
@@ -107,6 +108,8 @@ pub struct BimoveLoad {
     pub leader_count: usize,
     /// 읽은 물량표 **도형** 수.
     pub boq_count: usize,
+    /// 읽은 발주서 **도형** 수.
+    pub po_count: usize,
 }
 
 fn f(v: &Value, key: &str, dflt: f64) -> f64 {
@@ -1032,6 +1035,42 @@ fn boq_table(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<BoqTable
     boq::usable(&t).then_some(t)
 }
 
+/// 발주서 도형 하나를 읽는다.
+///
+/// `boq_table` 과 같은 규칙이다 — `x,y` 가 좌상단이고, 줄은 `props.rowsJson`
+/// 에 실려 있다. 칸 너비·줄 높이는 양쪽에 같은 상수로 박혀 있으므로
+/// `props.w`/`h` 는 읽지 않는다.
+///
+/// `unitPrice` 가 없으면 0 이다 — **"공짜" 가 아니라 "아직 안 적음"** 이고,
+/// `po.rs` 가 그걸 `-` 로 찍는다.
+///
+/// `None` 이면 못 쓰는 것이다 (자리가 NaN).
+fn po_table(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<PoTable> {
+    let rows = serde_json::from_str::<Value>(s(props, "rowsJson").unwrap_or("[]"))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|r| PoRow {
+            group: s(r, "group").unwrap_or("").to_string(),
+            name: s(r, "name").unwrap_or("").to_string(),
+            spec: s(r, "spec").unwrap_or("").to_string(),
+            qty: f(r, "qty", 0.0),
+            unit: s(r, "unit").unwrap_or("").to_string(),
+            unit_price: f(r, "unitPrice", 0.0),
+        })
+        .collect();
+
+    let t = PoTable {
+        id: s(sh, "id").unwrap_or("").to_string(),
+        at: Vec2::new(f(sh, "x", 0.0), f(sh, "y", 0.0)),
+        title: s(props, "title").unwrap_or("발주서").to_string(),
+        rows,
+        layer: layer_of(meta),
+    };
+    po::usable(&t).then_some(t)
+}
+
 /// 도형 하나가 **어느 페이지의 어디에** 놓이나.
 ///
 /// 전엔 `parentId == 페이지` 만 읽었다. 그러면 **그룹 안에 든 것이 통째로
@@ -1162,6 +1201,8 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let mut zone_seen = 0usize;
     let mut boqs: Vec<BoqTable> = Vec::new();
     let mut boq_seen = 0usize;
+    let mut pos: Vec<PoTable> = Vec::new();
+    let mut po_seen = 0usize;
 
     // 그룹 안에 든 도형의 **자리**. 부모를 따라 올라가야 어느 페이지인지, 또
     // 그룹이 얼마나 밀려 있는지 알 수 있다 (아래 `placements` 주석).
@@ -1220,6 +1261,15 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
             if let Some(t) = boq_table(sh, &props, meta) {
                 layers.entry(t.layer.clone()).or_insert(());
                 boqs.push(t);
+            }
+            continue;
+        }
+
+        if kind == "potable" {
+            po_seen += 1;
+            if let Some(t) = po_table(sh, &props, meta) {
+                layers.entry(t.layer.clone()).or_insert(());
+                pos.push(t);
             }
             continue;
         }
@@ -1412,6 +1462,12 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     let boq_dropped = boq_seen - boqs.len();
     boq::add_tables(&mut drawing, &boqs);
 
+    // 발주서도 같은 자리다 — 도면틀 옆에 물량표와 나란히 세우는 표라
+    // 공간보다 위여야 읽힌다.
+    let po_count = po_seen;
+    let po_dropped = po_seen - pos.len();
+    po::add_tables(&mut drawing, &pos);
+
     // 쓰인 레이어를 만들어 둔다. 없으면 엔진이 레이어를 못 찾아 "0" 으로만 본다.
     //
     // **대소문자를 가리지 않고** 찾는다. DXF 레이어 이름은 대소문자를 안 가린다.
@@ -1442,6 +1498,9 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
     }
     if boq_dropped > 0 {
         notes.push(format!("물량표 {boq_dropped}개를 못 그렸다 (자리를 못 읽었다)"));
+    }
+    if po_dropped > 0 {
+        notes.push(format!("발주서 {po_dropped}개를 못 그렸다 (자리를 못 읽었다)"));
     }
     if zone_dropped > 0 {
         notes.push(format!("공간 {zone_dropped}개를 못 그렸다 (점이 셋 미만)"));
@@ -1502,6 +1561,7 @@ pub fn drawing_from_bimove(json: &str, page_id: &str) -> Result<BimoveLoad, Stri
         dim_count,
         zone_count,
         boq_count,
+        po_count,
         leader_count,
     })
 }
@@ -2436,6 +2496,79 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
         assert_eq!(t.cells[2][1].text, "석고보드");
         assert_eq!(t.cells[2][3].text, "12.50");
         assert_eq!(t.cells[2][4].text, "7");
+    }
+
+    // ── 발주서 ──
+
+    fn po_json(i: u32, x: f64, y: f64, rows: &str) -> String {
+        format!(
+            r#"{{"id":"shape:p{i}","type":"potable","x":{x},"y":{y},"rotation":0,"index":"p{i}",
+               "parentId":"page:main","props":{{"w":612,"h":96,
+                 "title":"발주서","rowsJson":"{rows}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn 발주서를_table_로_넣는다() {
+        let rows = rows_json(
+            r#"[{"group":"석고보드","name":"석고보드 (마감재 연동)","spec":"900×1800","qty":12,"unit":"장","unitPrice":0}]"#,
+        );
+        let j = doc_json(&po_json(1, 100.0, 50.0, &rows));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.po_count, 1);
+        let t = only_table(&r);
+        // 제목 + 머리 + 품목 1 + 소계 1 + 총계
+        assert_eq!(t.row_heights.len(), 5);
+        assert_eq!(t.cells[2][0].text, "석고보드");
+        assert_eq!(t.cells[2][3].text, "12");
+        assert_eq!(t.cells[2][4].text, "장");
+        // 단가를 안 적었으니 **0원이 아니라 `-`**
+        assert_eq!(t.cells[2][5].text, "-");
+        assert_eq!(t.cells[2][6].text, "-");
+    }
+
+    #[test]
+    fn 발주서의_좌상단이_그대로_들어간다() {
+        let j = doc_json(&po_json(1, 300.0, 120.0, "[]"));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(only_table(&r).insert.xy(), Vec2::new(300.0, -120.0));
+    }
+
+    #[test]
+    fn 발주서의_못_읽는_rowsJson_은_빈_표가_된다() {
+        let j = doc_json(&po_json(1, 0.0, 0.0, "{{망가짐"));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.po_count, 1);
+        assert!(only_table(&r).cells[2][0].text.contains("없습니다"));
+    }
+
+    /// 물량표와 발주서를 같이 놓아도 **서로의 칸 모양을 안 덮는다.**
+    /// 둘 다 TABLE 이라 스타일 이름이 겹치면 뒤에 든 쪽이 앞을 갈아끼운다.
+    #[test]
+    fn 물량표와_발주서가_같이_선다() {
+        let j = doc_json(&format!(
+            "{},{}",
+            boq_json(1, 0.0, 0.0, "[]", 0.0),
+            po_json(2, 0.0, 300.0, "[]"),
+        ));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert_eq!(r.boq_count, 1);
+        assert_eq!(r.po_count, 1);
+        assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Table(_))), 2);
+        let names: Vec<&str> = r.drawing.table_styles.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&crate::boq::STYLE), "{names:?}");
+        assert!(names.contains(&crate::po::STYLE), "{names:?}");
+    }
+
+    #[test]
+    fn 발주서도_레이어를_만든다() {
+        let j = doc_json(
+            r#"{"id":"shape:p1","type":"potable","x":0,"y":0,"rotation":0,"index":"p1",
+                "parentId":"page:main","props":{"w":612,"h":96,"title":"발주서","rowsJson":"[]"},
+                "meta":{"dxfLayer":"A-PO"}}"#,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-PO"), "레이어가 없다");
     }
 
     #[test]

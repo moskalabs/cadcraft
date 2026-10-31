@@ -23,6 +23,7 @@ export const bimovedoc_pageIds: (a: number) => [number, number];
 export const bimovedoc_pageNames: (a: number) => [number, number];
 export const bimovedoc_pick: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
 export const bimovedoc_pickWindow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
+export const bimovedoc_poCount: (a: number) => number;
 export const bimovedoc_renderPixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => number;
 export const bimovedoc_revision: (a: number) => number;
 export const bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;

@@ -56,6 +56,9 @@ pub const WINDOW: &str = "window";
 pub const ZONE: &str = "zone";
 pub const DIM: &str = "dim";
 pub const BOQ: &str = "boq";
+/// **발주서** 표. 물량표(`BOQ`)와 종류를 나눈다 — 같은 TABLE 이지만 칸도
+/// 내용도 다르고, 되돌릴 때 서로 다른 Bimove 도형으로 가야 한다.
+pub const PO: &str = "po";
 /// 그냥 **선.** 벽도 공간도 아닌 기하 — 선·폴리라인·사각형·원형이 여기 온다.
 ///
 /// 이것만 Bimove 객체가 아니다. `cadIdentity.ts` 는 "선 하나는 Bimove 객체가

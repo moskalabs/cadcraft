@@ -80,6 +80,7 @@ fn type_of(kind: &str) -> Option<&'static str> {
         identity::ZONE => Some("zone"),
         identity::DIM => Some("dimension"),
         identity::BOQ => Some("boqtable"),
+        identity::PO => Some("potable"),
         // 그냥 선은 **들여온 도면과 같은 자리**로 간다. `dxfgroup` 은 이름만
         // 그룹이고 속은 `pathData` 한 줄이라, 선 묶음을 담는 유일한 타입이다.
         identity::LINE => Some("dxfgroup"),

@@ -75,7 +75,7 @@ struct Column {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Align {
+pub(crate) enum Align {
     Left,
     Right,
     Center,
@@ -83,14 +83,14 @@ enum Align {
 
 impl Align {
     /// MTEXT 붙임점 — 세로는 늘 가운데다 (화면도 `y + ROW_H/2` 에 찍는다).
-    fn attach(self) -> u8 {
+    pub(crate) fn attach(self) -> u8 {
         match self {
             Align::Left => 4,
             Align::Center => 5,
             Align::Right => 6,
         }
     }
-    fn suffix(self) -> &'static str {
+    pub(crate) fn suffix(self) -> &'static str {
         match self {
             Align::Left => "L",
             Align::Center => "C",
@@ -109,27 +109,27 @@ const COLUMNS: [Column; 6] = [
 ];
 
 /// 화면의 `BOQ_TITLE_H` / `BOQ_HEADER_H` / `BOQ_ROW_H`.
-const TITLE_H: f64 = 28.0;
-const HEADER_H: f64 = 24.0;
-const ROW_H: f64 = 22.0;
+pub(crate) const TITLE_H: f64 = 28.0;
+pub(crate) const HEADER_H: f64 = 24.0;
+pub(crate) const ROW_H: f64 = 22.0;
 
 /// 화면의 `FONT` / `TITLE_FONT`.
-const FONT: f64 = 11.0;
-const TITLE_FONT: f64 = 13.0;
+pub(crate) const FONT: f64 = 11.0;
+pub(crate) const TITLE_FONT: f64 = 13.0;
 
 /// 화면의 `INK` / `RULE`, 그리고 "내용 없음" 글자색.
-const INK: Rgb = Rgb(0x33, 0x33, 0x33);
-const RULE: Rgb = Rgb(0x9a, 0xa0, 0xa6);
-const MUTED: Rgb = Rgb(0x99, 0x99, 0x99);
+pub(crate) const INK: Rgb = Rgb(0x33, 0x33, 0x33);
+pub(crate) const RULE: Rgb = Rgb(0x9a, 0xa0, 0xa6);
+pub(crate) const MUTED: Rgb = Rgb(0x99, 0x99, 0x99);
 
 /// 채움색 — 화면의 제목줄·머리줄·합계줄.
-const TITLE_FILL: Rgb = Rgb(0xf1, 0xf3, 0xf4);
-const HEADER_FILL: Rgb = Rgb(0xfa, 0xfa, 0xfa);
-const TOTAL_FILL: Rgb = Rgb(0xf6, 0xf8, 0xfa);
+pub(crate) const TITLE_FILL: Rgb = Rgb(0xf1, 0xf3, 0xf4);
+pub(crate) const HEADER_FILL: Rgb = Rgb(0xfa, 0xfa, 0xfa);
+pub(crate) const TOTAL_FILL: Rgb = Rgb(0xf6, 0xf8, 0xfa);
 
 /// 칸 안쪽 여백. 화면의 `cellTextX` 기본 `pad = 6`, 제목·합계는 `x = 8`.
-const PAD: f64 = 6.0;
-const EDGE_PAD: f64 = 8.0;
+pub(crate) const PAD: f64 = 6.0;
+pub(crate) const EDGE_PAD: f64 = 8.0;
 
 /// 표 스타일 이름. 표가 여럿이어도 모양은 하나라 스타일도 하나면 된다.
 pub const STYLE: &str = "BIMOVE_BOQ";
@@ -143,7 +143,7 @@ fn table_width() -> f64 {
 /// 화면의 `fitText` 와 **같은 어림**이다 — 글꼴을 재지 않고 글자 수로 센다.
 /// 한글·한자·가나를 1 로, 그 밖을 0.55 로 본다. 엔진에서 제대로 재면 더
 /// 정확하겠지만, 그러면 화면과 다른 자리에서 잘려서 두 그림이 달라진다.
-fn fit_text(text: &str, width: f64) -> String {
+pub(crate) fn fit_text(text: &str, width: f64) -> String {
     let budget = (width - PAD * 2.0) / FONT;
     // 화면의 `/[ㄱ-힝一-鿿぀-ヿ]/` 과 **같은 집합**이다.
     //
@@ -185,13 +185,13 @@ fn cell_text(row: &BoqRow, col: usize) -> String {
 }
 
 /// 테두리 하나.
-fn border(visible: bool) -> CellBorder {
+pub(crate) fn border(visible: bool) -> CellBorder {
     // 색과 굵기는 `ByBlock` 으로 둔다 — 엔티티의 색(괘선색)을 따라간다.
     CellBorder { visible, ..CellBorder::default() }
 }
 
 /// 사방 테두리. `left`/`right` 만 따로 받는다 — 합계줄에서 그 둘을 끈다.
-fn borders(left: bool, right: bool) -> CellBorders {
+pub(crate) fn borders(left: bool, right: bool) -> CellBorders {
     CellBorders {
         left: border(left),
         right: border(right),
@@ -200,7 +200,7 @@ fn borders(left: bool, right: bool) -> CellBorders {
     }
 }
 
-fn style(
+pub(crate) fn style(
     name: &str, height: f64, align: Align, fill: Option<Rgb>, ink: Rgb, pad: f64,
     sides: (bool, bool),
 ) -> CellStyle {
@@ -262,11 +262,11 @@ fn register(drawing: &mut Drawing) {
     }
 }
 
-fn cell(text: impl Into<String>, style: &str) -> TableCell {
+pub(crate) fn cell(text: impl Into<String>, style: &str) -> TableCell {
     TableCell { text: text.into(), style: style.into(), ..TableCell::default() }
 }
 
-fn merged(text: impl Into<String>, style: &str, cols: u32) -> TableCell {
+pub(crate) fn merged(text: impl Into<String>, style: &str, cols: u32) -> TableCell {
     TableCell { merged: Some((1, cols)), ..cell(text, style) }
 }
 

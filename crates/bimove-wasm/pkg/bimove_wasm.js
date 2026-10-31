@@ -271,6 +271,16 @@ export class BimoveDoc {
         return v2;
     }
     /**
+     * 읽은 발주서 **도형** 수.
+     *
+     * 물량표와 마찬가지로 하나가 TABLE 엔티티 하나다 (`crate::po`).
+     * @returns {number}
+     */
+    poCount() {
+        const ret = wasm.bimovedoc_poCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
      * `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
      * `draft` 면 **그릴 거리를 다시 만들지 않는다** — 쓰던 걸 그대로 쓴다.
