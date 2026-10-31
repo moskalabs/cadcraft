@@ -159,7 +159,7 @@ pub fn drawing_to_bimove(
         }
         // 엔진에 들어가지 않았던 도형은 **통과**다 (모듈 주석). id 가 없는
         // 것도 여기로 온다 — 우리가 만든 것이 아니다.
-        if id.is_empty() || !loaded.contains(id) {
+        if id.is_empty() || !engine_backed(sh, id, loaded, page_id) {
             out.push(sh.clone());
             continue;
         }
@@ -275,7 +275,49 @@ fn rebuild(
     m.insert("y".into(), json!(r.y));
     m.insert("rotation".into(), json!(r.rotation));
     m.insert("props".into(), r.props);
+    // **이 도형은 엔진에서 왔다**는 표식. 다음 저장이 "지워졌나" 를 물을 때
+    // 쓴다 — 자세한 건 `engine_backed`.
+    let mut meta = Map::new();
+    meta.insert(FROM_ENGINE.into(), json!(true));
+    m.insert("meta".into(), Value::Object(meta));
     Some(Value::Object(m))
+}
+
+/// 되읽어 넣은 도형에 남기는 표식 (`meta` 안).
+pub const FROM_ENGINE: &str = "cadFromEngine";
+
+/// 이 도형이 **지워졌는지 물어도 되는** 것인가.
+///
+/// 여기가 틀리면 둘 중 하나가 난다. 너무 좁으면 **지운 것이 안 지워지고**,
+/// 너무 넓으면 **안 지운 것이 사라진다.** 뒤쪽이 비교도 안 되게 나쁘다.
+///
+/// ── 왜 `loaded` 만으로는 모자란가 ──
+///
+/// `loaded` 는 **열 때** 도면에 심겨 있던 id 다. 이번에 그린 도형은 거기
+/// 없다. 첫 저장이 문서에 넣어 주고 — 그 다음부터는 "엔진에 안 들어갔던
+/// 것" 으로 읽혀 **통과**한다. 그래서 그려 놓고 지우면 화면에서는 사라지는데
+/// 저장본에는 영영 남았다 (다시 열면 되살아난다). 공간을 하나 그렸다 지우면
+/// 물량표에 유령 공간이 남는 그 자리다.
+///
+/// ── 왜 표식만으로도 모자란가 ──
+///
+/// 표식은 **장을 안 가린다.** 1장에 그려 저장하고 2장으로 넘어가 저장하면,
+/// 엔진에는 2장만 떠 있으니 1장 도형이 전부 "없어졌다" 로 읽힌다. 그래서
+/// `parentId` 가 **지금 여는 장과 같을 때만** 묻는다. `loaded` 가 장을
+/// 자연스레 가려 주던 몫을 여기서 손으로 채우는 것이다.
+fn engine_backed(sh: &Value, id: &str, loaded: &BTreeSet<String>, page_id: &str) -> bool {
+    if loaded.contains(id) {
+        return true;
+    }
+    if page_id.is_empty() {
+        return false;
+    }
+    let marked = sh
+        .get("meta")
+        .and_then(|m| m.get(FROM_ENGINE))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    marked && sh.get("parentId").and_then(Value::as_str) == Some(page_id)
 }
 
 /// 엔진 좌표를 캔버스 좌표로. y 만 뒤집는다 (`bimove.rs` 의 역).
@@ -974,6 +1016,109 @@ mod tests {
         assert_eq!(back.kept, 1);
         assert_eq!(back.erased, 1);
         assert_eq!(ids_of(&back.json), vec!["shape:a"]);
+    }
+
+    // ── 이번에 그린 것도 지울 수 있어야 한다 ──
+    //
+    // 오래 틀려 있던 자리다. `loaded` 는 **열 때** 심겨 있던 id 라, 이번에
+    // 그린 도형은 거기 없다. 첫 저장이 문서에 넣고 나면 그 뒤로는 "엔진에
+    // 안 들어갔던 것" 으로 읽혀 통과했다 — 화면에서 지워도 저장본에는
+    // 영영 남고, 다시 열면 되살아났다.
+    //
+    // 브라우저에서 잡았다: 공간 하나를 그려 자동저장된 뒤 Delete 로 지우니
+    // 캔버스에서는 사라지는데 **관계 탭에 그대로** 있었다.
+
+    /// 되읽어 넣은 뒤의 도형 꼴 — `meta` 에 표식이 달린다.
+    fn drawn_shape(id: &str, page: &str) -> Value {
+        json!({
+            "id": id, "type": "zone", "parentId": page,
+            "props": { "label": "거실" },
+            "meta": { FROM_ENGINE: true },
+        })
+    }
+
+    #[test]
+    fn 되읽어_넣은_도형에_표식이_달린다() {
+        // 이 표식이 없으면 아래 두 시험이 설 자리가 없다.
+        let d = drawn(&[zone("shape:new", "거실", 5.0)]);
+        let back = drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d)
+            .expect("되돌리기 실패");
+        assert_eq!(back.added, 1);
+        let sh = &shapes_of(&back.json)[0];
+        assert_eq!(
+            sh.get("meta").and_then(|m| m.get(FROM_ENGINE)).and_then(Value::as_bool),
+            Some(true),
+            "되읽어 넣었는데 표식이 없다",
+        );
+    }
+
+    #[test]
+    fn 이번에_그렸다_지운_것도_뺀다() {
+        // 두 번째 저장이다: 도형은 문서에 있고 `loaded` 에는 없다.
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [drawn_shape("shape:new", "page:1")],
+        })
+        .to_string();
+
+        // 도면이 비었다 — 지운 것이다.
+        let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &Drawing::new_metric())
+            .expect("되돌리기 실패");
+
+        assert_eq!(back.erased, 1, "그렸다 지운 것이 저장본에 남는다");
+        assert!(ids_of(&back.json).is_empty());
+    }
+
+    #[test]
+    fn 그린_뒤_안_지웠으면_그대로_둔다() {
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [drawn_shape("shape:new", "page:1")],
+        })
+        .to_string();
+        let d = drawn(&[zone("shape:new", "거실", 5.0)]);
+        let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &d).expect("되돌리기 실패");
+
+        assert_eq!(back.erased, 0);
+        assert_eq!(back.added, 0, "이미 문서에 있는 것을 또 넣었다 (도형이 둘로 는다)");
+        assert_eq!(ids_of(&back.json), vec!["shape:new"]);
+    }
+
+    #[test]
+    fn 다른_장에_그린_것은_안_지운다() {
+        // **표식만 보면 안 되는 이유다.** 1장에 그려 저장하고 2장으로 넘어가
+        // 저장하면 엔진에는 2장만 떠 있다 — 1장 도형이 전부 "없어졌다" 로
+        // 읽히면 장을 넘길 때마다 앞 장이 비워진다.
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }, { "id": "page:2", "name": "2" }],
+            "shapes": [drawn_shape("shape:on1", "page:1")],
+        })
+        .to_string();
+
+        // 지금 열린 것은 2장이고 도면은 비었다.
+        let back = drawing_to_bimove(&doc, "page:2", &BTreeSet::new(), &Drawing::new_metric())
+            .expect("되돌리기 실패");
+
+        assert_eq!(back.erased, 0, "다른 장에 그린 것을 지웠다");
+        assert_eq!(ids_of(&back.json), vec!["shape:on1"]);
+    }
+
+    #[test]
+    fn 표식이_없으면_여전히_통과다() {
+        // 저장본에서 온 도형 — 정방향이 조용히 빼는 자리가 여럿이라
+        // (돌아간 그룹, 두께 0 인 벽) 도면에 정체성이 없다. 이걸 지우면
+        // 저장할 때마다 사라진다.
+        let doc = json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "shapes": [
+                { "id": "shape:plain", "type": "wall", "parentId": "page:1", "props": {} },
+            ],
+        })
+        .to_string();
+        let back = drawing_to_bimove(&doc, "page:1", &BTreeSet::new(), &Drawing::new_metric())
+            .expect("되돌리기 실패");
+        assert_eq!(back.erased, 0);
+        assert_eq!(ids_of(&back.json), vec!["shape:plain"]);
     }
 
     #[test]
