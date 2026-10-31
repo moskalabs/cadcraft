@@ -277,6 +277,8 @@ export class BimoveDoc {
      * 휠·드래그 중에 켜라. 60만 선분짜리에서 목록 다시 만들기가 프레임당
      * 150ms 라, 그 프레임이 통째로 밀리면서 직전 그림이 남아 보인다.
      * 손을 떼면 draft 를 끄고 한 번 더 그려서 제대로 맞춘다.
+     * `grid` 면 **바탕 바로 위에** 격자를 깐다 (도면보다 아래). 칸 간격은
+     * 배율을 보고 1·2·5 사다리에서 고른다 (`grid.rs`).
      * @param {string} layout
      * @param {number} cx
      * @param {number} cy
@@ -285,12 +287,13 @@ export class BimoveDoc {
      * @param {number} h
      * @param {number} bg
      * @param {boolean} draft
+     * @param {boolean} grid
      * @returns {BimoveRaster | undefined}
      */
-    renderPixels(layout, cx, cy, scale, w, h, bg, draft) {
+    renderPixels(layout, cx, cy, scale, w, h, bg, draft, grid) {
         const ptr0 = passStringToWasm0(layout, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.bimovedoc_renderPixels(this.__wbg_ptr, ptr0, len0, cx, cy, scale, w, h, bg, draft);
+        const ret = wasm.bimovedoc_renderPixels(this.__wbg_ptr, ptr0, len0, cx, cy, scale, w, h, bg, draft, grid);
         return ret === 0 ? undefined : BimoveRaster.__wrap(ret);
     }
     /**
