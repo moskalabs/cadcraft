@@ -126,6 +126,43 @@ pub fn stamp_one(drawing: &mut Drawing, from: usize, kind: &str, id: &str) {
     stamp(drawing, from, kind, &[id.to_string()]);
 }
 
+/**
+ * `kind`/`ids` 말고 **더 적을 것이 있을 때.**
+ *
+ * 모듈 머리말이 열어 둔 자리다 — "키를 더 넣어도 된다. 읽는 쪽은 `kind` 와
+ * `ids` 만 보고 나머지는 그대로 둔다."
+ *
+ * 첫 손님은 공간의 **층고**다. 엔티티에 그릴 것이 없어서(선도 글자도 아니다)
+ * 되읽을 때 2400 으로 박혀 있었고, 그래서 2.7m 로 맞춰 둔 방이 저장 한 번에
+ * 2.4m 가 됐다 — 그 숫자가 벽면 물량으로 바로 간다.
+ */
+pub fn stamp_with(drawing: &mut Drawing, from: usize, kind: &str, ids: &[String], extra: &Value) {
+    if ids.is_empty() || from >= drawing.model.len() {
+        return;
+    }
+    let mut data = json!({ "kind": kind, "ids": ids });
+    if let (Some(m), Some(x)) = (data.as_object_mut(), extra.as_object()) {
+        for (k, v) in x {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    let tags = xdata::encode(xdata::DEFAULT_APP, &data);
+    let hs: Vec<_> = drawing.model.iter().skip(from).map(|e| e.handle).collect();
+    for h in hs {
+        drawing.model.modify(h, |e| {
+            e.common.xdata = xdata::splice(&e.common.xdata, xdata::DEFAULT_APP, tags.clone());
+        });
+    }
+}
+
+/// 정체성에 **덧붙여 둔 숫자** 하나. 없거나 숫자가 아니면 `None`.
+///
+/// `of` 와 따로 두는 이유: `of` 는 "묶음" 을 돌려주는 것이고 이건 그 묶음에
+/// 딸린 값이다. 한 구조체에 섞으면 종류마다 쓰지도 않는 칸이 는다.
+pub fn num(e: &Entity, key: &str) -> Option<f64> {
+    xdata::decode(&e.common.xdata, xdata::DEFAULT_APP)?.get(key)?.as_f64()
+}
+
 /// 엔티티의 정체성. 우리 게 아니거나 꼴이 다르면 `None`.
 ///
 /// 꼴이 다른 걸 억지로 읽지 않는다 — 다른 프로그램이 `BIMOVE` 라는 이름을

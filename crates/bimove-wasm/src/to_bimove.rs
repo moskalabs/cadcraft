@@ -387,6 +387,13 @@ fn zone_props(ents: &[&Entity], scale: &DimScale) -> Option<Rebuilt> {
         None => (String::new(), "#1a73e8".to_string()),
     };
 
+    // 층고 — 공간을 이루는 엔티티 아무 데나 같은 값이 찍혀 있다.
+    let height = ents
+        .iter()
+        .find_map(|e| crate::identity::num(e, crate::zone::XDATA_HEIGHT))
+        .filter(|h| *h > 0.0)
+        .unwrap_or(crate::zone::DEFAULT_WALL_HEIGHT_MM);
+
     let area_px2 = shoelace(&pts);
     let ppm = scale.px_per_mm;
     let area = texts
@@ -403,9 +410,11 @@ fn zone_props(ents: &[&Entity], scale: &DimScale) -> Option<Rebuilt> {
         props: json!({
             "points": points,
             "label": label,
-            // 층고는 엔티티에 안 들어 있다 — 그릴 것이 없다. 화면 기본값과 같은
-            // 수를 둔다 (`ZoneShape.getDefaultProps` 의 2400).
-            "wallHeightMm": 2400,
+            // 층고는 **그릴 것이 없어서** 정체성 xdata 에 적어 둔다
+            // (`zone::XDATA_HEIGHT`). 전엔 여기서 2400 으로 박았고, 그래서
+            // 2.7m 로 맞춰 둔 방이 저장 한 번에 2.4m 가 됐다 — 그 숫자가
+            // 벽면 물량으로 바로 간다.
+            "wallHeightMm": height,
             "areaM2": area,
             "perimeterM": perimeter,
             "color": color,
@@ -934,6 +943,7 @@ mod tests {
             label: label.to_string(),
             area_m2: area,
             color: Rgb(0x34, 0xa8, 0x53),
+            wall_height_mm: crate::zone::DEFAULT_WALL_HEIGHT_MM,
             layer: "0".into(),
         }
     }
@@ -1035,6 +1045,51 @@ mod tests {
             "props": { "label": "거실" },
             "meta": { FROM_ENGINE: true },
         })
+    }
+
+    /// 층고가 든 공간 하나.
+    fn zone_h(id: &str, h: f64) -> Zone {
+        Zone { wall_height_mm: h, ..zone(id, "안방", 5.0) }
+    }
+
+    #[test]
+    fn 층고가_되읽기에서_살아_돌아온다() {
+        // **전엔 2400 으로 박혀 있었다.** 2.7m 로 맞춰 둔 방이 저장 한 번에
+        // 2.4m 가 됐고, 그 숫자는 벽면 물량으로 바로 간다 (`zoneImport.ts`).
+        let d = drawn(&[zone_h("shape:a", 2700.0)]);
+        let back = drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d)
+            .expect("되돌리기 실패");
+        let sh = &shapes_of(&back.json)[0];
+        assert_eq!(
+            sh.get("props").and_then(|p| p.get("wallHeightMm")).and_then(Value::as_f64),
+            Some(2700.0),
+            "층고가 안 따라왔다",
+        );
+    }
+
+    #[test]
+    fn 층고를_안_적었으면_기본값이다() {
+        let d = drawn(&[zone("shape:a", "방", 5.0)]);
+        let back = drawing_to_bimove(&empty_doc(), "page:1", &BTreeSet::new(), &d)
+            .expect("되돌리기 실패");
+        let sh = &shapes_of(&back.json)[0];
+        assert_eq!(
+            sh.get("props").and_then(|p| p.get("wallHeightMm")).and_then(Value::as_f64),
+            Some(crate::zone::DEFAULT_WALL_HEIGHT_MM),
+        );
+    }
+
+    #[test]
+    fn 층고를_적어도_정체성은_그대로다() {
+        // 키를 더 넣어도 `kind`/`ids` 를 읽는 쪽이 멀쩡해야 한다 — 안 그러면
+        // 공간이 통째로 "정체성 없음" 이 되어 저장에서 사라진다.
+        let d = drawn(&[zone_h("shape:a", 2700.0)]);
+        let found = d
+            .model
+            .iter()
+            .filter_map(|e| crate::identity::of(e))
+            .find(|i| i.kind == crate::identity::ZONE);
+        assert_eq!(found.map(|i| i.ids), Some(vec!["shape:a".to_string()]));
     }
 
     #[test]

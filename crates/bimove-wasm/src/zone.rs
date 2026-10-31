@@ -64,7 +64,23 @@ pub struct Zone {
     /// **이름 글자** 색. 면 색이 아니다.
     pub color: Rgb,
     pub layer: String,
+    /// 층고 (mm).
+    ///
+    /// **그릴 것이 없다** — 선도 글자도 아니다. 그래서 되읽을 때 2400 으로
+    /// 박혀 있었고, 2.7m 로 맞춰 둔 방이 저장 한 번에 2.4m 가 됐다. 그
+    /// 숫자는 벽면 물량으로 바로 간다 (`zoneImport.ts` 의 적용 높이).
+    ///
+    /// 그릴 수 없으니 **정체성 xdata 에 적어 둔다** (`identity` 머리말이
+    /// 열어 둔 자리다). 그러면 복사·거울·DXF 왕복을 따라다닌다.
+    pub wall_height_mm: f64,
 }
+
+/// 층고를 안 적어 둔 공간이 받는 값. 화면 기본값과 같다
+/// (`ZoneShape.getDefaultProps`).
+pub const DEFAULT_WALL_HEIGHT_MM: f64 = 2400.0;
+
+/// 층고를 적어 두는 xdata 키. 읽는 쪽(`to_bimove::zone_props`)과 맞춰야 한다.
+pub const XDATA_HEIGHT: &str = "h";
 
 /// 테두리에 쓰는 점선. 화면의 `strokeDasharray="8 4"` 와 같은 길이다.
 ///
@@ -223,7 +239,14 @@ pub fn add_zones(drawing: &mut Drawing, zones: &[Zone]) -> usize {
         // 같은 공간으로 묶는다.
         let from = drawing.model.len();
         one(drawing, z);
-        crate::identity::stamp_one(drawing, from, crate::identity::ZONE, &z.id);
+        // 층고는 **그릴 수 없어서** 정체성에 같이 적는다 (`Zone::wall_height_mm`).
+        crate::identity::stamp_with(
+            drawing,
+            from,
+            crate::identity::ZONE,
+            &[z.id.clone()],
+            &serde_json::json!({ XDATA_HEIGHT: z.wall_height_mm }),
+        );
         n += 1;
     }
     n
@@ -246,6 +269,7 @@ mod tests {
             area_m2: area,
             color: Rgb(0x1a, 0x73, 0xe8),
             layer: "A-ZONE".into(),
+            wall_height_mm: DEFAULT_WALL_HEIGHT_MM,
         }
     }
 

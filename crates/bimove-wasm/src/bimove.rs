@@ -983,6 +983,13 @@ fn zone_of(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<Zone> {
         // 이름 글자 색. 못 읽으면 화면의 첫 번째 공간 색을 쓴다
         color: s(props, "color").and_then(Rgb::parse_hex).unwrap_or(Rgb(0x1a, 0x73, 0xe8)),
         layer: layer_of(meta),
+        // 층고는 **그릴 것이 없어서** 되읽을 때 박혀 있었다. 이제 정체성
+        // xdata 로 따라간다 (`zone::XDATA_HEIGHT`) — 여기서 넣어 줘야
+        // 저장본에 적힌 값이 엔진을 거쳐도 살아 돌아온다.
+        wall_height_mm: match f(props, "wallHeightMm", 0.0) {
+            h if h > 0.0 => h,
+            _ => zone::DEFAULT_WALL_HEIGHT_MM,
+        },
     };
     zone::usable(&z).then_some(z)
 }
