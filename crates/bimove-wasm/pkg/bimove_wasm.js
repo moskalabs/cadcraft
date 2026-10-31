@@ -279,6 +279,7 @@ export class BimoveDoc {
      * 손을 떼면 draft 를 끄고 한 번 더 그려서 제대로 맞춘다.
      * `grid` 면 **바탕 바로 위에** 격자를 깐다 (도면보다 아래). 칸 간격은
      * 배율을 보고 1·2·5 사다리에서 고른다 (`grid.rs`).
+     * `gray` 면 색을 **먹 농도**로 바꾼다 — 선·글자·해치 세 단 (`to_gray`).
      * @param {string} layout
      * @param {number} cx
      * @param {number} cy
@@ -288,12 +289,13 @@ export class BimoveDoc {
      * @param {number} bg
      * @param {boolean} draft
      * @param {boolean} grid
+     * @param {boolean} gray
      * @returns {BimoveRaster | undefined}
      */
-    renderPixels(layout, cx, cy, scale, w, h, bg, draft, grid) {
+    renderPixels(layout, cx, cy, scale, w, h, bg, draft, grid, gray) {
         const ptr0 = passStringToWasm0(layout, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.bimovedoc_renderPixels(this.__wbg_ptr, ptr0, len0, cx, cy, scale, w, h, bg, draft, grid);
+        const ret = wasm.bimovedoc_renderPixels(this.__wbg_ptr, ptr0, len0, cx, cy, scale, w, h, bg, draft, grid, gray);
         return ret === 0 ? undefined : BimoveRaster.__wrap(ret);
     }
     /**

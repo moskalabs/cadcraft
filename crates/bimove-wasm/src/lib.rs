@@ -138,12 +138,12 @@ impl Doc {
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
         draft: bool,
     ) -> Option<Raster> {
-        self.raster(layout, cx, cy, scale, w, h, bg, draft, false)
+        self.raster(layout, cx, cy, scale, w, h, bg, draft, false, false)
     }
 
     fn raster(
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
-        draft: bool, grid: bool,
+        draft: bool, grid: bool, gray: bool,
     ) -> Option<Raster> {
         let bg_rgb = cadcraft_color::Rgb((bg >> 16) as u8, (bg >> 8) as u8, bg as u8);
         // 곡선을 선분으로 쪼갤 오차는 "화면 반 픽셀". 줌이 바뀌면 같이 바뀐다.
@@ -151,9 +151,12 @@ impl Doc {
         // 배경색도 키다 — 색 보정이 배경에 달려 있어서, 배경이 바뀌면 같은
         // 목록을 쓰면 안 된다.
         let rev = self.revision();
-        let reusable = self.cache.as_ref().is_some_and(|(l, t, b, r, _)| {
+        let reusable = self.cache.as_ref().is_some_and(|(l, t, b, g, r, _)| {
             l == layout
                 && *b == bg
+                // 흑백은 **색을 통째로 갈아 끼운다.** 키에 안 넣으면 토글을
+                // 눌러도 쓰던 목록을 그대로 써서 아무 일도 안 난다.
+                && *g == gray
                 && *r == rev
                 // `draft` 면 tolerance 가 얼마나 어긋나든 쓰던 걸 쓴다.
                 //
@@ -181,6 +184,12 @@ impl Doc {
             let opts = render_opts(tol, f64::from(h) / scale.max(1e-12));
             let mut dl = cadcraft_render::build(self.drawing(), &space, &opts);
             make_readable(&mut dl, bg_rgb, self.drawing());
+            // **읽히게 한 다음에** 먹으로 바꾼다. 순서를 바꾸면 우리가 정한
+            // 농도를 `make_readable` 이 다시 끌어내린다.
+            if gray {
+                let dark = (u32::from(bg_rgb.0) + u32::from(bg_rgb.1) + u32::from(bg_rgb.2)) / 3 < 128;
+                to_gray(&mut dl, dark, self.drawing());
+            }
             // **틀과 대각선을 걷어낸다.** `render` 크레이트는 `Image` 를 "그림을
             // 못 찾았다" 는 꼴로 그린다 (네모 + 대각선 둘). 우리는 그림을
             // 가졌으니 그 위에 대각선이 그어지면 안 된다 — 편집 화면도 밑그림을
@@ -196,7 +205,7 @@ impl Doc {
             // 그릴 때 쓰는 tolerance 와 **같은 값**으로 덜어낸다. 그래야
             // 보이는 차이가 없다는 보장이 선다 (decimate 주석 참고).
             decimate(&mut dl, tol);
-            self.cache = Some((layout.to_string(), tol, bg, rev, dl));
+            self.cache = Some((layout.to_string(), tol, bg, gray, rev, dl));
         }
         let view = cadcraft_render::raster::View {
             center: cadcraft_geom::Vec2 { x: cx, y: cy },
@@ -224,7 +233,7 @@ impl Doc {
                 blit_underlay(&mut pm, u, d, &view);
             }
         }
-        let dl = &self.cache.as_ref()?.4;
+        let dl = &self.cache.as_ref()?.5;
         cadcraft_render::raster::render_into(&mut pm, dl, &view, &ro);
 
         // tiny-skia 는 **알파 곱해진(premultiplied)** 픽셀을 준다. 캔버스
@@ -474,6 +483,65 @@ fn make_readable(dl: &mut DisplayList, bg: cadcraft_color::Rgb, d: &cadcraft_doc
     }
 }
 
+/// 흑백(CAD) 보기 — 색을 **먹 농도**로 바꾼다.
+///
+/// 한: "여기 gray on off 원래 기능 있었는데 없네. 그거 넣자"
+///
+/// tldraw 화면에는 있었다 (`LayersPanel` 의 [Grayscale ON/OFF]). 엔진은 그
+/// 설정을 안 봐서 단추를 아예 안 띄웠다 — 눌리는데 아무 일 없는 단추보다는
+/// 나았지만, 기능은 빈 자리였다.
+///
+/// ── 왜 그냥 desaturate 가 아닌가 ──
+///
+/// 색이 사라진 자리를 **농도**가 대신해야 한다. 선과 글자를 같은 검정으로
+/// 두면 글자가 선을 이긴다. 그래서 선 → 글자로 단을 둔다. 숫자는 화면 쪽
+/// `lib/grayscale.ts` 와 **같은 값**이다 (17 / 51, 어두운 바탕 240 / 208) —
+/// 두 화면이 다른 농도로 그리면 어느 쪽이 맞는지 알 수 없다.
+///
+/// ── 면은 **밝기를 지킨다** ──
+///
+/// 처음엔 면도 정해진 해치 먹(89)으로 칠했다. 그랬더니 **벽이 통째로 회색
+/// 덩어리**가 됐다 — 벽 속을 채우는 흰 면까지 같이 칠해져서다. 그 흰 면은
+/// 해치가 아니라 **바닥**이고, 흰 것이 목적이다.
+///
+/// `make_readable` 이 같은 자리에서 같은 말을 한다: "면은 잉크가 아니라
+/// 바닥이고, 연한 건 연한 게 목적이다. 묻힌다고 끌어내리면 연한 띠가 숯색
+/// 덩어리가 되어, 그 위에 얹힌 글자까지 못 읽게 된다."
+///
+/// 그래서 면은 **제 밝기 그대로 색만 뺀다.** 흰 면은 희게 남고, 짙은 해치는
+/// 짙은 회색이 된다 — 원래의 단이 그대로 살아 있다.
+fn to_gray(dl: &mut DisplayList, dark: bool, d: &cadcraft_doc::Drawing) {
+    let (line, text) = if dark {
+        (cadcraft_color::Rgb(0xf0, 0xf0, 0xf0), cadcraft_color::Rgb(0xd0, 0xd0, 0xd0))
+    } else {
+        (cadcraft_color::Rgb(0x11, 0x11, 0x11), cadcraft_color::Rgb(0x33, 0x33, 0x33))
+    };
+    for p in &mut dl.prims {
+        // 가림막은 **바탕을 칠하는 것**이다. 먹으로 바꾸면 가리려던 자리가
+        // 메워진다.
+        if matches!(p.kind, Kind::Mask) {
+            continue;
+        }
+        p.color = if is_ink_tris(d, p.handle) {
+            text
+        } else if matches!(p.kind, Kind::Tris) {
+            luma(p.color)
+        } else {
+            line
+        };
+        // 우리가 정한 색을 그대로 쓰게 한다 — 안 그러면 7번 색 규칙이
+        // 배경에 맞춰 다시 뒤집는다.
+        p.aci7 = false;
+    }
+}
+
+/// 색만 빼고 **밝기는 그대로** (Rec. 601).
+fn luma(c: cadcraft_color::Rgb) -> cadcraft_color::Rgb {
+    let y = 0.299 * f64::from(c.0) + 0.587 * f64::from(c.1) + 0.114 * f64::from(c.2);
+    let v = y.round().clamp(0.0, 255.0) as u8;
+    cadcraft_color::Rgb(v, v, v)
+}
+
 /// 커서가 붙을 점 하나.
 pub struct Snap {
     x: f64,
@@ -629,12 +697,12 @@ pub struct Doc {
     /// **이게 성능의 전부다.** 매 프레임 build 하면 45MB 도면에서 한 장이
     /// 240ms 인데, 그중 래스터는 15ms 뿐이고 나머지가 build 다. 팬은 카메라만
     /// 움직이므로 같은 목록을 다시 쓰면 된다.
-    /// (공간, tolerance, 배경, **도면 판번호**) → 그릴 거리.
+    /// (공간, tolerance, 배경, 흑백, **도면 판번호**) → 그릴 거리.
     ///
     /// revision 을 키에 넣는 게 편집과 캐시를 잇는 전부다. 엔진이 도면을 고칠
     /// 때마다 올려주므로, 선 하나만 그어도 다음 렌더에서 자동으로 다시 만든다.
     /// 이걸 빼면 그린 게 화면에 안 나타난다.
-    cache: Option<(String, f64, u32, u64, DisplayList)>,
+    cache: Option<(String, f64, u32, bool, u64, DisplayList)>,
     /// 깔린 밑그림들 — **푼 픽셀**. 비어 있으면 틀만 그려진다 (옛 동작).
     underlays: Vec<Underlay>,
 }
@@ -1152,13 +1220,14 @@ impl BimoveDoc {
     /// 손을 떼면 draft 를 끄고 한 번 더 그려서 제대로 맞춘다.
     /// `grid` 면 **바탕 바로 위에** 격자를 깐다 (도면보다 아래). 칸 간격은
     /// 배율을 보고 1·2·5 사다리에서 고른다 (`grid.rs`).
+    /// `gray` 면 색을 **먹 농도**로 바꾼다 — 선·글자·해치 세 단 (`to_gray`).
     #[wasm_bindgen(js_name = renderPixels)]
     #[allow(clippy::too_many_arguments)]
     pub fn render_pixels(
         &mut self, layout: &str, cx: f64, cy: f64, scale: f64, w: u32, h: u32, bg: u32,
-        draft: bool, grid: bool,
+        draft: bool, grid: bool, gray: bool,
     ) -> Option<BimoveRaster> {
-        self.0.raster(layout, cx, cy, scale, w, h, bg, draft, grid).map(BimoveRaster)
+        self.0.raster(layout, cx, cy, scale, w, h, bg, draft, grid, gray).map(BimoveRaster)
     }
 }
 
@@ -1291,6 +1360,126 @@ mod tests {
         assert!((f.bounds[3] - 50.0).abs() < 1e-6, "maxY {}", f.bounds[3]);
     }
 
+    /// **색이 있는** 저장본 — 흑백 보기가 정말 먹을 바꾸는지 보려면 색이
+    /// 있어야 한다. 공간을 쓴다: 이름 글자 색이 `props.color` 로 들어간다
+    /// (벽은 제 색이 없어서 회색만 나온다 — 그걸로 쟀다가 한 번 틀렸다).
+    fn colored_line_doc() -> String {
+        serde_json::json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "scale": { "pxPerMm": 1.0 },
+            "shapes": [{
+                "id": "shape:z1", "type": "zone", "x": 0.0, "y": 0.0, "rotation": 0.0,
+                "index": "a1", "parentId": "page:1",
+                "props": {
+                    "points": [
+                        { "x": 0.0, "y": 0.0 }, { "x": 2000.0, "y": 0.0 },
+                        { "x": 2000.0, "y": 1000.0 }, { "x": 0.0, "y": 1000.0 },
+                    ],
+                    "label": "거실", "areaM2": 2.0, "wallHeightMm": 2400,
+                    "color": "#e01b24",
+                },
+            }],
+            "records": {},
+            "source": { "from": "tldraw", "at": 0, "shapeCount": 1 },
+        })
+        .to_string()
+    }
+
+    /// 화면에 찍힌 색 가운데 **바탕이 아닌 것**들.
+    fn inks(r: &Raster, bg: (u8, u8, u8)) -> Vec<(u8, u8, u8)> {
+        let mut out: Vec<(u8, u8, u8)> = r
+            .rgba
+            .chunks_exact(4)
+            .filter(|p| p[3] > 200)
+            .map(|p| (p[0], p[1], p[2]))
+            .filter(|c| *c != bg)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn 흑백_보기는_색을_먹으로_바꾼다() {
+        // 한: "여기 gray on off 원래 기능 있었는데 없네. 그거 넣자"
+        let mut doc = Doc::from_bimove(&colored_line_doc(), "").unwrap();
+        let (w, h) = (200, 100);
+        let color = doc.raster("", 1000.0, -500.0, 0.09, w, h, 0xFFFFFF, false, false, false).unwrap();
+        let gray = doc.raster("", 1000.0, -500.0, 0.09, w, h, 0xFFFFFF, false, false, true).unwrap();
+
+        let c = inks(&color, (255, 255, 255));
+        let g = inks(&gray, (255, 255, 255));
+        assert!(!c.is_empty() && !g.is_empty(), "아무것도 안 그려졌다");
+        // 색 쪽에는 **치우친 색**이 있다 (빨강).
+        assert!(c.iter().any(|(r, gg, b)| r.abs_diff(*gg) > 30 || gg.abs_diff(*b) > 30),
+            "색 보기인데 치우친 색이 없다: {c:?}");
+        // 흑백 쪽은 **전부 무채색**이다 — 세 값이 거의 같다. (가장자리
+        // 안티앨리어싱은 바탕과 섞이므로 역시 무채색이다.)
+        for (r, gg, b) in &g {
+            assert!(
+                r.abs_diff(*gg) <= 2 && gg.abs_diff(*b) <= 2,
+                "흑백인데 색이 남았다: {:?}",
+                (r, gg, b)
+            );
+        }
+    }
+
+    #[test]
+    fn 흑백에서도_흰_면은_희게_남는다() {
+        // **처음엔 면도 정해진 해치 먹으로 칠했다.** 그랬더니 벽이 통째로
+        // 회색 덩어리가 됐다 — 벽 속을 채우는 흰 면까지 같이 칠해져서다.
+        // 그 면은 해치가 아니라 바닥이고, 흰 것이 목적이다.
+        let mut doc = Doc::from_bimove(&wall_doc(), "").unwrap();
+        let (w, h) = (200, 100);
+        let r = doc.raster("", 1000.0, 0.0, 0.08, w, h, 0xFFFFFF, false, false, true).unwrap();
+        // 벽 **속**은 흰색이어야 한다 — 가운데 한 점을 본다.
+        let i = ((h / 2) as usize * w as usize + (w / 2) as usize) * 4;
+        let mid = (r.rgba[i], r.rgba[i + 1], r.rgba[i + 2]);
+        assert_eq!(mid, (255, 255, 255), "흑백에서 벽 속이 회색으로 메워졌다: {mid:?}");
+    }
+
+    /// 벽 한 줄 — 속이 흰 면이 들어 있다.
+    fn wall_doc() -> String {
+        serde_json::json!({
+            "pages": [{ "id": "page:1", "name": "1" }],
+            "scale": { "pxPerMm": 1.0 },
+            "shapes": [{
+                "id": "shape:w1", "type": "wall", "x": 0.0, "y": 0.0, "rotation": 0.0,
+                "index": "a1", "parentId": "page:1",
+                "props": { "x2": 2000.0, "y2": 0.0, "thickness": 600.0 },
+            }],
+            "records": {},
+            "source": { "from": "tldraw", "at": 0, "shapeCount": 1 },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn 흑백을_껐다_켜면_다시_그린다() {
+        // 캐시 키에 흑백이 없으면 토글을 눌러도 쓰던 목록을 그대로 써서
+        // **아무 일도 안 난다.** 그게 이 시험이 막는 자리다.
+        let mut doc = Doc::from_bimove(&colored_line_doc(), "").unwrap();
+        let (w, h) = (200, 100);
+        let a = doc.raster("", 1000.0, -500.0, 0.09, w, h, 0xFFFFFF, false, false, false).unwrap();
+        let b = doc.raster("", 1000.0, -500.0, 0.09, w, h, 0xFFFFFF, false, false, true).unwrap();
+        let c = doc.raster("", 1000.0, -500.0, 0.09, w, h, 0xFFFFFF, false, false, false).unwrap();
+        assert_ne!(a.rgba, b.rgba, "흑백을 켰는데 그림이 그대로다");
+        assert_eq!(a.rgba, c.rgba, "흑백을 껐는데 색이 안 돌아왔다");
+    }
+
+    #[test]
+    fn 어두운_바탕에서는_밝은_먹을_쓴다() {
+        let mut doc = Doc::from_bimove(&colored_line_doc(), "").unwrap();
+        let (w, h) = (200, 100);
+        let bg = (0x1e, 0x1e, 0x22);
+        let r = doc.raster("", 1000.0, -500.0, 0.09, w, h, 0x1E1E22, false, false, true).unwrap();
+        let g = inks(&r, bg);
+        assert!(!g.is_empty(), "아무것도 안 그려졌다");
+        // 바탕(명도 ~30)보다 **밝아야** 보인다.
+        let brightest = g.iter().map(|(r, _, _)| *r).max().unwrap_or(0);
+        assert!(brightest > 120, "어두운 바탕인데 먹이 어둡다 — 가장 밝은 값 {brightest}");
+    }
+
     #[test]
     fn 픽셀로_그리면_선이_실제로_찍힌다() {
         // 크기만 맞고 전부 배경색이면 "그려진 척" 이다. 배경이 아닌 픽셀이
@@ -1298,7 +1487,7 @@ mod tests {
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
         let (w, h) = (200, 100);
         // (0,0)~(100,50) 선을 가운데(50,25)에 두고 1.5px/단위로
-        let r = doc.raster("", 50.0, 25.0, 1.5, w, h, 0xFFFFFF, false, false).expect("래스터 실패");
+        let r = doc.raster("", 50.0, 25.0, 1.5, w, h, 0xFFFFFF, false, false, false).expect("래스터 실패");
         assert_eq!(r.w, w);
         assert_eq!(r.h, h);
         assert_eq!(r.rgba.len(), (w as usize) * (h as usize) * 4, "RGBA 길이가 안 맞는다");
@@ -1352,7 +1541,7 @@ mod tests {
         // 있는지 안 보이니까.
         let mut doc = Doc::from_bimove(&underlay_json(1.0), "").unwrap();
         // 그림이 화면을 꽉 채우게 둔다: 가운데 (300, -350), 1px = 1단위.
-        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false).expect("래스터 실패");
+        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false, false).expect("래스터 실패");
         // **네 모서리가 제자리에 있어야 한다.** 위아래가 뒤집히면 여기서
         // 빨강과 파랑이 자리를 바꾼다 — 밑그림에서 그건 도면이 거꾸로
         // 깔렸다는 뜻이고, 그 위에 그린 벽이 전부 틀린 자리에 선다.
@@ -1387,7 +1576,7 @@ mod tests {
             "meta":{"dxfColor":"#ff00ff"},"props":{"pathData":"M0,0L300,0"}}"##;
         let shot = |extra: &str| {
             let mut doc = Doc::from_bimove(&underlay_with(1.0, extra), "").unwrap();
-            doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false).expect("래스터 실패").rgba
+            doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false, false).expect("래스터 실패").rgba
         };
         let (bare, drawn) = (shot(""), shot(line));
         // 1px 짜리 선이라 **딱 그 색**은 안 나온다 (계단 다듬기가 섞는다).
@@ -1404,7 +1593,7 @@ mod tests {
         // 빨강이니 **연한 빨강**이 나와야 한다 — 진한 빨강이면 불투명도를
         // 안 받은 것이고, 흰색이면 아예 안 그려진 것이다.
         let mut doc = Doc::from_bimove(&underlay_json(0.4), "").unwrap();
-        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false).expect("래스터 실패");
+        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false, false).expect("래스터 실패");
         let (rr, gg, bb) = at(&r, 0.25, 0.25);
         assert!(rr > 200, "빨강 기운이 없다: {rr},{gg},{bb}");
         assert!(gg > 120 && gg < 200, "흰 바탕과 안 섞였다: {rr},{gg},{bb}");
@@ -1425,7 +1614,7 @@ mod tests {
             .map(|e| e.handle.hex())
             .expect("밑그림이 없다");
         doc.exec("erase", &format!(r#"{{"handles":["{h}"]}}"#)).unwrap();
-        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false).expect("래스터 실패");
+        let r = doc.raster("", 300.0, -350.0, 1.0, 400, 300, 0xFFFFFF, false, false, false).expect("래스터 실패");
         let (rr, gg, bb) = mid_rgb(&r);
         assert_eq!((rr, gg, bb), (255, 255, 255), "지웠는데 그림이 남았다: {rr},{gg},{bb}");
     }
@@ -1515,7 +1704,7 @@ mod tests {
         let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
         let before = doc.build("", 0.001).prims.len();
         // 거칠게 그려도(=많이 덜어내도) 개수는 안 변해야 한다
-        doc.raster("", 0.0, 0.0, 0.001, 64, 64, 0xFFFFFF, false, false);
+        doc.raster("", 0.0, 0.0, 0.001, 64, 64, 0xFFFFFF, false, false, false);
         let after = doc.build("", 0.001).prims.len();
         assert_eq!(before, after);
     }
@@ -1534,7 +1723,7 @@ mod tests {
         // 숫자만 줄고 화면이 비면 아무 소용이 없다. 잉크 픽셀이 남아 있는지
         // 본다 (덜어내기는 반 픽셀 안쪽만 건드리므로 크게 달라질 수 없다).
         let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
-        let r = doc.raster("", 50.0, -25.0, 1.5, 200, 100, 0xFFFFFF, false, false).unwrap();
+        let r = doc.raster("", 50.0, -25.0, 1.5, 200, 100, 0xFFFFFF, false, false, false).unwrap();
         let ink = r.rgba.chunks_exact(4).filter(|p| !(p[0] == 255 && p[1] == 255 && p[2] == 255)).count();
         assert!(ink > 20, "덜어내고 나니 {ink} 픽셀뿐 — 도면이 사라졌다");
     }
@@ -1568,7 +1757,7 @@ mod tests {
 
     /// 창 안 잉크의 가로 폭(px). 선은 멀리 있어 안 들어온다 — 점만 잡힌다.
     fn ink_width(doc: &mut Doc, cx: f64, cy: f64, scale: f64, w: u32, h: u32) -> u32 {
-        let r = doc.raster("", cx, cy, scale, w, h, 0xFFFFFF, false, false).expect("그려야 한다");
+        let r = doc.raster("", cx, cy, scale, w, h, 0xFFFFFF, false, false, false).expect("그려야 한다");
         let px = &r.rgba;
         let (mut lo, mut hi) = (u32::MAX, 0u32);
         for i in (0..px.len()).step_by(4) {
@@ -1649,7 +1838,7 @@ mod tests {
         let mut doc = Doc::from_bimove(&bimove_json(), "").unwrap();
         let (w, h) = (200, 100);
         // 캔버스 y 가 뒤집히므로 도면은 y = -50..0 에 있다
-        let r = doc.raster("", 50.0, -25.0, 1.5, w, h, 0xFFFFFF, false, false).expect("래스터 실패");
+        let r = doc.raster("", 50.0, -25.0, 1.5, w, h, 0xFFFFFF, false, false, false).expect("래스터 실패");
         let bg = r.rgba.chunks_exact(4).filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255).count();
         let ink = (w as usize) * (h as usize) - bg;
         assert!(ink > 20, "배경이 아닌 픽셀이 {ink}개뿐 — 아무것도 안 찍혔다");
@@ -1797,7 +1986,7 @@ mod tests {
         let inner_ink = |json: &str| {
             let mut d = Doc::from_bimove(json, "").unwrap();
             let (w, h) = (200usize, 200usize);
-            let r = d.raster("", 50.0, -50.0, 1.8, w as u32, h as u32, 0xFFFFFF, false, false).unwrap();
+            let r = d.raster("", 50.0, -50.0, 1.8, w as u32, h as u32, 0xFFFFFF, false, false, false).unwrap();
             let mut n = 0;
             for y in h / 4..h * 3 / 4 {
                 for x in w / 4..w * 3 / 4 {
@@ -1832,7 +2021,7 @@ mod tests {
         // tiny-skia 는 알파가 곱해진 픽셀을 준다. 그대로 넘기면 캔버스에서
         // 색이 어두워진다. 불투명 배경이니 알파가 전부 255 여야 한다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        let r = doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false).unwrap();
+        let r = doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false, false).unwrap();
         assert!(r.rgba.chunks_exact(4).all(|p| p[3] == 255), "알파가 255 가 아닌 픽셀이 있다");
     }
 
@@ -1841,10 +2030,10 @@ mod tests {
         // 카메라만 움직이면 같은 DisplayList 를 쓴다. 이게 깨지면 45MB 도면에서
         // 한 프레임이 15ms 에서 240ms 로 돌아간다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false).unwrap();
-        let built = doc.cache.as_ref().map(|(_, t, _, _, dl)| (*t, dl.prims.len())).unwrap();
-        doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF, false, false).unwrap();
-        let after = doc.cache.as_ref().map(|(_, t, _, _, dl)| (*t, dl.prims.len())).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false, false).unwrap();
+        let built = doc.cache.as_ref().map(|(_, t, _, _, _, dl)| (*t, dl.prims.len())).unwrap();
+        doc.raster("", 999.0, -999.0, 1.5, 64, 64, 0xFFFFFF, false, false, false).unwrap();
+        let after = doc.cache.as_ref().map(|(_, t, _, _, _, dl)| (*t, dl.prims.len())).unwrap();
         assert_eq!(built, after, "팬만 했는데 목록이 다시 만들어졌다");
     }
 
@@ -1853,13 +2042,13 @@ mod tests {
         // tolerance 는 줌에 반비례한다. 2배 안쪽은 그대로 쓰고, 넘으면 다시
         // 만들어야 곡선이 거칠어지지 않는다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF, false, false).unwrap();
+        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF, false, false, false).unwrap();
         let t0 = doc.cache.as_ref().unwrap().1;
 
-        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false, false).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().1, t0, "1.5배 줌은 다시 만들 일이 아니다");
 
-        doc.raster("", 50.0, 25.0, 10.0, 64, 64, 0xFFFFFF, false, false).unwrap();
+        doc.raster("", 50.0, 25.0, 10.0, 64, 64, 0xFFFFFF, false, false, false).unwrap();
         assert_ne!(doc.cache.as_ref().unwrap().1, t0, "10배 줌인데 그대로 썼다");
     }
 
@@ -1867,9 +2056,9 @@ mod tests {
     fn 공간이_바뀌면_다시_만든다() {
         // 모형 ↔ 배치는 아예 다른 내용이다. 캐시를 그대로 쓰면 엉뚱한 걸 그린다.
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false).unwrap();
+        doc.raster("", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false, false).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().0, "");
-        doc.raster("배치1", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false).unwrap();
+        doc.raster("배치1", 50.0, 25.0, 1.5, 64, 64, 0xFFFFFF, false, false, false).unwrap();
         assert_eq!(doc.cache.as_ref().unwrap().0, "배치1", "공간이 바뀌었는데 캐시가 그대로다");
     }
 
@@ -2035,7 +2224,7 @@ mod tests {
     #[test]
     fn 크기가_0_이면_실패를_돌려준다() {
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
-        assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF, false, false).is_none());
+        assert!(doc.raster("", 0.0, 0.0, 1.0, 0, 100, 0xFFFFFF, false, false, false).is_none());
     }
 
     // ── 선택 · 스냅 ──
@@ -2116,8 +2305,8 @@ mod tests {
 
     /// 지금 모형공간을 그리면 프리미티브가 몇 개인가.
     fn prim_count(doc: &mut Doc) -> usize {
-        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF, false, false).unwrap();
-        doc.cache.as_ref().unwrap().4.prims.len()
+        doc.raster("", 50.0, 25.0, 1.0, 64, 64, 0xFFFFFF, false, false, false).unwrap();
+        doc.cache.as_ref().unwrap().5.prims.len()
     }
 
     #[test]
@@ -2152,7 +2341,7 @@ mod tests {
         doc.exec("line", r#"{"points": [[0,0],[0,200]]}"#).unwrap();
         assert!(doc.revision() > r0, "편집했는데 판번호가 그대로다");
         // 캐시에 남은 판번호가 옛것이라 다음 렌더가 다시 만든다
-        assert_ne!(doc.cache.as_ref().unwrap().3, doc.revision());
+        assert_ne!(doc.cache.as_ref().unwrap().4, doc.revision());
     }
 
     #[test]
@@ -2842,7 +3031,7 @@ mod tests {
             .min((f64::from(h) - 48.0) / (maxy - miny).max(1e-9));
 
         let r = doc
-            .raster("", (minx + maxx) / 2.0, (miny + maxy) / 2.0, scale, w, h, 0xFFFFFF, false, false)
+            .raster("", (minx + maxx) / 2.0, (miny + maxy) / 2.0, scale, w, h, 0xFFFFFF, false, false, false)
             .expect("못 그렸다");
         let px = &r.rgba;
         let mut ink = 0usize;
@@ -2862,7 +3051,7 @@ mod tests {
         let (w, h) = (600u32, 400u32);
         let scale = ((f64::from(w) - 48.0) / (maxx - minx).max(1e-9))
             .min((f64::from(h) - 48.0) / (maxy - miny).max(1e-9));
-        let Some(r) = doc.raster("", (minx + maxx) / 2.0, (miny + maxy) / 2.0, scale, w, h, 0xFFFFFF, false, false)
+        let Some(r) = doc.raster("", (minx + maxx) / 2.0, (miny + maxy) / 2.0, scale, w, h, 0xFFFFFF, false, false, false)
         else {
             return 0.0;
         };
@@ -2947,7 +3136,7 @@ mod tests {
         let mut doc = Doc::from_bimove(&walls_only_json(), "").unwrap();
         // 첫 벽은 (0,0)-(4000,0), 두께 200. 그 한가운데를 본다.
         let r = doc
-            .raster("", 2000.0, 0.0, 0.08, 400, 300, 0xFFFFFF, false, false)
+            .raster("", 2000.0, 0.0, 0.08, 400, 300, 0xFFFFFF, false, false, false)
             .expect("래스터 실패");
         let (rr, gg, bb) = mid_rgb(&r);
         assert!(
