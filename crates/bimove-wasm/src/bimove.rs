@@ -127,6 +127,37 @@ fn color_of(meta: Option<&Value>) -> Color {
         .map_or(Color::ByLayer, Color::True)
 }
 
+/// 공간이 설 레이어 이름의 머리.
+///
+/// 한: "이 관계에서 공간 지정한거 보기 안보기 하는 그 선택지 줘야지.
+/// 숨겨서 볼 수 있게끔"
+///
+/// 엔진이 **끄고 켜는 단위는 레이어**다 (`layer.set`). 공간을 한 레이어에
+/// 몰아 두면 하나만 숨길 길이 없으므로, **공간마다 제 레이어**를 준다.
+/// 읽는 쪽(`관계 탭`)이 이름을 지어 맞춰야 하니 머리를 여기 박아 둔다.
+pub const ZONE_LAYER_PREFIX: &str = "A-ZONE:";
+
+/// 이름 없는 공간이 받는 꼬리. 화면이 띄우는 말과 같다.
+pub const ZONE_LAYER_UNNAMED: &str = "미지정";
+
+/// 이 공간이 설 레이어.
+///
+/// 저장본이 레이어를 적어 뒀으면 **그게 이긴다** — 손으로 옮겨 둔 것을
+/// 덮지 않는다. `"0"` 은 적어 둔 것으로 안 본다: 공간 도구가 레이어를
+/// 안 적어서 떨어진 기본값이라, 그대로 두면 도면의 다른 모든 것과 한
+/// 레이어에 서서 공간만 숨길 수가 없다.
+pub fn zone_layer(meta: Option<&Value>, label: &str) -> String {
+    if let Some(l) = meta
+        .and_then(|m| s(m, "dxfLayer"))
+        .filter(|l| !l.is_empty() && *l != "0")
+    {
+        return l.to_string();
+    }
+    let name = label.trim();
+    let name = if name.is_empty() { ZONE_LAYER_UNNAMED } else { name };
+    format!("{ZONE_LAYER_PREFIX}{name}")
+}
+
 fn layer_of(meta: Option<&Value>) -> String {
     meta.and_then(|m| s(m, "dxfLayer"))
         .filter(|l| !l.is_empty())
@@ -985,7 +1016,8 @@ fn zone_of(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<Zone> {
         area_m2: f(props, "areaM2", 0.0),
         // 이름 글자 색. 못 읽으면 화면의 첫 번째 공간 색을 쓴다
         color: s(props, "color").and_then(Rgb::parse_hex).unwrap_or(Rgb(0x1a, 0x73, 0xe8)),
-        layer: layer_of(meta),
+        // **공간마다 제 레이어**다 — 관계 탭에서 하나만 숨기려면 그래야 한다.
+        layer: zone_layer(meta, s(props, "label").unwrap_or("")),
         // 층고는 **그릴 것이 없어서** 되읽을 때 박혀 있었다. 이제 정체성
         // xdata 로 따라간다 (`zone::XDATA_HEIGHT`) — 여기서 넣어 줘야
         // 저장본에 적힌 값이 엔진을 거쳐도 살아 돌아온다.
@@ -2713,6 +2745,75 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
         assert_eq!(count_kind(&r, |k| matches!(k, EntityKind::Hatch(_))), 0);
     }
 
+    #[test]
+    /// 한: "이 관계에서 공간 지정한거 보기 안보기 하는 그 선택지 줘야지"
+    ///
+    /// 끄고 켜는 단위가 레이어라, 공간을 한 레이어에 몰아 두면 하나만
+    /// 숨길 길이 없다. 공간 도구는 레이어를 안 적어서 전엔 전부 `"0"` —
+    /// 도면의 다른 모든 것과 같은 자리였다.
+    #[test]
+    fn 레이어를_안_적은_공간은_제_레이어를_받는다() {
+        let j = doc_json(
+            r##"{"id":"shape:z1","type":"zone","x":0,"y":0,"rotation":0,"index":"z1",
+                "parentId":"page:main",
+                "props":{"points":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10}],
+                "label":"거실","areaM2":1}}"##,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(
+            r.drawing.layers.iter().any(|l| l.name == "A-ZONE:거실"),
+            "공간 레이어가 없다: {:?}",
+            r.drawing.layers.iter().map(|l| &l.name).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn 이름_없는_공간은_미지정_레이어로_간다() {
+        let j = doc_json(
+            r##"{"id":"shape:z1","type":"zone","x":0,"y":0,"rotation":0,"index":"z1",
+                "parentId":"page:main",
+                "props":{"points":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10}],
+                "label":"","areaM2":1}}"##,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE:미지정"));
+    }
+
+    #[test]
+    fn 공간이_둘이면_레이어도_둘이다() {
+        let j = doc_json(&format!(
+            "{},{}",
+            r##"{"id":"shape:z1","type":"zone","x":0,"y":0,"rotation":0,"index":"z1",
+                "parentId":"page:main",
+                "props":{"points":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10}],
+                "label":"거실","areaM2":1}}"##,
+            r##"{"id":"shape:z2","type":"zone","x":0,"y":0,"rotation":0,"index":"z2",
+                "parentId":"page:main",
+                "props":{"points":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10}],
+                "label":"안방","areaM2":1}}"##,
+        ));
+        let r = drawing_from_bimove(&j, "").unwrap();
+        for want in ["A-ZONE:거실", "A-ZONE:안방"] {
+            assert!(r.drawing.layers.iter().any(|l| l.name == want), "{want} 가 없다");
+        }
+    }
+
+    /// `"0"` 은 **적어 둔 것으로 안 본다** — 공간 도구가 레이어를 안 적어서
+    /// 떨어진 기본값이다. 그대로 두면 도면의 다른 모든 것과 한 레이어에 선다.
+    #[test]
+    fn 레이어_0_은_적어_둔_것으로_안_본다() {
+        let j = doc_json(
+            r##"{"id":"shape:z1","type":"zone","x":0,"y":0,"rotation":0,"index":"z1",
+                "parentId":"page:main",
+                "props":{"points":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10}],
+                "label":"거실","areaM2":1},
+                "meta":{"dxfLayer":"0"}}"##,
+        );
+        let r = drawing_from_bimove(&j, "").unwrap();
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE:거실"));
+    }
+
+    /// 손으로 옮겨 둔 레이어는 **덮지 않는다.**
     #[test]
     fn 공간도_레이어를_만든다() {
         let j = doc_json(
