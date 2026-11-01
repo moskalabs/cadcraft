@@ -22,7 +22,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{points, scale?, justification?: top|zero|bottom, style?, closed?} → {handle}")
             .interactive(|s| Ok(Box::new(MlineM::new(s)))),
         CommandSpec::new("mlstyle", "Multiline Style...", run_mlstyle).menu(&["Format", "Multiline Style..."]).params(
-            "{} → styles | {name, description?, elements?: [{offset, color?, linetype?}], fill?: color|false, joints?, \
+            "{} → styles | {name, description?, elements?: [{offset, color?, linetype?}], fill?: color|false, joints?, mergeOverlaps?, \
                  startCaps?/endCaps?: {line?, outerArc?, innerArcs?, angle? (degrees)}, copyFrom?, current? (default true)} | \
                  {delete: name} | {name, rename: newName}",
         ),
@@ -345,6 +345,10 @@ fn run_mlstyle(s: &mut Session, p: &Value) -> Result<Value> {
         Some(c) => st.fill = Some(color_value(c).ok_or_else(|| bad("mlstyle", format!("unknown fill colour {c}")))?),
     }
     st.joints = bool_or(p, "joints", st.joints);
+    // 겹친 이웃과 한 덩어리로 보일 것인가 (`MLineStyle::merge_overlaps`).
+    // 빔모바의 벽 스타일이 켜고 들어온다 — 이게 없으면 **그려 넣은 벽만**
+    // 안 합쳐지다가 새로고침해야 합쳐진다.
+    st.merge_overlaps = bool_or(p, "mergeOverlaps", st.merge_overlaps);
     st.start_caps = caps_param(p, "startCaps", st.start_caps)?;
     st.end_caps = caps_param(p, "endCaps", st.end_caps)?;
     let st = st.sanitized();
@@ -833,4 +837,49 @@ pub(crate) fn explode(e: &Entity, m: &MLine) -> Vec<Entity> {
         out.push(Entity { handle: Handle(0), common: e.common.clone(), kind });
     }
     out
+}
+
+#[cfg(test)]
+mod merge_flag_tests {
+    use crate::Session;
+    use cadcraft_doc::EntityKind;
+    use serde_json::json;
+
+    fn drawn(merge: Option<bool>) -> bool {
+        let mut s = Session::new();
+        let mut style = json!({ "name": "W", "elements": [{"offset": 0.5}, {"offset": -0.5}] });
+        if let Some(m) = merge {
+            style["mergeOverlaps"] = json!(m);
+        }
+        s.execute("mlstyle", &style).expect("스타일");
+        s.execute("mline", &json!({ "style": "W", "points": [[0, 0], [100, 0]], "scale": 10 })).expect("벽");
+        let d = s.doc().unwrap();
+        d.model
+            .iter()
+            .find_map(|x| match &x.kind {
+                EntityKind::MLine(m) => Some(m.merge_overlaps),
+                _ => None,
+            })
+            .expect("multiline 이 없다")
+    }
+
+    /// **그려 넣은 벽도 합쳐진다.**
+    ///
+    /// 한: "붙이는 순간 되어야 하는데 붙여놓고 겹칠때 새로고침을 해야 되잖아"
+    ///
+    /// 깃발이 `MLine` 에만 있고 켜 주는 자리가 저장본 되읽기 하나뿐이라,
+    /// 그리는 길(`mlstyle` + `mline`)로 들어온 벽은 안 합쳐졌다. 새로고침하면
+    /// 되읽기를 거치니 그때서야 합쳐져서 — 한이 본 그 꼴이 됐다.
+    ///
+    /// 스타일에 실어 `MLine::new` 가 물려받게 했다. 이 시험이 그 줄을 지킨다.
+    #[test]
+    fn 스타일이_켜면_그린_벽도_합치기가_켜진다() {
+        assert!(drawn(Some(true)), "스타일이 켰는데 엔티티가 안 켜졌다");
+    }
+
+    #[test]
+    fn 평범한_multiline_은_그대로다() {
+        assert!(!drawn(None), "안 켰는데 켜졌다");
+        assert!(!drawn(Some(false)), "끄라고 했는데 켜졌다");
+    }
 }

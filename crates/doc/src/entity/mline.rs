@@ -68,6 +68,19 @@ pub struct MLineStyle {
     pub joints: bool,
     /// Fill colour between the outermost elements; `None` = no fill.
     pub fill: Option<Color>,
+    /// 이 스타일로 그린 multiline 은 **겹친 이웃과 한 덩어리로** 보인다.
+    ///
+    /// 한: "붙이는 순간 되어야 하는데 붙여놓고 겹칠때 새로고침을 해야 되잖아"
+    ///
+    /// 깃발은 원래 `MLine` 에만 있었고, 켜 주는 자리가 **저장본 되읽기
+    /// 하나뿐**이었다 (`bimove-wasm::wall::mline_for`). 그래서 벽을 그리면
+    /// 합쳐지지 않다가 새로고침해야 합쳐졌다 — 그리는 길은 `mlstyle` + `mline`
+    /// 명령으로 바로 들어가서 그 자리를 안 지나기 때문이다.
+    ///
+    /// 스타일이 들고 있으면 **두 길이 같아진다.** 명령으로 그려도
+    /// `MLine::new` 가 여기서 물려받는다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge_overlaps: bool,
 }
 
 impl Default for MLineStyle {
@@ -81,6 +94,7 @@ impl Default for MLineStyle {
             end_caps: MLineCaps::default(),
             joints: false,
             fill: None,
+            merge_overlaps: false,
         }
     }
 }
@@ -238,7 +252,9 @@ impl MLine {
             closed,
             no_start_caps: false,
             no_end_caps: false,
-            merge_overlaps: false,
+            // **스타일에서 물려받는다.** 명령으로 그린 벽도 합쳐지려면 이
+            // 한 줄이 있어야 한다 (`MLineStyle::merge_overlaps` 머리말).
+            merge_overlaps: def.merge_overlaps,
             vertices: pts.iter().map(|p| MLineVertex::new(p.to3(0.0))).collect(),
         }
     }

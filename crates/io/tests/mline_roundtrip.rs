@@ -30,6 +30,8 @@ fn wall() -> MLineStyle {
         start_caps: MLineCaps { line: true, outer_arc: false, inner_arcs: true, angle: 60f64.to_radians() },
         end_caps: MLineCaps { line: false, outer_arc: true, inner_arcs: false, angle: std::f64::consts::FRAC_PI_2 },
         joints: true,
+        // DXF 에는 없는 칸이다 — 오가며 늘 꺼진 채다.
+        merge_overlaps: false,
         fill: Some(Color::Index(3)),
     }
 }
