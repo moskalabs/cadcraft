@@ -207,6 +207,13 @@ pub struct MLineGeometry {
     pub fill: Vec<Vec<Vec2>>,
 }
 
+/// 꼭짓점 miter 의 **최대 길이**를 가르는 수 — 비율 한도의 역수다.
+///
+/// `0.5` → 비율 2 → 바깥 끝이 꼭짓점에서 **두께 하나**만큼까지 나간다.
+/// 작게 두면 예각에서 가시가 길어지고 (20 이던 때 25.8° 코너의 혀가 450
+/// 단위였다), 크게 두면 둔한 각까지 잘려 나간다.
+const MITER_MIN_DOT: f64 = 0.5;
+
 impl MLine {
     /// A multiline through `pts` in style `def`.
     pub fn new(def: &MLineStyle, pts: &[Vec2], closed: bool, just: MLineJust, scale: f64) -> MLine {
@@ -299,8 +306,20 @@ impl MLine {
                 if b == Vec2::ZERO {
                     return n1;
                 }
-                // Keep sharp corners finite.
-                b / b.dot(n1).max(0.05)
+                // Keep sharp corners finite — and **short**.
+                //
+                // 한: "벽은 아직도 만나는 지점 겹치잖아" (하루 종일 같은 코너)
+                //
+                // 예각에서 miter 는 `1/sin(각/2)` 배로 자란다. 한도가 20 이던
+                // 때 25.8° 짜리 코너의 혀가 **450 단위**였다 — 두께 100 짜리
+                // 벽에서 네 배 넘게 삐져나온 가시다. 평면도에서는 두 벽이
+                // 서로를 가로지른 것처럼 보인다.
+                //
+                // 2.0 은 "꼭짓점에서 **두께의 반**까지만" 이다 (바깥 끝이
+                // `thickness/2 × 2` = 두께 하나만큼). 60° 보다 벌어진 코너는
+                // 비율이 2 아래라 **아무것도 안 바뀐다** — 흔한 직각·둔각
+                // 코너는 전과 똑같이 뾰족하게 맞물린다.
+                b / b.dot(n1).max(MITER_MIN_DOT)
             })
             .collect()
     }
@@ -424,5 +443,65 @@ impl crate::Drawing {
     pub fn current_mline_style(&self) -> MLineStyle {
         let name = self.header.str("CMLSTYLE", STANDARD_MLINE_STYLE);
         self.mline_style(&name).or_else(|| self.mline_style(STANDARD_MLINE_STYLE)).cloned().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod miter_tests {
+    use super::*;
+
+    /// 꼭짓점 셋짜리 열린 MLINE — 가운데가 코너다.
+    fn corner(deg: f64) -> MLine {
+        let r: f64 = deg.to_radians();
+        let mut def = MLineStyle::default();
+        def.elements = vec![
+            MLineElement { offset: 0.5, ..Default::default() },
+            MLineElement { offset: -0.5, ..Default::default() },
+        ];
+        MLine {
+            style: "T".into(),
+            def,
+            scale: 100.0,
+            justification: MLineJust::Zero,
+            closed: false,
+            no_start_caps: true,
+            no_end_caps: true,
+            // (−1000,0) → (0,0) → 각도 `deg` 로 되돌아 나가는 팔.
+            vertices: vec![
+                MLineVertex::new(Vec3::new(-1000.0, 0.0, 0.0)),
+                MLineVertex::new(Vec3::new(0.0, 0.0, 0.0)),
+                MLineVertex::new(Vec3::new(-1000.0 * r.cos(), 1000.0 * r.sin(), 0.0)),
+            ],
+        }
+    }
+
+    /// 코너 꼭짓점의 miter 길이 ÷ (두께/2) — SVG 의 `stroke-miterlimit` 과 같은 비율.
+    fn ratio(deg: f64) -> f64 {
+        corner(deg).miters()[1].len()
+    }
+
+    /// 한: "벽은 아직도 만나는 지점 겹치잖아"
+    ///
+    /// 예각에서 miter 는 `1/sin(각/2)` 로 자란다. 한도가 20 이던 때 25.8°
+    /// 코너의 혀가 **450 단위** 였다 (두께 100 벽에서 네 배 넘는 가시다).
+    #[test]
+    fn 예각_miter_는_두께만큼까지만_자란다() {
+        // 25.8° → 원래 비율 1/sin(12.9°) = 4.48. 이제 2 에서 멈춘다.
+        assert!((ratio(25.8) - 2.0).abs() < 1e-9, "25.8°: {}", ratio(25.8));
+        // 더 뾰족해도 2 를 안 넘는다 — 예전엔 20 까지 갔다.
+        assert!(ratio(5.0) <= 2.0 + 1e-9, "5°: {}", ratio(5.0));
+        assert!(ratio(1.0) <= 2.0 + 1e-9, "1°: {}", ratio(1.0));
+    }
+
+    /// **흔한 각은 안 건드린다.** 직각·둔각은 비율이 2 아래라 전과 똑같이
+    /// 뾰족하게 맞물려야 한다 — 여기가 틀리면 멀쩡하던 도면이 다 뭉툭해진다.
+    #[test]
+    fn 직각과_둔각은_그대로다() {
+        for deg in [60.0_f64, 90.0, 120.0, 150.0] {
+            let want = 1.0 / (deg / 2.0).to_radians().sin();
+            assert!((ratio(deg) - want).abs() < 1e-9, "{deg}°: {} vs {want}", ratio(deg));
+        }
+        // 60° 가 경계다 — 비율이 딱 2 다.
+        assert!((ratio(60.0) - 2.0).abs() < 1e-9);
     }
 }
