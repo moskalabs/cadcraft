@@ -930,6 +930,10 @@ fn wall_seg(sh: &Value, props: &Value, meta: Option<&Value>) -> Option<WallSeg> 
         // 내려와야 하는데 `drawing_from_bimove` 는 그걸 모른다 — 색을 짐작하지
         // 말고, 배경을 넘기게 될 때 같이 손대는 게 맞다.
         fill: Some(hex("fill").map_or(Color::True(Rgb(255, 255, 255)), Color::True)),
+        // 불러온 도면에서 온 벽에는 지문이 붙어 있다 (`dxf.ts` 의
+        // `meta.dxfFingerprint`). 겹침 합치기를 거기서만 끈다 — 한: "벽체
+        // 새로 빔모바에서 그릴때만, 도면 불러온거는 말고".
+        imported: meta.and_then(|m| s(m, "dxfFingerprint")).is_some(),
     })
 }
 

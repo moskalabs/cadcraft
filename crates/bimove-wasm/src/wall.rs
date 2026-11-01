@@ -46,6 +46,18 @@ pub struct WallSeg {
     pub color: Color,
     /// 속 색. `None` 이면 안 칠한다.
     pub fill: Option<Color>,
+    /// **불러온 도면에서 온 벽**인가 (`meta.dxfFingerprint` 가 있다).
+    ///
+    /// 한: "벽체 새로 빔모바에서 그릴때만, 도면 불러온거는 말고"
+    ///
+    /// 세그먼트 100 개 미만인 DXF 는 빔모바가 그 선들을 **진짜 벽 도형으로**
+    /// 만든다 (`dxf.ts` 의 "100개 미만: 개별 wall shape"). 엔진에서는 사람이
+    /// 그린 벽과 생김새가 같아서, 이 칸이 없으면 불러온 도면까지 겹침이
+    /// 합쳐진다 — 남의 도면을 말없이 고쳐 보여주는 꼴이다.
+    ///
+    /// 겹침 합치기(`MLine::merge_overlaps`)만 가른다. 묶기·T자 잇기·두께는
+    /// 그대로다.
+    pub imported: bool,
 }
 
 /// 끝점이 만났다고 볼 거리.
@@ -77,6 +89,11 @@ pub struct WallChain {
     pub layer: String,
     pub color: Color,
     pub fill: Option<Color>,
+    /// 줄기 전체가 **불러온 도면의 것**인가 (`WallSeg::imported`).
+    ///
+    /// 열쇠에 들어가므로 한 줄기는 전부 같다 — 불러온 벽과 그린 벽이 한
+    /// MLINE 으로 섞이면 합치기를 켤지 말지가 하나로 안 정해진다.
+    pub imported: bool,
 }
 
 /// 묶을 수 있는 벽끼리 가르는 열쇠. MLINE 하나는 스타일 하나라서 필요하다.
@@ -84,10 +101,13 @@ pub struct WallChain {
 /// 두께는 **정수로 줄여서** 비교한다. 같은 두께로 그린 벽이 저장·복원을
 /// 거치며 1e-13 쯤 어긋나는 일이 있고, 그걸 다른 두께로 보면 줄기가 벽마다
 /// 끊어져 코너가 전부 캡으로 막힌다.
-type GroupKey = (String, i64, Color, Option<Color>);
+///
+/// **출처**도 가른다 — 불러온 벽과 그린 벽은 한 MLINE 에 못 섞인다. 합치기를
+/// 켤지 말지가 MLINE 단위라서, 섞이면 둘 중 하나는 뜻과 다르게 그려진다.
+type GroupKey = (String, i64, Color, Option<Color>, bool);
 
 fn group_key(w: &WallSeg) -> GroupKey {
-    (w.layer.clone(), (w.thickness * 1000.0).round() as i64, w.color, w.fill)
+    (w.layer.clone(), (w.thickness * 1000.0).round() as i64, w.color, w.fill, w.imported)
 }
 
 /// 두 점이 같은 자리인가.
@@ -232,6 +252,7 @@ fn chain_group(walls: &[WallSeg], idx: &[usize]) -> Vec<WallChain> {
             layer: w0.layer.clone(),
             color: w0.color,
             fill: w0.fill,
+            imported: w0.imported,
         });
     }
     out
@@ -345,7 +366,10 @@ pub fn mline_for(c: &WallChain) -> MLine {
         no_end_caps: !c.free_end,
         // 겹친 벽은 한 덩어리로 — 한: "겹치는거를 한개로 보이게 하는게 핵심".
         // 줄기끼리 겹칠 때 서로의 외곽선이 비쳐 보이던 것을 그릴 때 지운다.
-        merge_overlaps: true,
+        //
+        // **불러온 도면은 빼고** (`WallSeg::imported`) — 한: "벽체 새로
+        // 빔모바에서 그릴때만, 도면 불러온거는 말고".
+        merge_overlaps: !c.imported,
         vertices: c.pts.iter().map(|p| MLineVertex::new(Vec3::new(p.x, p.y, 0.0))).collect(),
     }
 }
@@ -391,7 +415,44 @@ mod tests {
             layer: "0".into(),
             color: Color::ByLayer,
             fill: None,
+            imported: false,
         }
+    }
+
+    /// 불러온 도면의 벽은 **합치기가 꺼진다.**
+    ///
+    /// 한: "벽체 새로 빔모바에서 그릴때만, 도면 불러온거는 말고"
+    ///
+    /// 세그먼트 100 개 미만인 DXF 는 빔모바가 진짜 벽 도형으로 만들어서
+    /// (`dxf.ts`) 엔진에서는 그린 벽과 생김새가 같다. 이 시험이 그 둘을
+    /// 갈라 놓는 유일한 자리다.
+    #[test]
+    fn 불러온_벽은_겹침을_안_합친다() {
+        let mut w = seg(0.0, 0.0, 100.0, 0.0, 10.0);
+        w.imported = true;
+        let c = chain_walls(&[w]);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].imported, "줄기가 출처를 안 들고 왔다");
+        assert!(!mline_for(&c[0]).merge_overlaps, "불러온 벽인데 합치기가 켜졌다");
+    }
+
+    #[test]
+    fn 그린_벽은_겹침을_합친다() {
+        let c = chain_walls(&[seg(0.0, 0.0, 100.0, 0.0, 10.0)]);
+        assert!(mline_for(&c[0]).merge_overlaps, "그린 벽인데 합치기가 꺼졌다");
+    }
+
+    /// 불러온 벽과 그린 벽은 **한 줄기로 안 묶인다.**
+    ///
+    /// 묶이면 MLINE 하나가 되는데 합치기는 MLINE 단위라서, 둘 중 하나는
+    /// 뜻과 다르게 그려진다. 끝점이 같아도 갈라 놓아야 한다.
+    #[test]
+    fn 불러온_벽과_그린_벽은_안_섞인다() {
+        let mut a = seg(0.0, 0.0, 100.0, 0.0, 10.0);
+        a.imported = true;
+        let b = seg(100.0, 0.0, 100.0, 100.0, 10.0);
+        let c = chain_walls(&[a, b]);
+        assert_eq!(c.len(), 2, "출처가 다른데 한 줄기로 묶였다: {c:?}");
     }
 
     #[test]
