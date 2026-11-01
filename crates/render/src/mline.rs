@@ -41,9 +41,24 @@ pub(super) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, m: &MLine, rgb: Ink, 
             (rgb, if b.opts.lineweights { w } else { 0.0 }, lt, scale)
         })
         .collect();
+    // 겹친 벽은 **한 덩어리로** 보여야 한다 — 남의 몸통 안에 든 토막은 긋지
+    // 않는다 (`wallmask`). 합치기를 안 켠 multiline 은 `mask` 가 `None` 이라
+    // 여태 하던 대로 제 선을 다 긋는다.
+    //
+    // 블록 안에서 그릴 때는 **안 자른다.** 몸통 좌표는 모델 좌표라서, 블록이
+    // 옮겨 놓은 벽에 그대로 대면 엉뚱한 데를 지운다. 빔모바 벽은 늘 모델에
+    // 직접 들어가므로 (`wall::add_walls`) 잃는 것이 없다.
+    let mask = (m.merge_overlaps && ctx.depth == 0).then_some(b.walls).flatten();
     for (i, a, z) in &g.lines {
         let Some((rgb, w, lt, scale)) = looks.get(*i) else { continue };
-        stroke(b, ctx, *rgb, *w, lt.as_ref(), *scale, min, &[*a, *z]);
+        match mask {
+            Some(mask) => {
+                for (a, z) in mask.clip(e.handle, *a, *z) {
+                    stroke(b, ctx, *rgb, *w, lt.as_ref(), *scale, min, &[a, z]);
+                }
+            }
+            None => stroke(b, ctx, *rgb, *w, lt.as_ref(), *scale, min, &[*a, *z]),
+        }
     }
     let own = resolve_common(ctx, &e.common, b.plotting);
     let lt = match b.styles.and_then(|s| s.linetype(rgb, b.named)) {
@@ -53,7 +68,16 @@ pub(super) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, m: &MLine, rgb: Ink, 
     for s in &g.caps {
         let mut pts = Vec::new();
         s.tessellate(tol, &mut pts);
-        stroke(b, ctx, rgb, lw, lt.as_ref(), own.3, min, &pts);
+        // 캡도 같이 지운다 — 벽 끝이 다른 벽 속에 파묻혔으면 그 막음선이
+        // 덩어리 한가운데를 가로지른다. 한이 보낸 그림에 그게 찍혀 있었다.
+        match mask {
+            Some(mask) => {
+                for run in mask.clip_path(e.handle, &pts) {
+                    stroke(b, ctx, rgb, lw, lt.as_ref(), own.3, min, &run);
+                }
+            }
+            None => stroke(b, ctx, rgb, lw, lt.as_ref(), own.3, min, &pts),
+        }
     }
 }
 

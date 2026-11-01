@@ -190,6 +190,19 @@ pub struct MLine {
     #[serde(default)]
     pub no_end_caps: bool,
     pub vertices: Vec<MLineVertex>,
+    /// 겹친 이웃과 **한 덩어리로 보이게** 그릴 것 — 벽이 쓴다.
+    ///
+    /// 한: "겹치는거를 한개로 보이게 하는게 핵심이라고"
+    ///
+    /// 켜 두면 그릴 때 이 multiline 의 선 가운데 **다른 겹침 multiline 의 몸통
+    /// 안으로 들어간 토막**을 지운다 (`render::wallmask`). 겹친 자리에서 서로의
+    /// 외곽선이 비쳐 보이던 것이 사라지고 바깥 테두리만 남는다.
+    ///
+    /// 기하는 **안 바뀐다** — `geometry()`, 스냅, 선택, DXF 내보내기 모두 그대로다.
+    /// 순전히 보이는 것만 손본다. DXF 에는 이런 칸이 없으므로 읽으면 늘 `false`
+    /// 이고, 빔모바가 제 벽을 만들 때만 켠다 (`bimove-wasm::wall::mline_for`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge_overlaps: bool,
 }
 
 fn one() -> f64 {
@@ -225,6 +238,7 @@ impl MLine {
             closed,
             no_start_caps: false,
             no_end_caps: false,
+            merge_overlaps: false,
             vertices: pts.iter().map(|p| MLineVertex::new(p.to3(0.0))).collect(),
         }
     }
@@ -384,16 +398,40 @@ impl MLine {
             }
         }
         if self.def.fill.is_some() {
-            let side = |e: usize| (0..n).map(|k| at(k, off(e))).collect::<Vec<Vec2>>();
-            if self.closed {
-                g.fill = vec![side(top), side(bottom)];
-            } else {
-                let mut poly = side(top);
-                poly.extend(side(bottom).into_iter().rev());
-                g.fill = vec![poly];
-            }
+            g.fill = self.body();
         }
         g
+    }
+
+    /// 바깥 두 요소 사이의 **몸통** — 벽에서는 벽 그 자체다.
+    ///
+    /// `geometry().fill` 과 같은 폴리곤이지만 **채움이 꺼져 있어도** 나온다.
+    /// 채움은 보일지 말지의 문제고, 몸통은 "어디까지가 이 벽인가" 의 문제라서
+    /// 겹침 지우기(`merge_overlaps`)는 채움과 무관하게 이것이 필요하다.
+    ///
+    /// 닫힌 multiline 은 고리 둘(바깥·안쪽, even-odd 로 읽어 가운데가 빈
+    /// 고리), 열린 것은 한 바퀴 도는 고리 하나다.
+    pub fn body(&self) -> Vec<Vec<Vec2>> {
+        let pts = self.points();
+        let n = pts.len();
+        if self.segment_count() == 0 || pts.iter().any(|p| !p.is_finite()) {
+            return Vec::new();
+        }
+        let miters = self.miters();
+        let offs = self.offsets();
+        let at = |k: usize, d: f64| pts.get(k % n).copied().unwrap_or_default() + miters.get(k % n).copied().unwrap_or_default() * d;
+        let mut order: Vec<usize> = (0..offs.len()).collect();
+        order.sort_by(|a, b| offs.get(*b).copied().unwrap_or(0.0).total_cmp(&offs.get(*a).copied().unwrap_or(0.0)));
+        let (Some(&top), Some(&bottom)) = (order.first(), order.last()) else { return Vec::new() };
+        let off = |e: usize| offs.get(e).copied().unwrap_or(0.0);
+        let side = |e: usize| (0..n).map(|k| at(k, off(e))).collect::<Vec<Vec2>>();
+        if self.closed {
+            vec![side(top), side(bottom)]
+        } else {
+            let mut poly = side(top);
+            poly.extend(side(bottom).into_iter().rev());
+            vec![poly]
+        }
     }
 
     /// Segments of every element piece, cap and joint.
@@ -466,6 +504,7 @@ mod miter_tests {
             closed: false,
             no_start_caps: true,
             no_end_caps: true,
+            merge_overlaps: false,
             // (−1000,0) → (0,0) → 각도 `deg` 로 되돌아 나가는 팔.
             vertices: vec![
                 MLineVertex::new(Vec3::new(-1000.0, 0.0, 0.0)),

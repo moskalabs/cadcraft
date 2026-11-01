@@ -343,6 +343,9 @@ pub fn mline_for(c: &WallChain) -> MLine {
         closed: c.closed,
         no_start_caps: !c.free_start,
         no_end_caps: !c.free_end,
+        // 겹친 벽은 한 덩어리로 — 한: "겹치는거를 한개로 보이게 하는게 핵심".
+        // 줄기끼리 겹칠 때 서로의 외곽선이 비쳐 보이던 것을 그릴 때 지운다.
+        merge_overlaps: true,
         vertices: c.pts.iter().map(|p| MLineVertex::new(Vec3::new(p.x, p.y, 0.0))).collect(),
     }
 }

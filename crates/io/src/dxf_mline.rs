@@ -144,6 +144,8 @@ pub(crate) fn read_entity(tags: &[Tag]) -> MLine {
         closed: flags & 2 != 0,
         no_start_caps: flags & 4 != 0,
         no_end_caps: flags & 8 != 0,
+        // DXF 에는 이런 칸이 없다 — 읽어 온 multiline 은 제 선을 다 긋는다.
+        merge_overlaps: false,
         vertices,
     }
 }
