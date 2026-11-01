@@ -30,9 +30,9 @@
 //!
 //! ── 글자는 잘라서 넣는다 ──
 //!
-//! 칸 너비가 고정이라 긴 글자는 옆 칸을 침범한다. 화면은 글자 수로 어림해
-//! 잘라 `…` 를 붙인다 (`fitText`). 엔진의 MTEXT 는 칸을 넘어도 안 잘리므로,
-//! **여기서 같은 규칙으로 미리 잘라야** 화면과 같은 그림이 된다.
+//! 칸 너비가 고정이라 긴 글자는 옆 칸을 침범한다. 엔진의 MTEXT 는 칸을
+//! 넘어도 안 잘리므로 **여기서 미리 잘라야** 한다 (`fit_text_at`). 재는 자는
+//! 그리는 그 함수다 — 전엔 글자 수로 어림했는데 반각에서 크게 어긋났다.
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::{
@@ -99,23 +99,37 @@ impl Align {
     }
 }
 
+/// 폭 합이 800 — `po::COLUMNS` 와 같다. 두 표를 나란히 세우면 변이 맞는다.
+///
+/// 612 에서 올렸다 (2026-11-01). 까닭은 `po::COLUMNS` 머리말에 있다 —
+/// 거기 칸이 모자라서 표를 통째로 키웠고, 변을 맞추려면 이쪽도 같이 커야
+/// 한다. 비율은 그대로 뒀다.
 const COLUMNS: [Column; 6] = [
-    Column { label: "구분", width: 88.0, align: Align::Left },
-    Column { label: "품명", width: 104.0, align: Align::Left },
-    Column { label: "규격", width: 228.0, align: Align::Left },
-    Column { label: "면적(m²)", width: 78.0, align: Align::Right },
-    Column { label: "수량", width: 66.0, align: Align::Right },
-    Column { label: "단위", width: 48.0, align: Align::Center },
+    Column { label: "구분", width: 115.0, align: Align::Left },
+    Column { label: "품명", width: 136.0, align: Align::Left },
+    Column { label: "규격", width: 298.0, align: Align::Left },
+    Column { label: "면적(m²)", width: 102.0, align: Align::Right },
+    Column { label: "수량", width: 86.0, align: Align::Right },
+    Column { label: "단위", width: 63.0, align: Align::Center },
 ];
 
 /// 화면의 `BOQ_TITLE_H` / `BOQ_HEADER_H` / `BOQ_ROW_H`.
-pub(crate) const TITLE_H: f64 = 28.0;
-pub(crate) const HEADER_H: f64 = 24.0;
-pub(crate) const ROW_H: f64 = 22.0;
+///
+/// 폭과 **같이** 올렸다 (28/24/22 → 36/30/28). 가로만 늘리면 칸이 납작해져
+/// 표가 눌린 것처럼 보인다.
+pub(crate) const TITLE_H: f64 = 36.0;
+pub(crate) const HEADER_H: f64 = 30.0;
+pub(crate) const ROW_H: f64 = 28.0;
 
 /// 화면의 `FONT` / `TITLE_FONT`.
-pub(crate) const FONT: f64 = 11.0;
-pub(crate) const TITLE_FONT: f64 = 13.0;
+///
+/// 한: "발주서 표 만들때 표 자체를 가로 세로 더 크게 만들면 되지 않나?"
+///
+/// 표를 키우면서 글자도 같이 올렸다 (11 → 12, 제목 13 → 15). 칸만 키우고
+/// 글자를 두면 여백만 넓어져서 **도면 위에서 여전히 안 읽힌다** — 표가
+/// 커졌다는 건 글자가 커졌다는 뜻이기도 하다.
+pub(crate) const FONT: f64 = 12.0;
+pub(crate) const TITLE_FONT: f64 = 15.0;
 
 /// 화면의 `INK` / `RULE`, 그리고 "내용 없음" 글자색.
 pub(crate) const INK: Rgb = Rgb(0x33, 0x33, 0x33);
@@ -140,29 +154,55 @@ fn table_width() -> f64 {
 
 /// 글자를 칸 안에 들어가게 자르고 `…` 를 붙인다.
 ///
-/// 화면의 `fitText` 와 **같은 어림**이다 — 글꼴을 재지 않고 글자 수로 센다.
-/// 한글·한자·가나를 1 로, 그 밖을 0.55 로 본다. 엔진에서 제대로 재면 더
-/// 정확하겠지만, 그러면 화면과 다른 자리에서 잘려서 두 그림이 달라진다.
-pub(crate) fn fit_text(text: &str, width: f64) -> String {
-    let budget = (width - PAD * 2.0) / FONT;
-    // 화면의 `/[ㄱ-힝一-鿿぀-ヿ]/` 과 **같은 집합**이다.
-    //
-    // 한자 범위는 한글 범위 안에 통째로 들어간다 (U+4E00..U+9FFF ⊂
-    // U+3131..U+D79D) — 그대로 옮겨 적으면 "닿지 않는 갈래" 경고가 난다.
-    // 그렇다고 둘을 `U+3040..U+D79D` 한 줄로 합치면 **안 된다**: 가나 끝과
-    // 한글 시작 사이의 U+3100..U+3130 (31자) 이 딸려 들어와 화면과 다른
-    // 자리에서 잘린다.
-    let wide = |c: char| matches!(c, '\u{3040}'..='\u{30FF}' | '\u{3131}'..='\u{D79D}');
-    let mut used = 0.0;
-    for (i, c) in text.chars().enumerate() {
-        used += if wide(c) { 1.0 } else { 0.55 };
-        if used > budget {
-            // '…' 자리를 남기려고 한 글자 더 물러선다 (화면과 같다)
-            let keep = if i > 0 { i - 1 } else { 0 };
-            return text.chars().take(keep).collect::<String>() + "…";
+/// **그리는 그 함수로 잰다** (`cadcraft_fonts::line_width`).
+///
+/// 전엔 글자 수로 어림했다 — 한글·한자·가나를 1 로, 그 밖을 0.55 로. 화면
+/// (tldraw) 쪽 `fitText` 와 같은 어림이라 "두 그림이 같아야 한다" 는 뜻이
+/// 있었는데, 그 화면은 빌드에서 빠졌고 (`reference/tldraw-editor/`) 지금
+/// 그리는 것은 엔진 하나뿐이다. 그래서 맞출 상대가 **실제 획**밖에 없다.
+///
+/// 어림은 실제와 꽤 어긋났다 (FONT=11 에서 재 봤다):
+///
+/// | 글자 | 실제 | 어림 |
+/// |---|---|---|
+/// | 숫자·라틴 | 7.33 | 6.05 |
+/// | `×` | 10.72 | 6.05 |
+/// | `(` `)` | 3.67 | 6.05 |
+/// | 한글 | 11.0 | 11.0 |
+///
+/// 한글만 맞고 나머지는 다 틀렸다. 반각은 **덜 자르고** (칸을 넘쳐 옆을
+/// 침범한다), 괄호는 **더 잘랐다**. 한이 "품목이 `（마감…` 으로 잘린다" 고
+/// 짚은 자리다.
+///
+/// `font` 를 받는 것은 제목이 `TITLE_FONT` 로 그려지기 때문이다 — 전엔 늘
+/// `FONT` 로 재서 제목만 다른 자를 대고 있었다.
+pub(crate) fn fit_text_at(text: &str, width: f64, font: f64) -> String {
+    let budget = width - PAD * 2.0;
+    if budget <= 0.0 {
+        return String::new();
+    }
+    if cadcraft_fonts::line_width(text, font, 1.0) <= budget {
+        return text.to_string();
+    }
+    // **뒤에서 한 글자씩 덜어낸다.** 앞에서 쌓아 가며 넘는 자리를 찾으면
+    // `…` 가 붙는 만큼을 또 빼야 하고, 그 뺄 양이 글자마다 달라서 (`…` 는
+    // 반각인데 앞 글자가 전각일 수 있다) 한 글자 더 물러서는 어림이 또
+    // 생긴다. 들어가는 가장 긴 머리를 직접 찾는 쪽이 어림이 없다.
+    let chars: Vec<char> = text.chars().collect();
+    for keep in (0..chars.len()).rev() {
+        let cut: String = chars[..keep].iter().collect::<String>() + "…";
+        if cadcraft_fonts::line_width(&cut, font, 1.0) <= budget {
+            return cut;
         }
     }
-    text.to_string()
+    // `…` 한 글자도 안 들어가는 칸이다. **비운다** — 넘치는 글자는 옆 칸을
+    // 침범해서 거기 적힌 것까지 못 읽게 만든다. 빈 칸이 덜 나쁘다.
+    String::new()
+}
+
+/// 본문 글자 크기로 자른다 — 셀 대부분이 이쪽이다.
+pub(crate) fn fit_text(text: &str, width: f64) -> String {
+    fit_text_at(text, width, FONT)
 }
 
 /// 한 칸에 찍을 글자. 숫자 칸은 화면과 같은 자릿수로 맞춘다.
@@ -312,7 +352,12 @@ pub fn usable(t: &BoqTable) -> bool {
 
 fn entity_for(t: &BoqTable) -> Table {
     let mut cells: Vec<Vec<TableCell>> =
-        vec![vec![merged(fit_text(&t.title, table_width()), TITLE_STYLE, COLUMNS.len() as u32)]];
+        vec![vec![merged(
+            // 제목은 `TITLE_FONT` 로 그려진다 — 본문 자로 재면 안 맞는다.
+            fit_text_at(&t.title, table_width(), TITLE_FONT),
+            TITLE_STYLE,
+            COLUMNS.len() as u32,
+        )]];
     cells.push(
         COLUMNS.iter().map(|c| cell(c.label, &head_style(c.align))).collect(),
     );
@@ -417,18 +462,18 @@ mod tests {
         let mut d = Drawing::new_metric();
         add_tables(&mut d, &[table(vec![row("가", "나", "다", 1.0, 1.0, "개"); 3])]);
         let t = only(&d);
-        assert_eq!(t.row_heights, vec![28.0, 24.0, 22.0, 22.0, 22.0, 22.0]);
+        assert_eq!(t.row_heights, vec![TITLE_H, HEADER_H, ROW_H, ROW_H, ROW_H, ROW_H]);
         // 총 높이가 `boqTableSize` 와 같아야 한다
         let total: f64 = t.row_heights.iter().sum();
-        assert_eq!(total, 28.0 + 24.0 + 3.0 * 22.0 + 22.0);
+        assert_eq!(total, TITLE_H + HEADER_H + 3.0 * ROW_H + ROW_H);
     }
 
     #[test]
     fn 칸_너비가_화면과_같다() {
         let mut d = Drawing::new_metric();
         add_tables(&mut d, &[table(vec![])]);
-        assert_eq!(only(&d).col_widths, vec![88.0, 104.0, 228.0, 78.0, 66.0, 48.0]);
-        assert_eq!(table_width(), 612.0);
+        assert_eq!(only(&d).col_widths, vec![115.0, 136.0, 298.0, 102.0, 86.0, 63.0]);
+        assert_eq!(table_width(), 800.0);
     }
 
     #[test]
@@ -497,15 +542,68 @@ mod tests {
         assert_eq!(body[2].text, "9.5T 일반");
     }
 
+    /// **자른 글자는 칸을 안 넘는다.** 이게 `fit_text` 의 전부다.
+    ///
+    /// 글자 수로 재지 않는다 — 글꼴이 바뀌면 (빌드마다 깔리는 글꼴이 다르다;
+    /// `cadcraft_fonts::CRAFT_FONTS`) 몇 글자가 들어가는지도 바뀌어서, 수를
+    /// 박아 두면 다른 기계에서 깨진다. **넘지 않는다** 는 성질은 어디서나
+    /// 참이어야 한다.
     #[test]
-    fn 자르는_자리가_화면과_같다() {
-        // 화면의 `fitText` 와 같은 어림이어야 한다 — 한글 1, 그 밖 0.55.
-        // 규격 칸(228px, 글꼴 11) 의 예산은 (228-12)/11 = 19.64 글자다.
-        assert_eq!(fit_text("가나다라마바사아자차카타파하가나다라마", 228.0).chars().count(), 19);
-        // 영문은 0.55 로 세므로 더 많이 들어간다
-        assert!(fit_text(&"a".repeat(30), 228.0).chars().count() > 19);
-        // 빈 글자와 딱 맞는 글자는 그대로
+    fn 자른_글자는_칸을_안_넘는다() {
+        let cases: [(&str, f64); 7] = [
+            ("가나다라마바사아자차카타파하가나다라마", 228.0),
+            (&"a".repeat(30), 228.0),
+            ("석고보드 (마감재 연동)", 104.0),
+            ("900×1800", 120.0),
+            ("벽 타일 (마감재 연동)", 104.0),
+            ("2box", 48.0),
+            ("가", 20.0),
+        ];
+        for (text, w) in cases {
+            let cut = fit_text(text, w);
+            let drawn = cadcraft_fonts::line_width(&cut, FONT, 1.0);
+            assert!(
+                drawn <= w - PAD * 2.0 + 1e-9,
+                "{text:?} → {cut:?} 가 {drawn} 로 칸 {w} 를 넘는다",
+            );
+        }
+    }
+
+    #[test]
+    fn 들어가는_글자는_안_건드린다() {
         assert_eq!(fit_text("", 228.0), "");
+        assert_eq!(fit_text("가나다", 228.0), "가나다");
+        // 칸에 들어가면 `…` 가 붙지 않는다.
+        assert!(!fit_text("900×1800", 120.0).ends_with('…'));
+    }
+
+    /// 제목은 `TITLE_FONT` 로 그려진다 — 본문 자로 재면 넘친다.
+    #[test]
+    fn 제목은_제_글자_크기로_잰다() {
+        let long = "발주서".repeat(40);
+        let cut = fit_text_at(&long, 612.0, TITLE_FONT);
+        let drawn = cadcraft_fonts::line_width(&cut, TITLE_FONT, 1.0);
+        assert!(drawn <= 612.0 - PAD * 2.0 + 1e-9, "{cut:?} 가 {drawn}");
+        // 본문 자로 쟀다면 더 많이 넣었을 것이다.
+        assert!(fit_text(&long, 612.0).chars().count() > cut.chars().count());
+    }
+
+    /// 칸이 `…` 하나도 못 받을 만큼 좁아도 **망가지지 않는다.**
+    ///
+    /// 여기서도 수를 박지 않는다 (`자른_글자는_칸을_안_넘는다` 와 같은 까닭).
+    /// 좁아지는 칸을 훑으며 **늘 넘지 않는지**만 본다.
+    #[test]
+    fn 아주_좁은_칸도_견딘다() {
+        assert_eq!(fit_text("가나다", 0.0), "");
+        assert_eq!(fit_text("가나다", PAD * 2.0), "");
+        assert_eq!(fit_text("가나다", -5.0), "");
+        for w in 0..60 {
+            let width = PAD * 2.0 + f64::from(w);
+            let cut = fit_text("가나다", width);
+            let drawn = cadcraft_fonts::line_width(&cut, FONT, 1.0);
+            assert!(drawn <= width - PAD * 2.0 + 1e-9, "폭 {width}: {cut:?} 가 {drawn}");
+        }
+        // 넉넉하면 그대로 둔다.
         assert_eq!(fit_text("가나다", 228.0), "가나다");
     }
 

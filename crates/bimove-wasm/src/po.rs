@@ -5,7 +5,7 @@
 //!
 //! ── 왜 `boq.rs` 옆에 따로 두나 ──
 //!
-//! 그림은 닮았다 — 제목·머리·본문·합계에 같은 글꼴·같은 색이고, 폭도 612 로
+//! 그림은 닮았다 — 제목·머리·본문·합계에 같은 글꼴·같은 색이고, 폭도 800 으로
 //! 맞춰 뒀다 (도면틀 옆에 둘을 나란히 세우면 변이 맞는다). 그래서 칸·테두리·
 //! 글자 자르기 같은 잔일은 `boq` 것을 그대로 쓴다.
 //!
@@ -28,7 +28,7 @@ use cadcraft_geom::{Vec2, Vec3};
 
 use crate::boq::{
     Align, EDGE_PAD, FONT, HEADER_FILL, HEADER_H, INK, MUTED, PAD, ROW_H, RULE, TITLE_FILL,
-    TITLE_FONT, TITLE_H, TOTAL_FILL, cell, fit_text, merged, style,
+    TITLE_FONT, TITLE_H, TOTAL_FILL, cell, fit_text, fit_text_at, merged, style,
 };
 use crate::jsnum::to_fixed;
 
@@ -63,15 +63,39 @@ struct Column {
     align: Align,
 }
 
-/// 폭 합이 612 — `boq::COLUMNS` 와 같다. 두 표를 나란히 세우면 변이 맞는다.
+/// 폭 합이 800 — `boq::COLUMNS` 와 같다. 두 표를 나란히 세우면 변이 맞는다.
+///
+/// ── 왜 612 에서 키웠나 ──
+///
+/// 한: "발주서 표 만들때 표 자체를 가로 세로 더 크게 만들면 되지 않나?"
+///
+/// 그 전엔 612 안에서 칸끼리 뺏고 뺏겼다. 그런데 **어떻게 나눠도 모자랐다** —
+/// 가장 긴 품목(`친환경 페인트 (마감재 연동)` 류, 이름에 `(마감재 연동)` 이
+/// 붙는다; `poRelink.LINK_SUFFIX`)이 FONT=12 에서 **156.6** 인데 612 짜리
+/// 표에서 품목에 줄 수 있는 최대가 그에 못 미쳤다.
+///
+/// 도면은 무한 캔버스라 표 크기에 제약이 없다. 612 를 지키던 유일한 까닭은
+/// 물량표와 변을 맞추는 것이었고, **둘 다 키우면** 그 약속은 그대로다.
+///
+/// 칸마다 여유(= 폭 − `PAD`×2)와 가장 긴 내용 (FONT=12, Noto Sans KR 실측):
+///
+/// | 칸 | 폭 | 여유 | 가장 긴 것 |
+/// |---|---|---|---|
+/// | 구분 | 96 | 84 | `석고보드` 44 |
+/// | 품목 | 188 | 176 | `친환경 페인트 (마감재 연동)` 156.6 |
+/// | 규격 | 140 | 128 | `1200×2400` 102.8 |
+/// | 수량 | 86 | 74 | `1234.56` 69.2 |
+/// | 단위 | 56 | 44 | `box` 30 |
+/// | 단가 | 114 | 102 | `12,345,678` 96.8 |
+/// | 금액 | 120 | 108 | `12,345,678` 96.8 |
 const COLUMNS: [Column; 7] = [
-    Column { label: "구분", width: 88.0, align: Align::Left },
-    Column { label: "품목", width: 104.0, align: Align::Left },
-    Column { label: "규격", width: 120.0, align: Align::Left },
-    Column { label: "수량", width: 66.0, align: Align::Right },
-    Column { label: "단위", width: 48.0, align: Align::Center },
-    Column { label: "단가", width: 86.0, align: Align::Right },
-    Column { label: "금액", width: 100.0, align: Align::Right },
+    Column { label: "구분", width: 96.0, align: Align::Left },
+    Column { label: "품목", width: 188.0, align: Align::Left },
+    Column { label: "규격", width: 140.0, align: Align::Left },
+    Column { label: "수량", width: 86.0, align: Align::Right },
+    Column { label: "단위", width: 56.0, align: Align::Center },
+    Column { label: "단가", width: 114.0, align: Align::Right },
+    Column { label: "금액", width: 120.0, align: Align::Right },
 ];
 
 /// 표 스타일 이름. 물량표와 **다른 이름**이어야 한다 — 같은 이름이면 뒤에
@@ -312,7 +336,12 @@ pub fn usable(t: &PoTable) -> bool {
 
 fn entity_for(t: &PoTable) -> Table {
     let mut cells: Vec<Vec<TableCell>> =
-        vec![vec![merged(fit_text(&t.title, table_width()), TITLE_STYLE, COLUMNS.len() as u32)]];
+        vec![vec![merged(
+            // 제목은 `TITLE_FONT` 로 그려진다 — 본문 자로 재면 안 맞는다.
+            fit_text_at(&t.title, table_width(), TITLE_FONT),
+            TITLE_STYLE,
+            COLUMNS.len() as u32,
+        )]];
     cells.push(COLUMNS.iter().map(|c| cell(c.label, &head_style(c.align))).collect());
     let body = body_rows(t);
     let mut heights = vec![TITLE_H, HEADER_H];
@@ -429,7 +458,35 @@ mod tests {
     /// 물량표와 **폭이 같아야** 도면틀 옆에 나란히 세울 수 있다.
     #[test]
     fn 물량표와_폭이_같다() {
-        assert_eq!(table_width(), 612.0);
+        assert_eq!(table_width(), 800.0);
+    }
+
+    /// **마감재와 이어진 품목이 안 잘린다.**
+    ///
+    /// 한: 발주서를 도면에 넣었더니 품목이 `석고보드 （마감…` 으로 잘려 있었다.
+    /// 이름에 `(마감재 연동)` 이 붙는 품목이 가장 길어서 (`poRelink`), 품목
+    /// 칸은 그걸 받을 수 있어야 한다.
+    ///
+    /// 폭은 글꼴을 타는데, **여기(네이티브)가 브라우저보다 엄하다** — 깔린
+    /// 글꼴이 브라우저가 쓰는 Noto Sans KR 보다 넓다 (한글 11.0 대 10.12).
+    /// 그래서 여기서 안 잘리면 거기서도 안 잘린다.
+    #[test]
+    fn 마감재_이어진_품목이_안_잘린다() {
+        let 품목 = COLUMNS[1].width;
+        for name in ["석고보드 (마감재 연동)", "벽 타일 (마감재 연동)", "도배 (마감재 연동)"] {
+            let cut = fit_text(name, 품목);
+            assert_eq!(cut, name, "품목 칸 {품목} 이 {name:?} 를 못 받는다");
+        }
+    }
+
+    /// 규격 칸은 `900×1800` 같은 자재 치수를 받는다. `×` 는 반각인데도
+    /// 거의 전각만큼 넓어서 (Noto 기준 10.7) 한 번 짚어 둔다.
+    #[test]
+    fn 자재_규격이_안_잘린다() {
+        let 규격 = COLUMNS[2].width;
+        for spec in ["900×1800", "600×600", "1200×2400"] {
+            assert_eq!(fit_text(spec, 규격), spec, "규격 칸 {규격} 이 {spec:?} 를 못 받는다");
+        }
     }
 
     /// 물량표와 **스타일 이름이 달라야** 한다. 같으면 뒤에 넣는 쪽이 앞의
@@ -466,7 +523,7 @@ mod tests {
             row("석고", "피스", "", 1.0, "box", 0.0),
         ])]);
         let t = only(&d);
-        assert_eq!(t.row_heights, vec![28.0, 24.0, 22.0, 22.0, 22.0, 22.0]);
+        assert_eq!(t.row_heights, vec![TITLE_H, HEADER_H, ROW_H, ROW_H, ROW_H, ROW_H]);
     }
 
     /// 표마다 소계가 하나씩 붙고, 맨 밑에 총계가 또 하나.
@@ -613,14 +670,18 @@ mod tests {
             row("가", "ㄱ", "", 1.0, "장", 0.0),
             row("나", "ㄴ", "", 1.0, "장", 0.0),
         ]);
-        assert_eq!(w, 612.0);
-        // 제목 28 + 머리 24 + (품목 2 + 소계 2) × 22 + 총계 22
-        assert_eq!(h, 28.0 + 24.0 + 4.0 * 22.0 + 22.0);
+        assert_eq!(w, 800.0);
+        // 제목 + 머리 + (품목 2 + 소계 2) 줄 + 총계 한 줄
+        assert_eq!(h, TITLE_H + HEADER_H + 4.0 * ROW_H + ROW_H);
     }
 
     #[test]
     fn 빈_표의_크기도_한_줄은_잡는다() {
         let (_, h) = table_size(&[]);
-        assert_eq!(h, 28.0 + 24.0 + 22.0 + 22.0);
+        assert_eq!(h, TITLE_H + HEADER_H + ROW_H + ROW_H);
     }
 }
+
+
+
+
