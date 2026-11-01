@@ -19,10 +19,10 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("mline", "Multiline", run_mline)
             .menu(&["Draw", "Multiline"])
             .alias(&["ml"])
-            .params("{points, scale?, justification?: top|zero|bottom, style?, closed?} → {handle}")
+            .params("{points, scale?, justification?: top|zero|bottom, style?, closed?, mergeOverlaps?} → {handle}")
             .interactive(|s| Ok(Box::new(MlineM::new(s)))),
         CommandSpec::new("mlstyle", "Multiline Style...", run_mlstyle).menu(&["Format", "Multiline Style..."]).params(
-            "{} → styles | {name, description?, elements?: [{offset, color?, linetype?}], fill?: color|false, joints?, mergeOverlaps?, \
+            "{} → styles | {name, description?, elements?: [{offset, color?, linetype?}], fill?: color|false, joints?, \
                  startCaps?/endCaps?: {line?, outerArc?, innerArcs?, angle? (degrees)}, copyFrom?, current? (default true)} | \
                  {delete: name} | {name, rename: newName}",
         ),
@@ -89,7 +89,19 @@ fn run_mline(s: &mut Session, p: &Value) -> Result<Value> {
         None => s.doc()?.current_mline_style(),
     };
     let closed = bool_or(p, "closed", false) && pts.len() >= 3;
-    let k = make(&def, &pts, closed, j, scale).ok_or_else(|| bad("mline", "need 2 or more points"))?;
+    let mut k = make(&def, &pts, closed, j, scale).ok_or_else(|| bad("mline", "need 2 or more points"))?;
+    // 겹친 이웃과 한 덩어리로 보일 것인가 (`MLine::merge_overlaps`).
+    //
+    // 한: "그린직후에 바로 합쳐지게 해"
+    //
+    // 깃발은 **엔티티마다**라 스타일을 안 건드린다. 스타일에 실어
+    // 봤더니 벽 그리기가 통째로 막혔다 — 빔모바는 불러온 벽과
+    // 그린 벽이 두께당 스타일 하나를 같이 쓴다(`BIMOVE_WALL_250000`).
+    // 쓰이는 중인 스타일은 바꿀 수가 없어서(아래 `mline_in_use`)
+    // `mlstyle` 이 거부당하고, 그게 `pre` 라 본 명령까지 안 갔다.
+    if let EntityKind::MLine(m) = &mut k {
+        m.merge_overlaps = bool_or(p, "mergeOverlaps", false);
+    }
     Ok(json!({ "handle": s.add_entity(k)?.hex() }))
 }
 
@@ -345,10 +357,6 @@ fn run_mlstyle(s: &mut Session, p: &Value) -> Result<Value> {
         Some(c) => st.fill = Some(color_value(c).ok_or_else(|| bad("mlstyle", format!("unknown fill colour {c}")))?),
     }
     st.joints = bool_or(p, "joints", st.joints);
-    // 겹친 이웃과 한 덩어리로 보일 것인가 (`MLineStyle::merge_overlaps`).
-    // 빔모바의 벽 스타일이 켜고 들어온다 — 이게 없으면 **그려 넣은 벽만**
-    // 안 합쳐지다가 새로고침해야 합쳐진다.
-    st.merge_overlaps = bool_or(p, "mergeOverlaps", st.merge_overlaps);
     st.start_caps = caps_param(p, "startCaps", st.start_caps)?;
     st.end_caps = caps_param(p, "endCaps", st.end_caps)?;
     let st = st.sanitized();
@@ -842,44 +850,63 @@ pub(crate) fn explode(e: &Entity, m: &MLine) -> Vec<Entity> {
 #[cfg(test)]
 mod merge_flag_tests {
     use crate::Session;
-    use cadcraft_doc::EntityKind;
+    use cadcraft_doc::{EntityKind, Handle};
     use serde_json::json;
 
-    fn drawn(merge: Option<bool>) -> bool {
+    /// 벽을 하나 그려서 그 엔티티의 합치기 깃발을 돌려준다.
+    ///
+    /// `merge` 가 `Some` 이면 `mline` 에 그대로 실어 보낸다. `used` 면 **그
+    /// 스타일을 쓰는 벽이 이미 있는** 도면에서 그린다 — 빔모바에서 불러온
+    /// 도면 위에 같은 두께의 벽을 덧그리는 그 상황이다.
+    fn drawn(merge: Option<bool>, used: bool) -> bool {
         let mut s = Session::new();
-        let mut style = json!({ "name": "W", "elements": [{"offset": 0.5}, {"offset": -0.5}] });
-        if let Some(m) = merge {
-            style["mergeOverlaps"] = json!(m);
-        }
+        let style = json!({ "name": "BIMOVE_WALL_250000", "elements": [{"offset": 0.5}, {"offset": -0.5}] });
         s.execute("mlstyle", &style).expect("스타일");
-        s.execute("mline", &json!({ "style": "W", "points": [[0, 0], [100, 0]], "scale": 10 })).expect("벽");
+        let mut wall = json!({ "style": "BIMOVE_WALL_250000", "points": [[0, 0], [100, 0]], "scale": 250 });
+        if used {
+            s.execute("mline", &wall).expect("먼저 있던 벽");
+        }
+        if let Some(m) = merge {
+            wall["mergeOverlaps"] = json!(m);
+        }
+        wall["points"] = json!([[50, -50], [50, 50]]);
+        // 빔모바는 벽을 그릴 때마다 스타일을 먼저 깐다 (`pre`). 이것이
+        // 거부당하면 본 명령도 안 간다 — 그래서 여기서도 같이 보낸다.
+        s.execute("mlstyle", &style).expect("벽을 그릴 때 먼저 깔리는 스타일");
+        let h = s.execute("mline", &wall).expect("그린 벽");
+        let h = u64::from_str_radix(h["handle"].as_str().unwrap(), 16).unwrap();
         let d = s.doc().unwrap();
-        d.model
-            .iter()
-            .find_map(|x| match &x.kind {
-                EntityKind::MLine(m) => Some(m.merge_overlaps),
-                _ => None,
-            })
-            .expect("multiline 이 없다")
+        match &d.entity(Handle(h)).expect("방금 그린 것").kind {
+            EntityKind::MLine(m) => m.merge_overlaps,
+            _ => panic!("multiline 이 아니다"),
+        }
     }
 
-    /// **그려 넣은 벽도 합쳐진다.**
+    /// **그린 직후에 바로 합쳐진다.**
     ///
-    /// 한: "붙이는 순간 되어야 하는데 붙여놓고 겹칠때 새로고침을 해야 되잖아"
+    /// 한: "그린직후에 바로 합쳐지게 해"
     ///
-    /// 깃발이 `MLine` 에만 있고 켜 주는 자리가 저장본 되읽기 하나뿐이라,
-    /// 그리는 길(`mlstyle` + `mline`)로 들어온 벽은 안 합쳐졌다. 새로고침하면
-    /// 되읽기를 거치니 그때서야 합쳐져서 — 한이 본 그 꼴이 됐다.
-    ///
-    /// 스타일에 실어 `MLine::new` 가 물려받게 했다. 이 시험이 그 줄을 지킨다.
+    /// 깃발을 켜 주는 자리가 저장본 되읽기 하나뿐이라, 그리는 길로 들어온
+    /// 벽은 안 합쳐졌다 — 새로고침하면 되읽기를 거치니 그때서야 합쳐졌다.
     #[test]
-    fn 스타일이_켜면_그린_벽도_합치기가_켜진다() {
-        assert!(drawn(Some(true)), "스타일이 켰는데 엔티티가 안 켜졌다");
+    fn 그린_벽은_합치기가_켜져_난다() {
+        assert!(drawn(Some(true), false), "켜라고 했는데 꺼진 채로 났다");
+    }
+
+    /// **이미 쓰이는 스타일이어도 켜진다.**
+    ///
+    /// 깃발을 `MLineStyle` 에 실었다가 여기서 걸렸다. 빔모바는 두께당 스타일
+    /// 하나를 불러온 벽과 그린 벽이 같이 쓰는데, 쓰이는 중인 스타일은 바꿀
+    /// 수 없어서 `mlstyle` 이 거부당했다. 그게 `pre` 라 **벽이 아예 안
+    /// 그려졌다.** 깃발은 엔티티마다라야 한다.
+    #[test]
+    fn 쓰이는_스타일의_벽도_합치기가_켜진다() {
+        assert!(drawn(Some(true), true), "스타일이 쓰이는 중이라고 꺼진 채로 났다");
     }
 
     #[test]
     fn 평범한_multiline_은_그대로다() {
-        assert!(!drawn(None), "안 켰는데 켜졌다");
-        assert!(!drawn(Some(false)), "끄라고 했는데 켜졌다");
+        assert!(!drawn(None, false), "안 켰는데 켜졌다");
+        assert!(!drawn(Some(false), false), "끄라고 했는데 켜졌다");
     }
 }

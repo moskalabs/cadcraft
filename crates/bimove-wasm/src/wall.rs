@@ -349,10 +349,6 @@ fn style_for(c: &WallChain) -> MLineStyle {
         end_caps: MLineCaps { line: true, ..Default::default() },
         fill: c.fill,
         joints: false,
-        // 스타일이 깃발을 들고 있으면 **그리는 길과 되읽는 길이 같아진다**
-        // (`MLineStyle::merge_overlaps`). 엔티티 쪽에도 그대로 둔다 —
-        // 저장본에서 온 것은 `mline_for` 가 직접 적는다.
-        merge_overlaps: !c.imported,
         ..Default::default()
     }
 }
