@@ -135,7 +135,27 @@ fn color_of(meta: Option<&Value>) -> Color {
 /// 엔진이 **끄고 켜는 단위는 레이어**다 (`layer.set`). 공간을 한 레이어에
 /// 몰아 두면 하나만 숨길 길이 없으므로, **공간마다 제 레이어**를 준다.
 /// 읽는 쪽(`관계 탭`)이 이름을 지어 맞춰야 하니 머리를 여기 박아 둔다.
-pub const ZONE_LAYER_PREFIX: &str = "A-ZONE:";
+/// 공간 레이어 이름의 머리.
+///
+/// 한: "내보내기 했을때 오토캐드에서 못잡음"
+///
+/// **콜론이 아니다.** `A-ZONE:거실` 로 짓다가 내보낸 DXF 를 AutoCAD 가
+/// 통째로 거부했다 — 레이어 이름에 `< > / \ " : ; ? * | = '` 는 못 쓴다.
+/// 공간을 하나라도 지정한 도면은 전부 안 열렸다.
+pub const ZONE_LAYER_PREFIX: &str = "A-ZONE-";
+
+/// 레이어 이름에 **못 쓰는 글자** (AutoCAD). 공간 이름은 사용자가 적는
+/// 것이라 여기로 그대로 들어온다 — 거르지 않으면 `창고/창고2` 같은 이름
+/// 하나가 도면 전체를 못 열게 만든다.
+const LAYER_BAD: &[char] = &['<', '>', '/', '\\', '"', ':', ';', '?', '*', '|', '=', '\''];
+
+/// 레이어 이름으로 쓸 수 있게 **못 쓰는 글자를 밑줄로** 바꾼다.
+///
+/// 읽는 쪽(`zoneLayer.ts` 의 `zoneLayerName`)과 **같은 규칙**이라야 한다 —
+/// 어긋나면 눈 아이콘이 없는 레이어를 끄게 되고 아무 일도 안 일어난다.
+pub fn layer_safe(name: &str) -> String {
+    name.chars().map(|c| if LAYER_BAD.contains(&c) { '_' } else { c }).collect()
+}
 
 /// 이름 없는 공간이 받는 꼬리. 화면이 띄우는 말과 같다.
 pub const ZONE_LAYER_UNNAMED: &str = "미지정";
@@ -155,7 +175,7 @@ pub fn zone_layer(meta: Option<&Value>, label: &str) -> String {
     }
     let name = label.trim();
     let name = if name.is_empty() { ZONE_LAYER_UNNAMED } else { name };
-    format!("{ZONE_LAYER_PREFIX}{name}")
+    format!("{ZONE_LAYER_PREFIX}{}", layer_safe(name))
 }
 
 fn layer_of(meta: Option<&Value>) -> String {
@@ -2719,6 +2739,38 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
         assert!(mline < fill && gap < fill, "벽 {mline} / 가림 {gap} / 공간 {fill}");
     }
 
+    /// **레이어 이름에 AutoCAD 금지 문자가 없다.**
+    ///
+    /// 한: "내보내기 했을때 오토캐드에서 못잡음"
+    ///
+    /// `A-ZONE:거실` 로 짓다가 내보낸 DXF 를 AutoCAD 가 통째로 거부했다.
+    /// 공간을 하나라도 지정하면 그 도면은 안 열렸다 — ezdxf 로 재니
+    /// `Invalid layer name` 이 공간마다 넷씩 떴다.
+    ///
+    /// 공간 이름은 사용자가 적는 것이라 금지 문자가 그대로 들어온다.
+    #[test]
+    fn 공간_레이어에_금지_문자가_없다() {
+        // 거르는 쪽과 **같은 목록**을 쓴다 — 두 벌이면 갈린다.
+        for label in ["거실", "창고/창고2", "A:B", "<손님*방>", "", "  "] {
+            let name = zone_layer(None, label);
+            assert!(
+                !name.contains(LAYER_BAD),
+                "{label:?} → {name:?} 에 금지 문자가 남았다 — AutoCAD 가 도면을 통째로 거부한다",
+            );
+            assert!(name.starts_with("A-ZONE-"), "{name:?} 가 머리를 안 달았다");
+        }
+    }
+
+    /// 멀쩡한 이름은 **그대로 둔다.** 다 밑줄로 바꾸면 눈 아이콘이 어느
+    /// 공간 것인지 알 수 없게 된다.
+    #[test]
+    fn 멀쩡한_이름은_안_건드린다() {
+        assert_eq!(zone_layer(None, "거실"), "A-ZONE-거실");
+        assert_eq!(zone_layer(None, "창고 1"), "A-ZONE-창고 1");
+        assert_eq!(layer_safe("거실"), "거실");
+        assert_eq!(layer_safe("창고/1"), "창고_1");
+    }
+
     #[test]
     fn 공간의_y_도_뒤집힌다() {
         let j = doc_json(&zone_json(1, 0.0, 60.0, 100.0, 80.0, "거실", 8.0));
@@ -2765,7 +2817,7 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
         );
         let r = drawing_from_bimove(&j, "").unwrap();
         assert!(
-            r.drawing.layers.iter().any(|l| l.name == "A-ZONE:거실"),
+            r.drawing.layers.iter().any(|l| l.name == "A-ZONE-거실"),
             "공간 레이어가 없다: {:?}",
             r.drawing.layers.iter().map(|l| &l.name).collect::<Vec<_>>(),
         );
@@ -2780,7 +2832,7 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
                 "label":"","areaM2":1}}"##,
         );
         let r = drawing_from_bimove(&j, "").unwrap();
-        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE:미지정"));
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE-미지정"));
     }
 
     #[test]
@@ -2797,7 +2849,7 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
                 "label":"안방","areaM2":1}}"##,
         ));
         let r = drawing_from_bimove(&j, "").unwrap();
-        for want in ["A-ZONE:거실", "A-ZONE:안방"] {
+        for want in ["A-ZONE-거실", "A-ZONE-안방"] {
             assert!(r.drawing.layers.iter().any(|l| l.name == want), "{want} 가 없다");
         }
     }
@@ -2814,7 +2866,7 @@ const LEADER_SHAPE: &str = r#"{"id":"shape:a1","type":"arrow","x":500,"y":200,"r
                 "meta":{"dxfLayer":"0"}}"##,
         );
         let r = drawing_from_bimove(&j, "").unwrap();
-        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE:거실"));
+        assert!(r.drawing.layers.iter().any(|l| l.name == "A-ZONE-거실"));
     }
 
     /// 손으로 옮겨 둔 레이어는 **덮지 않는다.**
