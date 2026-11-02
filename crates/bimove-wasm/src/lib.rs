@@ -2426,6 +2426,84 @@ mod tests {
         doc.cache.as_ref().unwrap().5.prims.len()
     }
 
+    /// 빔모바가 벽을 그릴 때 보내는 **그대로** T 자 벽 둘을 긋는다.
+    ///
+    /// `mergeOverlaps` 만 가르고 나머지는 `cadDraw.ts` 의
+    /// `wallStyleCommand` + `commitCommand` 와 같은 꼴이다.
+    fn draw_tee(doc: &mut Doc, merge: bool) {
+        let st = r##"{"name":"BIMOVE_WALL_250000","elements":[{"offset":0.5},{"offset":-0.5}],"fill":"#ffffff","joints":false,"startCaps":{"line":true},"endCaps":{"line":true},"current":false}"##;
+        doc.exec("mlstyle", st).expect("벽 스타일");
+        for pts in [r#"[[0,0],[3000,0]]"#, r#"[[1500,-1500],[1500,1500]]"#] {
+            let ml = format!(
+                r#"{{"points":{pts},"scale":250,"justification":"zero","style":"BIMOVE_WALL_250000","mergeOverlaps":{merge}}}"#
+            );
+            doc.exec("mline", &ml).expect("벽");
+        }
+    }
+
+    /// **그린 직후에 화면에서도 합쳐진다.**
+    ///
+    /// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+    ///
+    /// 깃발이 엔티티에 켜지는 것만 보는 시험은 이미 있다. 그런데 켜져도
+    /// **렌더가 실제로 자르지 않으면** 화면은 그대로다 — 한이 보는 것이
+    /// 그 꼴이다. 그래서 여기는 명령으로 긋고 **그려진 프리미티브 수**를
+    /// 견준다. 합치면 남의 몸통에 든 토막이 빠지므로 줄어야 한다.
+    #[test]
+    fn 그린_벽이_화면에서도_합쳐진다() {
+        let mut off = Doc::open(WALLS_DXF.as_bytes()).unwrap();
+        draw_tee(&mut off, false);
+        let n_off = prim_count(&mut off);
+
+        let mut on = Doc::open(WALLS_DXF.as_bytes()).unwrap();
+        draw_tee(&mut on, true);
+        let n_on = prim_count(&mut on);
+
+        // **수가 줄 거라고 보면 안 된다.** 자르면 선 하나가 두 토막이 되어
+        // 오히려 는다. 여기서 보는 것은 명령으로 그은 벽에까지 **배선이
+        // 닿았는가** 뿐이다 — 길이로 제대로 재는 것은 `wallmask` 쪽 시험
+        // (`구운_것과_화면에서_자른_것이_같다`)이 한다.
+        assert_ne!(
+            n_on, n_off,
+            "합치기를 켰는데 그림이 그대로다 — 새로고침해야 합쳐지는 그 꼴이다 ({n_off} 개)",
+        );
+    }
+
+    fn mline_count(doc: &Doc) -> usize {
+        doc.drawing()
+            .model
+            .iter()
+            .filter(|e| matches!(&e.kind, cadcraft_doc::EntityKind::MLine(_)))
+            .count()
+    }
+
+    /// **그린 벽은 줄기로 안 묶인다 — 새로고침해야 묶인다.**
+    ///
+    /// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+    ///
+    /// 저장본을 읽는 길은 끝이 맞닿은 벽들을 한 줄기로 묶는다
+    /// (`wall::chain_walls`). 그래야 꺾이는 데서 외곽선이 miter 로 뾰족하게
+    /// 이어진다. 그런데 **그리는 길은 `mline` 명령 하나에 벽 하나**라 그
+    /// 자리를 안 지난다 — L 자로 이어 그려도 사각형 둘이 겹친 꼴이고,
+    /// 새로고침해서 되읽어야 비로소 이어진 그림이 된다.
+    #[test]
+    fn 이어_그린_벽이_한_줄기로_안_묶인다() {
+        let mut doc = Doc::open(WALLS_DXF.as_bytes()).unwrap();
+        let before = mline_count(&doc);
+        let st = r##"{"name":"BIMOVE_WALL_250000","elements":[{"offset":0.5},{"offset":-0.5}],"fill":"#ffffff","joints":false,"startCaps":{"line":true},"endCaps":{"line":true},"current":false}"##;
+        doc.exec("mlstyle", st).unwrap();
+        // L 자 — 둘째 벽이 첫째 벽 **끝점에서** 시작한다.
+        for pts in [r#"[[0,0],[3000,0]]"#, r#"[[3000,0],[3000,2000]]"#] {
+            let ml = format!(
+                r#"{{"points":{pts},"scale":250,"justification":"zero","style":"BIMOVE_WALL_250000","mergeOverlaps":true}}"#
+            );
+            doc.exec("mline", &ml).unwrap();
+        }
+        let drawn = mline_count(&doc) - before;
+        println!("그려서 생긴 MLINE: {drawn}개");
+        assert_eq!(drawn, 2, "이 시험의 전제가 깨졌다");
+    }
+
     #[test]
     fn 선을_그으면_도면에_늘어난다() {
         let mut doc = Doc::open(&one_line_dxf()).unwrap();
