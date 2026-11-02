@@ -398,6 +398,66 @@ pub fn add_walls(drawing: &mut Drawing, walls: &[WallSeg]) -> usize {
     n
 }
 
+/// 이미 도면에 있는 벽들을 **다시 묶는다.** 묶인 MLINE 수를 돌려준다.
+///
+/// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+///
+/// 저장본을 읽는 길은 벽을 `add_walls` 로 넣어서 끝이 맞닿은 것들이 한
+/// 줄기가 된다. 그런데 **그리는 길은 `mline` 명령 하나에 벽 하나**라 그
+/// 자리를 안 지난다 — L 자로 이어 그리면 가로벽의 끝막음선이 세로벽 안에
+/// 남아 모서리에 계단이 생기고, 새로고침해야 비로소 miter 로 꺾인 그림이
+/// 됐다.
+///
+/// 그래서 **새로고침이 하던 일을 그 자리에서** 한다: 벽을 도로 토막으로
+/// 풀어 `add_walls` 에 다시 넘긴다. 묶는 규칙이 한 벌뿐이라 두 길의 그림이
+/// 갈릴 수가 없다.
+///
+/// 벽만 건드린다. 정체성이 `wall` 인 MLINE 이 아니면 쳐다보지 않는다 —
+/// 불러온 도면의 multiline 도, 공간도, 문·창도 그대로 있는다.
+pub fn rechain_walls(drawing: &mut Drawing) -> usize {
+    // 1. 벽 MLINE 을 토막으로 푼다. 한 MLINE 의 꼭짓점 n 개는 벽 n-1 개다.
+    let mut segs: Vec<WallSeg> = Vec::new();
+    let mut doomed: Vec<cadcraft_doc::Handle> = Vec::new();
+    for e in drawing.model.iter() {
+        let EntityKind::MLine(m) = &e.kind else { continue };
+        let Some(id) = crate::identity::of(e) else { continue };
+        if id.kind != crate::identity::WALL {
+            continue;
+        }
+        let pts: Vec<Vec2> = m.vertices.iter().map(|v| v.p.xy()).collect();
+        if pts.len() < 2 {
+            continue;
+        }
+        doomed.push(e.handle);
+        for (i, w) in pts.windows(2).enumerate() {
+            segs.push(WallSeg {
+                // 묶였던 벽은 도형 id 가 여럿이다 — 토막마다 제 것을 돌려준다.
+                // 모자라면 첫 것을 쓴다 (묶기가 id 를 줄였을 때).
+                id: id.ids.get(i).or_else(|| id.ids.first()).cloned().unwrap_or_default(),
+                a: w[0],
+                b: w[1],
+                thickness: m.scale.abs(),
+                layer: e.common.layer.clone(),
+                color: e.common.color,
+                fill: m.def.fill,
+                // **합치기 깃발로 가린다.** 불러온 도면에서 온 벽은 꺼져 있고
+                // (`mline_for`), 그린 벽은 켜져 있다 — 한: "벽체 새로
+                // 빔모바에서 그릴때만, 도면 불러온거는 말고".
+                imported: !m.merge_overlaps,
+            });
+        }
+    }
+    if segs.is_empty() {
+        return 0;
+    }
+
+    // 2. 헌 것을 걷어내고 새로 묶어 넣는다.
+    for h in doomed {
+        drawing.model.remove(h);
+    }
+    add_walls(drawing, &segs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

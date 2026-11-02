@@ -989,6 +989,30 @@ impl Doc {
         )
     }
 
+    /// 도면에 있는 벽들을 **다시 묶는다.** 묶인 MLINE 수를 돌려준다.
+    ///
+    /// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+    ///
+    /// 그리는 길은 `mline` 명령 하나에 벽 하나라 줄기로 안 묶인다. 그래서
+    /// 벽을 긋고 **그 자리에서** 이것을 부른다 — 새로고침이 하던 일
+    /// (`wall::rechain_walls`)을 당겨 하는 셈이다.
+    ///
+    /// 되돌리기는 **직접 쌓는다.** 엔진 명령이 아니라 여기서 문서를 고치므로
+    /// `execute` 안의 `push_undo` 를 안 지난다 — 안 쌓으면 벽을 긋고 되돌릴 때
+    /// 묶기 전으로 못 돌아간다.
+    fn rechain_walls(&mut self) -> Result<usize, String> {
+        let st = self.session.state_mut().map_err(|e| e.to_string())?;
+        let before = st.doc.clone();
+        let sel = st.selection.clone();
+        st.push_undo(cadcraft_engine::Snapshot {
+            label: "벽 묶기".to_string(),
+            doc: before,
+            selection: sel,
+        });
+        let d = self.session.doc_mut().map_err(|e| e.to_string())?;
+        Ok(wall::rechain_walls(d))
+    }
+
     fn exec(&mut self, id: &str, params_json: &str) -> Result<String, String> {
         let params: serde_json::Value = if params_json.trim().is_empty() {
             serde_json::json!({})
@@ -1206,6 +1230,18 @@ impl BimoveDoc {
     /// 도면 판번호. 편집할 때마다 올라간다 — UI 가 "다시 그려야 하나" 를 이걸로 안다.
     pub fn revision(&self) -> f64 {
         self.0.revision() as f64
+    }
+
+    /// 벽들을 **다시 묶는다** — 벽을 그린 **직후**에 부른다.
+    ///
+    /// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+    ///
+    /// 묶인 MLINE 수를 돌려준다. 벽이 없으면 `0` 이고 아무것도 안 한다.
+    /// 되돌리기 한 묶음 안에서 불러야 한다 (`asOneStep`) — 그래야 벽 긋기와
+    /// 묶기가 한 번에 되돌아간다.
+    #[wasm_bindgen(js_name = rechainWalls)]
+    pub fn rechain_walls(&mut self) -> Result<usize, JsError> {
+        self.0.rechain_walls().map_err(|e| JsError::new(&e))
     }
 
     /// 지금 도면을 DXF 글로. 저장할 때 이걸 올린다.
@@ -2477,32 +2513,98 @@ mod tests {
             .count()
     }
 
-    /// **그린 벽은 줄기로 안 묶인다 — 새로고침해야 묶인다.**
+    /// **그린 벽을 그 자리에서 한 줄기로 묶는다.**
     ///
     /// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
     ///
-    /// 저장본을 읽는 길은 끝이 맞닿은 벽들을 한 줄기로 묶는다
-    /// (`wall::chain_walls`). 그래야 꺾이는 데서 외곽선이 miter 로 뾰족하게
-    /// 이어진다. 그런데 **그리는 길은 `mline` 명령 하나에 벽 하나**라 그
-    /// 자리를 안 지난다 — L 자로 이어 그려도 사각형 둘이 겹친 꼴이고,
-    /// 새로고침해서 되읽어야 비로소 이어진 그림이 된다.
+    /// 그리는 길은 `mline` 명령 하나에 벽 하나라, L 자로 이어 그려도 MLINE
+    /// 둘이다. 그 꼴이면 가로벽의 끝막음선이 세로벽 안에 남아 모서리에
+    /// 계단이 생기고, 새로고침해서 되읽어야 비로소 miter 로 꺾인 그림이
+    /// 됐다. `rechain_walls` 가 그 일을 당겨 한다.
     #[test]
-    fn 이어_그린_벽이_한_줄기로_안_묶인다() {
+    fn 이어_그린_벽을_그_자리에서_묶는다() {
         let mut doc = Doc::open(WALLS_DXF.as_bytes()).unwrap();
         let before = mline_count(&doc);
         let st = r##"{"name":"BIMOVE_WALL_250000","elements":[{"offset":0.5},{"offset":-0.5}],"fill":"#ffffff","joints":false,"startCaps":{"line":true},"endCaps":{"line":true},"current":false}"##;
         doc.exec("mlstyle", st).unwrap();
         // L 자 — 둘째 벽이 첫째 벽 **끝점에서** 시작한다.
-        for pts in [r#"[[0,0],[3000,0]]"#, r#"[[3000,0],[3000,2000]]"#] {
+        for (i, pts) in [r#"[[0,0],[3000,0]]"#, r#"[[3000,0],[3000,2000]]"#].iter().enumerate() {
             let ml = format!(
                 r#"{{"points":{pts},"scale":250,"justification":"zero","style":"BIMOVE_WALL_250000","mergeOverlaps":true}}"#
             );
-            doc.exec("mline", &ml).unwrap();
+            let h: serde_json::Value = serde_json::from_str(&doc.exec("mline", &ml).unwrap()).unwrap();
+            let h = h["handle"].as_str().unwrap().to_string();
+            let xd = format!(r#"{{"handles":["{h}"],"data":{{"kind":"wall","ids":["shape:w{i}"]}}}}"#);
+            doc.exec("xdata.set", &xd).unwrap();
         }
-        let drawn = mline_count(&doc) - before;
-        println!("그려서 생긴 MLINE: {drawn}개");
-        assert_eq!(drawn, 2, "이 시험의 전제가 깨졌다");
+        assert_eq!(mline_count(&doc) - before, 2, "그릴 때는 벽마다 MLINE 하나다");
+
+        doc.rechain_walls().expect("묶기");
+        assert_eq!(mline_count(&doc) - before, 1, "L 자 벽 둘이 한 줄기로 안 묶였다");
     }
+
+    /// **묶은 그림이 새로고침한 그림과 같다.**
+    ///
+    /// 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+    ///
+    /// 묶기를 따로 짜면 두 길의 그림이 갈린다. 그래서 새로고침이 쓰는 그
+    /// 함수(`wall::add_walls`)를 그대로 쓴다 — 이 시험이 그걸 지킨다.
+    #[test]
+    fn 묶은_그림이_새로고침한_것과_같다() {
+        let st = r##"{"name":"BIMOVE_WALL_250000","elements":[{"offset":0.5},{"offset":-0.5}],"fill":"#ffffff","joints":false,"startCaps":{"line":true},"endCaps":{"line":true},"current":false}"##;
+        // 빔모바가 벽을 그릴 때 하는 그대로 — 긋고 **정체성까지 심는다**
+        // (`CadCraftViewer` 의 `identify(d.tool, made)`). 정체성이 없으면
+        // `to_bimove` 도 `rechain_walls` 도 그 벽을 못 본다.
+        let draw = |doc: &mut Doc| {
+            doc.exec("mlstyle", st).unwrap();
+            for (i, pts) in [r#"[[0,0],[3000,0]]"#, r#"[[3000,0],[3000,2000]]"#].iter().enumerate() {
+                let ml = format!(
+                    r#"{{"points":{pts},"scale":250,"justification":"zero","style":"BIMOVE_WALL_250000","mergeOverlaps":true}}"#
+                );
+                let h: serde_json::Value = serde_json::from_str(&doc.exec("mline", &ml).unwrap()).unwrap();
+                let h = h["handle"].as_str().unwrap().to_string();
+                let xd = format!(r#"{{"handles":["{h}"],"data":{{"kind":"wall","ids":["shape:w{i}"]}}}}"#);
+                doc.exec("xdata.set", &xd).unwrap();
+            }
+        };
+        // 그린 뒤 **그 자리에서** 묶은 것.
+        let mut now = Doc::from_bimove(&bimove_json(), "").unwrap();
+        draw(&mut now);
+        now.rechain_walls().expect("묶기");
+
+        // 그린 뒤 저장본으로 갔다 온 것 = 새로고침.
+        let mut later = Doc::from_bimove(&bimove_json(), "").unwrap();
+        draw(&mut later);
+        let back = later.to_bimove(&bimove_json()).expect("저장");
+        let reloaded = Doc::from_bimove(&back.json, "").unwrap();
+
+        let shape = |d: &Doc| {
+            let mut v: Vec<String> = d
+                .drawing()
+                .model
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    cadcraft_doc::EntityKind::MLine(m) => Some(format!(
+                        "{:.0}|{}",
+                        m.scale,
+                        // `+ 0.0` 은 **-0.0 을 0.0 으로** 만든다. 저장본을
+                        // 갔다 오면 y 가 한 번 뒤집혀서 (`to_bimove::canvas`)
+                        // 0 이 -0 으로 적히는데, 기하는 같은 점이다.
+                        m.vertices
+                            .iter()
+                            .map(|x| format!("{:.1},{:.1}", x.p.x + 0.0, x.p.y + 0.0))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(shape(&now), shape(&reloaded), "묶은 그림과 새로고침한 그림이 다르다");
+    }
+
 
     #[test]
     fn 선을_그으면_도면에_늘어난다() {

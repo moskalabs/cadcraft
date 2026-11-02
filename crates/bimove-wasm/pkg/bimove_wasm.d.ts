@@ -114,6 +114,16 @@ export class BimoveDoc {
      */
     poCount(): number;
     /**
+     * 벽들을 **다시 묶는다** — 벽을 그린 **직후**에 부른다.
+     *
+     * 한: "아직 벽 새로고침해야 연결되는 그림 나와"
+     *
+     * 묶인 MLINE 수를 돌려준다. 벽이 없으면 `0` 이고 아무것도 안 한다.
+     * 되돌리기 한 묶음 안에서 불러야 한다 (`asOneStep`) — 그래야 벽 긋기와
+     * 묶기가 한 번에 되돌아간다.
+     */
+    rechainWalls(): number;
+    /**
      * 픽셀로 그린다. `cx`,`cy` 는 화면 가운데 도면 좌표, `scale` 은 단위당 픽셀.
      * `bg` 는 0xRRGGBB. 크기가 0 이거나 터무니없으면 null.
      * `draft` 면 **그릴 거리를 다시 만들지 않는다** — 쓰던 걸 그대로 쓴다.
@@ -273,6 +283,7 @@ export interface InitOutput {
     readonly bimovedoc_pick: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly bimovedoc_pickWindow: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
     readonly bimovedoc_poCount: (a: number) => number;
+    readonly bimovedoc_rechainWalls: (a: number) => [number, number, number];
     readonly bimovedoc_renderPixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => number;
     readonly bimovedoc_revision: (a: number) => number;
     readonly bimovedoc_snap: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
