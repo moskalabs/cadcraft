@@ -340,6 +340,33 @@ impl MLine {
             .collect()
     }
 
+    /// Each element's full run on each segment: `(segment, element, start, end)`.
+    ///
+    /// Breaks are **not** taken out — this is the line a break's distances are measured
+    /// along, so whoever computes breaks needs it whole ([`MLineCut`]). [`Self::geometry`]
+    /// takes the breaks out of these same runs, so the two can't drift apart.
+    pub fn element_runs(&self) -> Vec<(usize, usize, Vec2, Vec2)> {
+        let pts = self.points();
+        let n = pts.len();
+        let nseg = self.segment_count();
+        if nseg == 0 || pts.iter().any(|p| !p.is_finite()) {
+            return Vec::new();
+        }
+        let miters = self.miters();
+        let offs = self.offsets();
+        let at = |k: usize, d: f64| pts.get(k % n).copied().unwrap_or_default() + miters.get(k % n).copied().unwrap_or_default() * d;
+        let mut out = Vec::new();
+        for k in 0..nseg {
+            for (e, d) in offs.iter().enumerate() {
+                let (a, b) = (at(k, *d), at(k + 1, *d));
+                if a.dist(b) > 1e-12 {
+                    out.push((k, e, a, b));
+                }
+            }
+        }
+        out
+    }
+
     /// The drawn geometry: element pieces (breaks taken out), caps, joints and fill.
     pub fn geometry(&self) -> MLineGeometry {
         let mut g = MLineGeometry::default();
@@ -349,21 +376,15 @@ impl MLine {
         if nseg == 0 || pts.iter().any(|p| !p.is_finite()) {
             return g;
         }
-        let miters = self.miters();
         let offs = self.offsets();
+        let miters = self.miters();
         let at = |k: usize, d: f64| pts.get(k % n).copied().unwrap_or_default() + miters.get(k % n).copied().unwrap_or_default() * d;
-        for k in 0..nseg {
+        for (k, e, a, b) in self.element_runs() {
             let cuts = self.vertices.get(k).map(|v| v.cuts.as_slice()).unwrap_or(&[]);
-            for (e, d) in offs.iter().enumerate() {
-                let (a, b) = (at(k, *d), at(k + 1, *d));
-                let len = a.dist(b);
-                if len <= 1e-12 {
-                    continue;
-                }
-                let dir = (b - a) / len;
-                for (s, t) in pieces(len, cuts.iter().filter(|c| c.element == e).map(|c| (c.start, c.end))) {
-                    g.lines.push((e, a + dir * s, a + dir * t));
-                }
+            let len = a.dist(b);
+            let dir = (b - a) / len;
+            for (s, t) in pieces(len, cuts.iter().filter(|c| c.element == e).map(|c| (c.start, c.end))) {
+                g.lines.push((e, a + dir * s, a + dir * t));
             }
         }
         // Elements by offset, largest (leftmost) first.

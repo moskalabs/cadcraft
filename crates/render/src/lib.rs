@@ -24,6 +24,56 @@ mod text;
 mod tolerance;
 pub mod units;
 mod wallmask;
+
+/// 겹친 벽의 합치기를 **문서에 굽는다** — 내보내기 바로 전에 부른다.
+///
+/// 한: "내보내기도 ... 오토캐드랑 딱 호환되게끔"
+///
+/// 화면에서는 그릴 때마다 남의 몸통에 든 토막을 빼면 된다
+/// ([`wallmask`]). 파일에는 그 자리가 없다 — DXF 에 "겹친 이웃과 합쳐라"
+/// 라는 칸이 없어서, 내보낸 벽은 제 선을 다 긋고 **AutoCAD 에서 교차 자리에
+/// X 가 다시 생긴다.** 화면과 납품 파일이 갈리는 꼴이다.
+///
+/// 그래서 잘라낸 결과를 MLINE 이 정식으로 아는 **요소별 끊기**로 바꿔 넣는다
+/// ([`wallmask::WallMask::bake`]). AutoCAD 의 MLEDIT 가 "Merged Cross/Tee" 로
+/// 만드는 것과 같은 물건이라, 받는 쪽에서 더 손댈 것이 없다.
+///
+/// **문서를 고친다.** 부르는 쪽이 내보낼 복제본에만 걸어야 한다 — 원본에
+/// 걸면 화면이 끊기를 한 번, 마스크를 또 한 번 적용하게 된다.
+///
+/// 구운 벽 수를 돌려준다.
+pub fn bake_wall_merges(d: &mut Drawing, space: &Space) -> usize {
+    let Some(mask) = wallmask::WallMask::collect(d, space) else { return 0 };
+    // **먼저 다 셈한다.** 하나 굽고 다음을 셈하면 이웃의 기하가 그새 달라져
+    // 서로 다른 그림을 보고 자르게 된다.
+    let baked: Vec<(Handle, wallmask::Baked)> = match d.space(space) {
+        Some(store) => store
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::MLine(m) if m.merge_overlaps => Some((e.handle, mask.bake(e.handle, m))),
+                _ => None,
+            })
+            .collect(),
+        None => return 0,
+    };
+    let n = baked.len();
+    let Some(store) = d.space_mut(space) else { return 0 };
+    for (h, b) in baked {
+        store.modify(h, |e| {
+            let EntityKind::MLine(m) = &mut e.kind else { return };
+            for (v, cuts) in m.vertices.iter_mut().zip(b.cuts) {
+                v.cuts.extend(cuts);
+            }
+            m.no_start_caps = b.no_start_caps;
+            m.no_end_caps = b.no_end_caps;
+            // 끊기가 기하에 들어갔으니 깃발은 내린다. 그대로 두면 이 문서를
+            // 다시 그릴 때 끊긴 선을 **또** 자른다.
+            m.merge_overlaps = false;
+        });
+    }
+    n
+}
+
 mod wide;
 
 use cadcraft_color::{Color, Rgb};

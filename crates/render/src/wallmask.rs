@@ -20,7 +20,7 @@
 //! 켜는 것은 벽뿐이다 (`MLine::merge_overlaps`). 일반 DXF multiline 은 그대로
 //! 제 선을 다 긋는다.
 
-use cadcraft_doc::{Drawing, EntityKind, Handle, Space};
+use cadcraft_doc::{Drawing, EntityKind, Handle, MLine, MLineCut, Space};
 use cadcraft_geom::Vec2;
 
 /// 몸통 가장자리에 **딱 붙은** 점을 "안"으로 치지 않는 여유.
@@ -42,6 +42,14 @@ struct Wall {
 /// 한 공간에서 **합칠 벽 전부.**
 pub struct WallMask {
     walls: Vec<Wall>,
+}
+
+/// 합치기를 DXF 가 아는 말로 구운 것 — [`WallMask::bake`] 가 낸다.
+pub struct Baked {
+    /// 꼭짓점마다, **거기서 시작하는 세그먼트**의 끊기 (`MLineVertex::cuts`).
+    pub cuts: Vec<Vec<MLineCut>>,
+    pub no_start_caps: bool,
+    pub no_end_caps: bool,
 }
 
 impl WallMask {
@@ -90,6 +98,71 @@ impl WallMask {
             out.push((a + (b - a) * t0, a + (b - a) * t1));
         }
         out
+    }
+
+    /// 합치기를 **DXF 가 아는 말로** 굽는다.
+    ///
+    /// 한: "그게 오토캐드랑 딱 호환되게끔 내보내기 했었어"
+    ///
+    /// 화면에서는 그릴 때마다 잘라내면 된다 (`clip`). 파일로 내보내면 그
+    /// 자리가 없다 — DXF 에 "겹친 이웃과 합쳐라" 같은 칸은 없어서, 내보낸
+    /// 벽은 제 선을 다 긋고 AutoCAD 에서 교차 자리에 X 가 다시 생긴다.
+    ///
+    /// 그런데 DXF 의 MLINE 은 **요소별 끊기**를 정식으로 안다 (group 73/74/41,
+    /// MLEDIT 의 Cut). 잘라낸 토막을 그 끊기로 바꿔 넣으면 AutoCAD 가 우리와
+    /// 같은 그림을 그린다 — MLEDIT 의 "Merged Cross/Tee" 와 같은 결과물이다.
+    ///
+    /// 끊기는 세그먼트 시작점(miter 가 적용된 자리)으로부터의 **거리**다
+    /// (`MLineCut`). 그 거리를 재는 선이 곧 `MLine::element_runs` 이고,
+    /// `geometry` 도 같은 선에서 끊기를 빼므로 둘이 갈릴 수 없다.
+    pub fn bake(&self, e: Handle, m: &MLine) -> Baked {
+        let mut cuts = vec![Vec::new(); m.vertices.len()];
+        for (k, el, a, b) in m.element_runs() {
+            let len = a.dist(b);
+            // 남는(= 남의 몸통 밖) 토막들. 자를 데가 없으면 통째로 하나다.
+            let kept = self.clip(e, a, b);
+            let mut from = 0.0;
+            for (s, t) in &kept {
+                let (ds, dt) = (a.dist(*s), a.dist(*t));
+                if ds > from + ON_EDGE_EPS {
+                    cuts[k].push(MLineCut { element: el, start: from, end: ds });
+                }
+                from = f64::max(from, dt);
+            }
+            if len > from + ON_EDGE_EPS {
+                cuts[k].push(MLineCut { element: el, start: from, end: len });
+            }
+        }
+        // 끝막음선은 **통째로** 끄거나 켜는 수밖에 없다 — DXF 가 캡을 부분적
+        // 으로 끊지 못한다. 그래서 그 선이 남의 몸통에 완전히 묻혔을 때만
+        // 끈다. T 자로 만나는 자리가 그렇다: 가로벽 끝의 막음선이 세로벽
+        // 속으로 들어가 덩어리 한가운데를 가로지른다.
+        let (mut no_start, mut no_end) = (m.no_start_caps, m.no_end_caps);
+        if !m.closed {
+            if let Some((a, b)) = self.cap_line(m, true) {
+                no_start |= self.clip(e, a, b).is_empty();
+            }
+            if let Some((a, b)) = self.cap_line(m, false) {
+                no_end |= self.clip(e, a, b).is_empty();
+            }
+        }
+        Baked { cuts, no_start_caps: no_start, no_end_caps: no_end }
+    }
+
+    /// 첫(`start`) 또는 마지막 세그먼트의 **끝막음선** — 가장 바깥 요소 둘을 잇는다.
+    fn cap_line(&self, m: &MLine, start: bool) -> Option<(Vec2, Vec2)> {
+        let offs = m.offsets();
+        let hi = (0..offs.len()).max_by(|a, b| offs[*a].total_cmp(&offs[*b]))?;
+        let lo = (0..offs.len()).min_by(|a, b| offs[*a].total_cmp(&offs[*b]))?;
+        if hi == lo {
+            return None; // 요소가 하나뿐이면 막을 것이 없다.
+        }
+        let runs = m.element_runs();
+        let k = if start { 0 } else { m.segment_count().checked_sub(1)? };
+        let end = |el: usize| {
+            runs.iter().find(|(kk, ee, _, _)| *kk == k && *ee == el).map(|(_, _, a, b)| if start { *a } else { *b })
+        };
+        Some((end(hi)?, end(lo)?))
     }
 
     /// 여러 점으로 된 선(캡·호)을 토막마다 잘라 **이어지는 조각들**로.
@@ -210,6 +283,76 @@ mod tests {
             d.model.push(e);
         }
         WallMask::collect(&d, &Space::Model)
+    }
+
+    /// T 자로 만나는 벽 둘 — 가로벽 (0,0)→(3000,0), 세로벽 (1500,±1500),
+    /// 둘 다 두께 250. 세로벽의 몸통은 x ∈ [1375, 1625] 이므로 가로벽의
+    /// 외곽선은 **딱 그 구간에서** 끊겨야 한다.
+    fn tee() -> (Drawing, Handle) {
+        let mut d = Drawing::new_metric();
+        d.model.push(wall(1, (0.0, 0.0), (3000.0, 0.0), 250.0));
+        d.model.push(wall(2, (1500.0, -1500.0), (1500.0, 1500.0), 250.0));
+        (d, Handle(1))
+    }
+
+    /// **끊기가 교차 구간에 정확히 생긴다.**
+    ///
+    /// 한: "내보내기도 ... 오토캐드랑 딱 호환되게끔"
+    ///
+    /// 화면의 합치기는 그릴 때만 잘라내므로 기하에 안 남는다. 파일로 내보내면
+    /// 그 자리가 없어서 AutoCAD 에서 교차 자리에 X 가 다시 생겼다. 잘라냄을
+    /// MLINE 의 요소별 끊기로 구워 그걸 막는다 (`bake`).
+    #[test]
+    fn 끊기가_남의_몸통_구간에_생긴다() {
+        let (d, h) = tee();
+        let mask = WallMask::collect(&d, &Space::Model).expect("벽 둘");
+        let EntityKind::MLine(m) = &d.model.get(h).unwrap().kind else { panic!() };
+        let baked = mask.bake(h, m);
+
+        // 가로벽은 세그먼트 하나뿐이라 끊기는 첫 꼭짓점에 달린다.
+        let cuts = &baked.cuts[0];
+        assert_eq!(cuts.len(), 2, "외곽선 둘이 각각 한 번 끊겨야 한다: {cuts:?}");
+        for c in cuts {
+            assert!((c.start - 1375.0).abs() < 1e-6, "끊기 시작이 1375 가 아니다: {c:?}");
+            assert!((c.end - 1625.0).abs() < 1e-6, "끊기 끝이 1625 가 아니다: {c:?}");
+        }
+        // 가로벽 끝은 세로벽 밖이라 막음선은 **그대로 둔다.**
+        assert!(!baked.no_start_caps && !baked.no_end_caps, "엉뚱한 캡을 껐다");
+    }
+
+    /// **구운 끊기가 화면에서 자른 것과 같다.**
+    ///
+    /// 둘이 갈리면 화면과 내보낸 파일이 다른 그림이 된다 — 이 수정이 막으려는
+    /// 바로 그 일이다. 그래서 같은 벽을 두 길로 그려 길이를 견준다.
+    #[test]
+    fn 구운_것과_화면에서_자른_것이_같다() {
+        let (mut d, h) = tee();
+        let mask = WallMask::collect(&d, &Space::Model).expect("벽 둘");
+        let EntityKind::MLine(m) = &d.model.get(h).unwrap().kind else { panic!() };
+
+        // 화면: geometry 의 선마다 마스크를 건다.
+        let on_screen: f64 = m
+            .geometry()
+            .lines
+            .iter()
+            .flat_map(|(_, a, b)| mask.clip(h, *a, *b))
+            .map(|(a, b)| a.dist(b))
+            .sum();
+
+        // 파일: 끊기를 구워 넣고 geometry 가 알아서 빼게 한다.
+        let baked = mask.bake(h, m);
+        d.model.modify(h, |e| {
+            let EntityKind::MLine(m) = &mut e.kind else { return };
+            for (v, cuts) in m.vertices.iter_mut().zip(baked.cuts) {
+                v.cuts.extend(cuts);
+            }
+        });
+        let EntityKind::MLine(m) = &d.model.get(h).unwrap().kind else { panic!() };
+        let in_file: f64 = m.geometry().lines.iter().map(|(_, a, b)| a.dist(*b)).sum();
+
+        assert!((on_screen - in_file).abs() < 1e-6, "화면 {on_screen} vs 파일 {in_file}");
+        // 자르기 전보다 **짧아야** 한다 — 안 짧으면 아무것도 안 뺀 것이다.
+        assert!(in_file < 2.0 * 3000.0 - 1.0, "끊긴 자리가 없다: {in_file}");
     }
 
     #[test]

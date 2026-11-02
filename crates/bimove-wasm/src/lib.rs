@@ -958,7 +958,21 @@ impl Doc {
     /// 없으면 고친 것이 창을 닫는 순간 사라진다 — 그리기·되돌리기가 다 돌아도
     /// 쓸 수가 없다.
     fn to_dxf(&self) -> String {
-        cadcraft_io::write_dxf(self.drawing())
+        // 겹친 벽을 **파일에서도** 한 덩어리로.
+        //
+        // 한: "내보내기도 ... 오토캐드랑 딱 호환되게끔"
+        //
+        // 화면의 합치기는 그릴 때만 잘라내는 것이라 기하에 안 남는다. 그냥
+        // 내보내면 AutoCAD 에서 교차 자리에 X 가 다시 생긴다 — 화면과 납품
+        // 파일이 갈린다. `bake_wall_merges` 가 그 잘라냄을 MLINE 의 요소별
+        // 끊기로 바꿔 넣는다.
+        //
+        // **복제본에 건다.** 원본에 걸면 화면이 끊기를 한 번, 마스크를 또 한
+        // 번 적용한다. 큰 도면에서는 한 벌 더 드는 값이 있지만, 내보내기는
+        // 한 번뿐이고 어차피 DXF 글이 그만큼 또 난다.
+        let mut d = self.drawing().clone();
+        cadcraft_render::bake_wall_merges(&mut d, &cadcraft_doc::Space::Model);
+        cadcraft_io::write_dxf(&d)
     }
 
     /// 지금 도면을 **Bimove 저장본으로** 되돌린다.
@@ -3071,6 +3085,96 @@ mod tests {
     /// 브라우저에서 이걸 다시 읽으니 벽이 **까맣게 칠해진 덩어리**가 됐다.
     /// 픽스처(벽 하나)로는 재현이 안 돼서 실제 바이트를 들여온다.
     const WALLS_DXF: &str = include_str!("../tests/walls.dxf");
+
+    /// T 자로 겹친 벽 둘 — 지금 빔모바가 그리는 그대로.
+    fn tee_doc() -> Doc {
+        let mut doc = Doc::open(WALLS_DXF.as_bytes()).expect("한의 벽 도면");
+        let st = r##"{"name":"BIMOVE_WALL_250000","elements":[{"offset":0.5},{"offset":-0.5}],"fill":"#ffffff","joints":false,"startCaps":{"line":true},"endCaps":{"line":true},"current":false}"##;
+        doc.exec("mlstyle", st).expect("벽 스타일");
+        for pts in [r#"[[0,0],[3000,0]]"#, r#"[[1500,-1500],[1500,1500]]"#] {
+            let ml = format!(
+                r#"{{"points":{pts},"scale":250,"justification":"zero","style":"BIMOVE_WALL_250000","mergeOverlaps":true}}"#
+            );
+            doc.exec("mline", &ml).expect("벽");
+        }
+        doc
+    }
+
+    /// **겹친 벽이 DXF 를 건너도 한 덩어리로 남는다.**
+    ///
+    /// 한: "내보내기도 ... 오토캐드랑 딱 호환되게끔"
+    ///
+    /// 화면의 합치기는 그릴 때만 잘라내므로 기하에 안 남는다. 그냥 내보내면
+    /// 벽이 제 선을 다 긋고 **AutoCAD 에서 교차 자리에 X 가 다시 생긴다** —
+    /// 화면과 납품 파일이 갈린다. `to_dxf` 가 그 잘라냄을 MLINE 의 요소별
+    /// 끊기로 구워 넣는다 (`cadcraft_render::bake_wall_merges`).
+    #[test]
+    fn 겹친_벽이_dxf_를_건너도_한_덩어리로_남는다() {
+        let dxf = tee_doc().to_dxf();
+        let again = Doc::open(dxf.as_bytes()).expect("쓴 DXF 를 다시 못 읽었다");
+
+        // 되읽은 벽에 끊기가 실려 있어야 한다.
+        let cuts: usize = again
+            .drawing()
+            .model
+            .iter()
+            .filter_map(|e| match &e.kind {
+                cadcraft_doc::EntityKind::MLine(m) => Some(m.vertices.iter().map(|v| v.cuts.len()).sum::<usize>()),
+                _ => None,
+            })
+            .sum();
+        assert!(cuts > 0, "끊기가 파일을 못 건넜다 — AutoCAD 에서 X 가 보인다");
+    }
+
+    /// **구운 끊기가 교차 구간에 정확히 들어간다.**
+    ///
+    /// 세로벽(중심 x=1500, 두께 250)의 몸통은 x ∈ [1375, 1625] 이므로 가로벽의
+    /// 외곽선 둘이 거기서 끊긴다. 세로벽도 같은 일을 당한다 — 가로벽 몸통
+    /// y ∈ [-125, 125] 이 세로벽 시작(y=-1500)에서 보면 역시 1375~1625 다.
+    /// 둘을 대칭으로 놓았으니 거리가 같게 나오는 것이고, 그래서 넷을 한 자로
+    /// 재도 된다. 어느 외곽선이 어디서 끊기는지는 `wallmask` 쪽 시험
+    /// (`끊기가_남의_몸통_구간에_생긴다`)이 따로 가른다.
+    ///
+    /// 거리가 어긋나면 AutoCAD 에서 엉뚱한 자리가 비어 보인다.
+    #[test]
+    fn 끊긴_자리가_교차_구간과_맞다() {
+        let dxf = tee_doc().to_dxf();
+        let again = Doc::open(dxf.as_bytes()).unwrap();
+        let mut found = 0;
+        for e in again.drawing().model.iter() {
+            let cadcraft_doc::EntityKind::MLine(m) = &e.kind else { continue };
+            for v in &m.vertices {
+                for c in &v.cuts {
+                    assert!((c.start - 1375.0).abs() < 1e-6, "끊기 시작 {} ≠ 1375", c.start);
+                    assert!((c.end - 1625.0).abs() < 1e-6, "끊기 끝 {} ≠ 1625", c.end);
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(found, 4, "벽 둘의 외곽선 넷이 각각 한 번 끊겨야 한다");
+    }
+
+    /// **원본 문서는 안 건드린다.**
+    ///
+    /// 굽기는 내보낼 복제본에만 걸어야 한다. 원본에 걸면 화면이 끊기를 한 번,
+    /// 마스크를 또 한 번 적용해서 벽이 더 깎인다.
+    #[test]
+    fn 내보내도_원본에_끊기가_안_남는다() {
+        let mut doc = tee_doc();
+        let before = prim_count(&mut doc);
+        let _ = doc.to_dxf();
+        let cuts: usize = doc
+            .drawing()
+            .model
+            .iter()
+            .filter_map(|e| match &e.kind {
+                cadcraft_doc::EntityKind::MLine(m) => Some(m.vertices.iter().map(|v| v.cuts.len()).sum::<usize>()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(cuts, 0, "내보내기가 원본에 끊기를 남겼다");
+        assert_eq!(prim_count(&mut doc), before, "내보내기가 화면을 바꿨다");
+    }
 
     /// 같은 도면을 **고친 뒤에 다시 받은 것.** 손으로 만든 게 아니라 브라우저가
     /// 실제로 내려준 바이트다. 두 파일의 차이는 벽 스타일의 채움 색 한 군데다 —
